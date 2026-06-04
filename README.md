@@ -23,18 +23,18 @@ The design principle is that binding is *temporary and scoped* — no agent owns
 
 ```mermaid
 flowchart TB
-    subgraph Agents["AI Agents"]
+    subgraph Agents["🤖  AI Agents"]
         A1["Agent A\nRemoteAgent / Agent"]
         A2["Agent B\nagent.achieve('vision')"]
     end
 
-    subgraph Core["D2A Core — frozen contract"]
+    subgraph Core["🔒  D2A Core — frozen contract"]
         SC["Capability Schema\nschema.py"]
         VB["Bind Verbs\nverbs.py"]
         ID["Identity + Token\nidentity.py"]
     end
 
-    subgraph Pipeline["Resolution Pipeline"]
+    subgraph Pipeline["⚙️  Resolution Pipeline"]
         AD["Advertise"]
         TG["Trust Gate\nHMAC-signed token"]
         BR["Contention Broker\npriority · quota · preemption"]
@@ -42,16 +42,16 @@ flowchart TB
         AD --> TG --> BR --> BI
     end
 
-    subgraph DevStack["Device Stack"]
+    subgraph DevStack["💻  Device Stack"]
         DR["Device Runtime\ndevice_runtime.py"]
         PB["OS Probes\n/proc · /sys · sysfs"]
         HW["Bare Hardware\ncamera · GPU · mic · sensors"]
         DR --> PB --> HW
     end
 
-    subgraph Transport["Swarm Transport"]
+    subgraph Transport["🌐  Swarm Transport"]
         LS["LANSwarm\nUDP broadcast + TCP"]
-        DS["DHTSwarm stub\nKademlia adapter — in progress"]
+        DS["DHTSwarm stub\nKademlia — in progress"]
     end
 
     A1 & A2 --> Core
@@ -59,6 +59,18 @@ flowchart TB
     Pipeline --> DevStack
     Transport <--> Pipeline
     Transport <--> DevStack
+
+    classDef agentNode  fill:#dbeafe,stroke:#3b82f6,stroke-width:2px,color:#1e3a5f
+    classDef coreNode   fill:#fef9c3,stroke:#ca8a04,stroke-width:2px,color:#451a03
+    classDef pipeNode   fill:#dcfce7,stroke:#16a34a,stroke-width:2px,color:#14532d
+    classDef devNode    fill:#f3e8ff,stroke:#9333ea,stroke-width:2px,color:#3b0764
+    classDef transNode  fill:#ffe4e6,stroke:#e11d48,stroke-width:2px,color:#4c0519
+
+    class A1,A2 agentNode
+    class SC,VB,ID coreNode
+    class AD,TG,BR,BI pipeNode
+    class DR,PB,HW devNode
+    class LS,DS transNode
 ```
 
 Runtimes plug in on the device side; agents plug in on the top. The frozen core in the middle never changes — only the transport and the hardware underneath vary.
