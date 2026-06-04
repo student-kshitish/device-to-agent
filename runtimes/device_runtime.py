@@ -1,0 +1,595 @@
+import os
+import time
+
+from d2a import (
+    Capability, KeyPair, BindToken,
+    generate_node_id, generate_keypair,
+    verify_bind_token, CapabilityBroker,
+    rebind, renew,
+    probe_all,
+    LANSwarm, SwarmTransport,
+    IOContract, CapabilityContract,
+)
+from d2a.resource_probes import probe_resources, RESOURCE_SENSITIVITY
+from d2a.policy import ResourcePolicy
+from d2a.stream_source import (
+    CPUSource, MemorySource, GPUSource,
+    ThermalSource, BatterySource, DiskIOSource, NetIOSource,
+    CameraMetaSource, MicrophoneMetaSource, LocationMetaSource,
+    DisplayMetaSource, StorageSource, NetworkMetaSource,
+)
+from d2a.data_provider import DataProvider
+from d2a.sense_layer import SenseLayer
+from d2a.sense_types import SenseRequest, SenseFrame
+
+
+class DeviceRuntime:
+    def __init__(
+        self,
+        name: str = "node",
+        transport: SwarmTransport = None,
+        capability_override: list[str] | None = None,
+        # Owner-consent policy params — default (nothing passed) = safe
+        open_resources:      list[str] | None = None,
+        deny_resources:      list[str] | None = None,
+        approval_callback                      = None,
+    ):
+        self.name = name
+        self.node_id = generate_node_id()
+        self.private_key, self.public_key = generate_keypair()
+        self.keypair = KeyPair(
+            node_id=self.node_id,
+            private_key=self.private_key,
+            public_key=self.public_key,
+        )
+
+        # ── hardware + resource probes ────────────────────────────────────────
+        self.snapshot          = probe_all()
+        self.resource_snapshot = probe_resources()
+        self.device_class      = self.snapshot["device_class"]
+        self.power_state       = self.snapshot.get("battery")
+        self.capabilities: dict[str, Capability] = self._build_capabilities(
+            self.snapshot, self.resource_snapshot
+        )
+
+        # ── capability contracts (for composition planner) ────────────────────
+        self.capability_contracts: dict[str, CapabilityContract] = \
+            self._build_capability_contracts(self.snapshot, self.resource_snapshot)
+
+        # ── owner-consent policy (safe defaults, no args needed) ──────────────
+        self.policy = ResourcePolicy(device_class=self.device_class)
+        if open_resources:
+            for r in open_resources:
+                self.policy.allow(r)
+        if deny_resources:
+            for r in deny_resources:
+                self.policy.deny(r)
+        if approval_callback is not None:
+            self.policy.set_approval_callback(approval_callback)
+
+        # ── broker ────────────────────────────────────────────────────────────
+        self.broker = CapabilityBroker(self)
+        self.broker.quotas = {n: 1 for n in self.capabilities}
+
+        self.swarm: SwarmTransport = transport if transport is not None else LANSwarm(node_id=self.node_id)
+
+        # ── data delivery layer ───────────────────────────────────────────────
+        # Nothing runs until an agent requests data.
+        # NOTE: build sources BEFORE applying override so the DataProvider exists
+        # before _apply_override may inject extra sources into it.
+        self.data = DataProvider(self._build_sources(self.snapshot, self.resource_snapshot))
+
+        # binding_id -> data_provider sub_id (stream cleanup on release/preemption)
+        self._binding_subs: dict[str, str] = {}
+
+        # ── sense layer ───────────────────────────────────────────────────────
+        # Nothing runs until handle() is called. Shares the same sources dict as
+        # DataProvider so no duplicate source instances are created.
+        self.sense = SenseLayer(self.data._sources, self.device_class)
+
+        # Now apply override (may inject sources into self.data)
+        if capability_override is not None:
+            self.capabilities = self._apply_override(capability_override)
+            self.broker.quotas = {n: 1 for n in self.capabilities}
+
+        print(f"[{self.name}] class={self.device_class}  node={self.node_id[:8]}  "
+              f"offering={list(self.capabilities)}")
+
+    # ── capability building ────────────────────────────────────────────────────
+
+    def _build_capabilities(
+        self, snapshot: dict, resource_snapshot: dict = None
+    ) -> dict[str, Capability]:
+        caps: dict[str, Capability] = {}
+        battery_tags  = ["battery_aware"] if "battery" in snapshot else []
+        rs            = resource_snapshot or {}
+
+        # ── existing hardware capabilities ────────────────────────────────────
+        compute_state: dict = {
+            "cpu_count": snapshot["cpu"]["count"],
+            "arch":      snapshot["cpu"]["arch"],
+        }
+        if "loadavg" in snapshot:
+            compute_state["load1"] = snapshot["loadavg"]["load1"]
+        if "memory" in snapshot:
+            m = snapshot["memory"]
+            compute_state["mem_total_mb"]     = m["total_mb"]
+            compute_state["mem_available_mb"] = m["available_mb"]
+            compute_state["mem_used_percent"] = m["used_percent"]
+        if "disk" in snapshot:
+            d = snapshot["disk"]
+            compute_state["disk_free_gb"]  = d["free_gb"]
+            compute_state["disk_used_pct"] = d["used_pct"]
+        caps["compute"] = Capability(
+            name="compute",
+            tags=["compute", "open"] + battery_tags,
+            live_state=compute_state,
+            node_id=self.node_id,
+            public_key=self.public_key,
+        )
+
+        if "gpu" in snapshot:
+            caps["gpu"] = Capability(
+                name="gpu",
+                tags=["compute", "gpu", "open"] + battery_tags,
+                live_state=snapshot["gpu"],
+                node_id=self.node_id,
+                public_key=self.public_key,
+            )
+
+        if "thermal" in snapshot or "sensors" in snapshot:
+            sense_state: dict = {}
+            if "thermal" in snapshot:
+                sense_state["thermal_zones"]  = snapshot["thermal"]["zone_count"]
+                sense_state["sample_temps_c"] = snapshot["thermal"]["temps_c"][:6]
+            if "sensors" in snapshot:
+                sense_state["sensor_inputs"] = snapshot["sensors"]["count"]
+                sense_state["hwmons"]        = snapshot["sensors"]["hwmons"]
+            caps["sensing"] = Capability(
+                name="sensing",
+                tags=["sensing", "thermal", "open"] + battery_tags,
+                live_state=sense_state,
+                node_id=self.node_id,
+                public_key=self.public_key,
+            )
+
+        if "battery" in snapshot:
+            caps["battery_aware"] = Capability(
+                name="battery_aware",
+                tags=["battery_aware", "battery", "open"],
+                live_state=snapshot["battery"],
+                node_id=self.node_id,
+                public_key=self.public_key,
+            )
+
+        # ── generic resource capabilities ─────────────────────────────────────
+        # Each resource carries access level in its live_state and tags.
+        for res_name, res_data in rs.items():
+            sensitivity = RESOURCE_SENSITIVITY.get(res_name, "sensitive")
+            access_tag  = "open" if sensitivity == "open" else "owner_consent"
+            caps[res_name] = Capability(
+                name=res_name,
+                tags=[res_name, access_tag] + (battery_tags if sensitivity == "open" else []),
+                live_state=dict(res_data),
+                node_id=self.node_id,
+                public_key=self.public_key,
+            )
+
+        return caps
+
+    def _build_capability_contracts(
+        self, snapshot: dict, resource_snapshot: dict = None
+    ) -> dict[str, CapabilityContract]:
+        """
+        Attach CapabilityContract to each hardware capability where meaningful.
+        Unknown format → "unknown" so the contract checker fails explicitly, never silently passes.
+        Shape/rate values are best-effort from probe data; None = not known.
+        """
+        contracts: dict[str, CapabilityContract] = {}
+        rs = resource_snapshot or {}
+
+        # compute → can host a model consumer accepting float32 tensors
+        # (shape is configurable; default matches common vision model input)
+        contracts["compute"] = CapabilityContract(
+            name="compute",
+            role="consumer",
+            accepts=IOContract(
+                media="tensor", format="float32",
+                shape=(640, 480, 3),   # TODO: configurable per model
+                rate=None,
+            ),
+        )
+
+        if "gpu" in snapshot:
+            contracts["gpu"] = CapabilityContract(
+                name="gpu",
+                role="consumer",
+                accepts=IOContract(
+                    media="tensor", format="float32",
+                    shape=(640, 480, 3),   # TODO: configurable per model
+                    rate=None,
+                ),
+            )
+
+        # camera → producer; format detected from probe, "unknown" if not determinable
+        if "camera" in rs:
+            cam = rs["camera"]
+            fmt = cam.get("format", "unknown")
+            w   = cam.get("width")
+            h   = cam.get("height")
+            fps = cam.get("fps")
+            shape = (w, h, 3) if (w and h) else None
+            contracts["camera"] = CapabilityContract(
+                name="camera",
+                role="producer",
+                produces=IOContract(
+                    media="image", format=fmt,
+                    shape=shape, rate=fps,
+                ),
+            )
+
+        # microphone → producer; pcm16 is the standard capture format
+        if "microphone" in rs:
+            contracts["microphone"] = CapabilityContract(
+                name="microphone",
+                role="producer",
+                produces=IOContract(media="audio", format="pcm16", shape=None, rate=None),
+            )
+
+        # sensing → producer of scalar values (temperature, etc.)
+        if "thermal" in snapshot or "sensors" in snapshot:
+            contracts["sensing"] = CapabilityContract(
+                name="sensing",
+                role="producer",
+                produces=IOContract(media="scalar", format="float32", shape=None, rate=None),
+            )
+
+        return contracts
+
+    def _build_sources(self, snapshot: dict, resource_snapshot: dict = None) -> dict[str, list]:
+        """Map capability names to fresh-read signal sources for DataProvider."""
+        sources: dict[str, list] = {}
+        rs = resource_snapshot or {}
+
+        # compute: CPU + memory + optional disk/net IO rates
+        compute_srcs = [CPUSource(), MemorySource()]
+        if os.path.exists("/proc/diskstats"):
+            compute_srcs.append(DiskIOSource())
+        if os.path.exists("/proc/net/dev"):
+            compute_srcs.append(NetIOSource())
+        sources["compute"] = compute_srcs
+
+        if "gpu" in snapshot:
+            sources["gpu"] = [GPUSource()]
+
+        if "thermal" in snapshot or "sensors" in snapshot:
+            sources["sensing"] = [ThermalSource()]
+
+        if "battery" in snapshot:
+            sources["battery_aware"] = [BatterySource()]
+
+        # generic resources — always register metadata sources when capability exists
+        if "camera" in rs:
+            sources["camera"] = [CameraMetaSource()]
+        if "microphone" in rs:
+            sources["microphone"] = [MicrophoneMetaSource()]
+        if "location" in rs:
+            sources["location"] = [LocationMetaSource()]
+        if "storage" in rs:
+            sources["storage"] = [StorageSource()]
+        if "network" in rs:
+            sources["network"] = [NetworkMetaSource(), NetIOSource()]
+        if "display" in rs:
+            sources["display"] = [DisplayMetaSource()]
+
+        return sources
+
+    def _apply_override(self, cap_names: list[str]) -> dict[str, Capability]:
+        """Demo-only: replace capability set with a named list. Real caps kept where matched."""
+        battery_tags = ["battery_aware"] if "battery" in self.snapshot else []
+        caps: dict[str, Capability] = {}
+        for cap_name in cap_names:
+            if cap_name in self.capabilities:
+                caps[cap_name] = self.capabilities[cap_name]
+            else:
+                sensitivity = RESOURCE_SENSITIVITY.get(cap_name, "sensitive")
+                access_tag  = "open" if sensitivity == "open" else "owner_consent"
+                caps[cap_name] = Capability(
+                    name=cap_name,
+                    tags=[cap_name, access_tag],
+                    live_state={"simulated": True, "access": access_tag},
+                    node_id=self.node_id,
+                    public_key=self.public_key,
+                )
+                # always register a metadata source for overridden capabilities
+                # so get_reading returns a safe frame even without real hardware
+                _src_map = {
+                    "camera":     CameraMetaSource,
+                    "microphone": MicrophoneMetaSource,
+                    "location":   LocationMetaSource,
+                    "display":    DisplayMetaSource,
+                    "storage":    StorageSource,
+                    "network":    NetworkMetaSource,
+                }
+                if cap_name in _src_map:
+                    self.data._sources[cap_name] = [_src_map[cap_name]()]
+        return caps
+
+    # ── capability interface ───────────────────────────────────────────────────
+
+    def advertise(self) -> list[Capability]:
+        return list(self.capabilities.values())
+
+    def get_capability(self, name: str) -> Capability | None:
+        return self.capabilities.get(name)
+
+    def refresh_hardware(self) -> dict:
+        self.snapshot          = probe_all()
+        self.resource_snapshot = probe_resources()
+        self.device_class      = self.snapshot["device_class"]
+        self.power_state       = self.snapshot.get("battery")
+        self.capabilities      = self._build_capabilities(self.snapshot, self.resource_snapshot)
+        return self.snapshot
+
+    def live_capabilities(self) -> list[Capability]:
+        self.refresh_hardware()
+        return self.advertise()
+
+    # ── swarm integration ──────────────────────────────────────────────────────
+
+    def start_swarm(self) -> None:
+        self.swarm.start()
+        self.swarm.message_handler = self._on_message
+        self.publish_capabilities()
+
+    def stop_swarm(self) -> None:
+        self.swarm.stop()
+
+    def publish_capabilities(self) -> None:
+        ip, port = self.swarm.address
+        for cap in self.advertise():
+            record = {
+                "node_id":      self.node_id,
+                "name":         cap.name,
+                "tags":         list(cap.tags),
+                "live_state":   {k: v for k, v in cap.live_state.items()},
+                "public_key":   self.public_key,
+                "address":      [ip, port],
+                "device_class": self.device_class,
+                "ts":           time.time(),
+            }
+            self.swarm.publish(record)
+
+    # ── binding scope verification ─────────────────────────────────────────────
+
+    def _verify_binding_scope(self, binding_id: str, capability: str) -> bool:
+        """Return True iff binding_id is active, in-scope for capability, and not expired."""
+        binding = self.broker.get_binding(binding_id)
+        if binding is None:
+            return False
+        if binding.status != "active":
+            return False
+        if binding.capability_name != capability:
+            return False
+        if time.time() > binding.token.expires_at:
+            binding.status = "expired"
+            return False
+        return True
+
+    def _cleanup_binding_stream(self, binding_id: str) -> None:
+        """Stop any streaming subscription tied to this binding."""
+        sub_id = self._binding_subs.pop(binding_id, None)
+        if sub_id is not None:
+            self.data.unsubscribe(sub_id)
+
+    # ── message handler ────────────────────────────────────────────────────────
+
+    def _on_message(self, message: dict) -> dict | None:
+        mtype = message.get("type")
+
+        # ── bind request (with policy check) ──────────────────────────────────
+        if mtype == "bind_request":
+            agent_id = message.get("from_node", "unknown")
+            cap_name = message.get("capability_name", "")
+            needs    = message.get("needs", [])
+            priority = message.get("priority", 5)
+
+            # All TCP bind_requests are remote — always enforce policy
+            decision = self.policy.check(cap_name, agent_id, is_remote=True)
+            if decision == "deny":
+                print(f"[{self.name}] bind_request from {agent_id[:8]} for '{cap_name}' "
+                      f"→ denied (policy: blocked)")
+                return {"status": "denied", "message": "resource blocked by device policy"}
+            if decision == "needs_approval":
+                if not self.policy.approve(cap_name, agent_id):
+                    print(f"[{self.name}] bind_request from {agent_id[:8]} for '{cap_name}' "
+                          f"→ denied (sensitive: approval required)")
+                    return {"status": "denied",
+                            "message": "owner approval required for sensitive resource"}
+
+            result = self.broker_request(agent_id, cap_name, needs, priority)
+            print(f"[{self.name}] bind_request from {agent_id[:8]} for '{cap_name}' "
+                  f"→ {result['status']}")
+            if result.get("status") in ("granted", "granted_by_preemption"):
+                token = result["token"]
+                return {
+                    "status":               result["status"],
+                    "binding_id":           result.get("binding_id"),
+                    "capability_name":      token.capability_name,
+                    "agent_id":             token.agent_id,
+                    "node_id":              token.node_id,
+                    "scope":                token.scope,
+                    "expires_at":           token.expires_at,
+                    "signature":            token.signature,
+                    "device_class":         self.device_class,
+                    "verified_by_provider": True,
+                }
+            return {"status": result.get("status"), "message": result.get("message", "")}
+
+        # ── capability probe (TCP fallback for AP-isolation / probe_peer) ──────
+        if mtype == "capabilities_request":
+            ip, port = self.swarm.address
+            records = []
+            for cap in self.advertise():
+                records.append({
+                    "node_id":      self.node_id,
+                    "name":         cap.name,
+                    "tags":         list(cap.tags),
+                    "live_state":   {k: v for k, v in cap.live_state.items()},
+                    "public_key":   self.public_key,
+                    "address":      [ip, port],
+                    "device_class": self.device_class,
+                    "ts":           time.time(),
+                })
+            return {"type": "capabilities_response", "records": records}
+
+        # ── on-demand data pull (THE DEFAULT) ─────────────────────────────────
+        if mtype == "get_reading":
+            binding_id = message.get("binding_id", "")
+            capability = message.get("capability", "")
+            if not self._verify_binding_scope(binding_id, capability):
+                return {
+                    "type":       "error",
+                    "binding_id": binding_id,
+                    "error":      "binding_invalid_or_out_of_scope",
+                }
+            frame = self.data.get_reading(capability)
+            return {
+                "type":       "reading",
+                "capability": capability,
+                "binding_id": binding_id,
+                "frame":      frame,
+            }
+
+        # ── opt-in streaming: subscribe ───────────────────────────────────────
+        if mtype == "subscribe":
+            binding_id    = message.get("binding_id", "")
+            capability    = message.get("capability", "")
+            hz            = float(message.get("hz", 5.0))
+            agent_node_id = message.get("from_node", "")
+            agent_address = message.get("agent_address")
+
+            if not self._verify_binding_scope(binding_id, capability):
+                return {
+                    "type":       "error",
+                    "binding_id": binding_id,
+                    "error":      "binding_invalid_or_out_of_scope",
+                }
+
+            if agent_address and len(agent_address) == 2:
+                self.swarm.add_known_peer(agent_node_id, agent_address[0], int(agent_address[1]))
+
+            def _make_cb(nid: str, cap: str, bid: str):
+                def _cb(frame: dict) -> None:
+                    self.swarm.send(nid, {
+                        "type":       "stream_frame",
+                        "capability": cap,
+                        "binding_id": bid,
+                        "frame":      frame,
+                    })
+                return _cb
+
+            sub_id = self.data.subscribe(capability, _make_cb(agent_node_id, capability, binding_id), hz)
+            self._binding_subs[binding_id] = sub_id
+            print(f"[{self.name}] subscribe binding={binding_id[:8]} cap={capability} "
+                  f"hz={hz} sub={sub_id[:8]}")
+            return {
+                "type":       "subscribed",
+                "status":     "subscribed",
+                "sub_id":     sub_id,
+                "binding_id": binding_id,
+            }
+
+        # ── opt-in streaming: unsubscribe ─────────────────────────────────────
+        if mtype == "unsubscribe":
+            binding_id = message.get("binding_id", "")
+            self._cleanup_binding_stream(binding_id)
+            print(f"[{self.name}] unsubscribe binding={binding_id[:8]}")
+            return {"type": "unsubscribed", "status": "ok", "binding_id": binding_id}
+
+        # ── remote release (from ResourceHandle.release) ──────────────────────
+        if mtype == "release_binding":
+            agent_id = message.get("from_node", "")
+            cap_name = message.get("capability_name", "")
+            result   = self.broker_release(agent_id, cap_name)
+            return {"type": "released", "status": result.get("status", "ok")}
+
+        return None
+
+    # ── broker interface ───────────────────────────────────────────────────────
+
+    def verify_agent_token(self, token: BindToken) -> bool:
+        return verify_bind_token(token, self.private_key)
+
+    def broker_request(self, agent_id: str, capability_name: str,
+                       needs: list[str], priority: int = 5) -> dict:
+        # Detect preemption before calling broker so we can clean up preempted streams.
+        active = self.broker.active_binds.get(capability_name, [])
+        quota  = self.broker.quotas.get(capability_name, 1)
+        if len(active) >= quota:
+            worst = max(active, key=lambda b: b.priority)
+            if worst.priority > priority:
+                self._cleanup_binding_stream(worst.binding_id)
+        return self.broker.request_bind(agent_id, capability_name, needs, priority)
+
+    def broker_release(self, agent_id: str, capability_name: str) -> dict:
+        # Clean up streaming before releasing binding.
+        active = self.broker.active_binds.get(capability_name, [])
+        bind   = next((b for b in active if b.agent_id == agent_id), None)
+        if bind:
+            self._cleanup_binding_stream(bind.binding_id)
+        return self.broker.release_bind(agent_id, capability_name)
+
+    def broker_status(self) -> dict:
+        return self.broker.status()
+
+    def broker_rebind(self, binding_id: str, new_capability_name: str) -> dict:
+        binding = self.broker.get_binding(binding_id)
+        if binding is None:
+            return {"status": "error", "message": f"Binding {binding_id} not found"}
+        rebind(binding, new_capability_name, self, self.private_key)
+        return {
+            "status":           "rebound",
+            "binding_id":       binding_id,
+            "capability_name":  binding.capability_name,
+            "rebind_count":     binding.rebind_count,
+            "token":            binding.token,
+        }
+
+    def broker_renew(self, binding_id: str, ttl_seconds: int = 300) -> dict:
+        binding = self.broker.get_binding(binding_id)
+        if binding is None:
+            return {"status": "error", "message": f"Binding {binding_id} not found"}
+        renew(binding, self, self.private_key, ttl_seconds)
+        return {"status": "renewed", "binding_id": binding_id, "expires_at": binding.token.expires_at}
+
+    def broker_get_binding(self, binding_id: str) -> dict:
+        binding = self.broker.get_binding(binding_id)
+        if binding is None:
+            return {"status": "error", "message": f"Binding {binding_id} not found"}
+        return {
+            "binding_id":      binding.binding_id,
+            "agent_id":        binding.agent_id,
+            "node_id":         binding.node_id,
+            "capability_name": binding.capability_name,
+            "scope":           binding.scope,
+            "created_at":      binding.created_at,
+            "rebind_count":    binding.rebind_count,
+            "status":          binding.status,
+            "expires_at":      binding.token.expires_at,
+        }
+
+    # ── sense layer interface ──────────────────────────────────────────────────
+
+    def sense_reading(
+        self,
+        resource: str,
+        shape: str = "normalized",
+        mode: str  = "on_demand",
+    ) -> SenseFrame:
+        """
+        Run the full sense pipeline for a resource and return a SenseFrame.
+        Local call — no binding or policy check required.
+        Network wiring for remote sense_request messages comes in Part 2.
+        """
+        return self.sense.handle(SenseRequest(resource=resource, shape=shape, mode=mode))
