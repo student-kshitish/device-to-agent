@@ -115,6 +115,18 @@ class CapabilityBroker:
 
         return {"status": "released", "next_agent_id": None}
 
+    def cancel_queue(self, agent_id: str, capability_name: str) -> bool:
+        """
+        Remove agent_id from the waitqueue for capability_name.
+        Used by AtomicBinder to prevent ghost bindings when a bind attempt
+        returns 'queued' but we want to fail-fast and try a different blueprint.
+        Returns True if an entry was removed.
+        """
+        wq = self.waitqueue.get(capability_name, [])
+        before = len(wq)
+        self.waitqueue[capability_name] = [e for e in wq if e[1] != agent_id]
+        return len(wq) > before
+
     def get_binding(self, binding_id: str) -> Binding | None:
         return self.bindings.get(binding_id)
 
