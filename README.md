@@ -83,17 +83,35 @@ The same seven phases apply to every device regardless of what hardware it has. 
 
 ```mermaid
 flowchart LR
-    P0["0 · Exist\nprobe self"]
-    P1["1 · Advertise\npublish capabilities"]
-    P2["2 · Discover\nagent finds providers"]
-    P3["3 · Trust\nHMAC token issued"]
-    P4["4 · Bind\nbroker grants slot"]
-    P5["5 · Sense\nread via sense layer"]
-    P6["6 · Act\nuse the capability"]
-    P7["7 · Release\nslot returned"]
+    P0["⚡ 0 · Exist\nprobe self"]
+    P1["📡 1 · Advertise\npublish capabilities"]
+    P2["🔍 2 · Discover\nagent finds providers"]
+    P3["🔑 3 · Trust\nHMAC token issued"]
+    P4["🔗 4 · Bind\nbroker grants slot"]
+    P5["👁️ 5 · Sense\nread via sense layer"]
+    P6["🎯 6 · Act\nuse the capability"]
+    P7["🔓 7 · Release\nslot returned"]
 
     P0 --> P1 --> P2 --> P3 --> P4 --> P5 --> P6 --> P7
     P7 -->|"back to available"| P1
+
+    classDef exist     fill:#f0fdf4,stroke:#15803d,stroke-width:2px,color:#14532d
+    classDef advertise fill:#eff6ff,stroke:#2563eb,stroke-width:2px,color:#1e3a8a
+    classDef discover  fill:#f0f9ff,stroke:#0284c7,stroke-width:2px,color:#0c4a6e
+    classDef trust     fill:#fef9c3,stroke:#ca8a04,stroke-width:2px,color:#451a03
+    classDef bind      fill:#fdf4ff,stroke:#a21caf,stroke-width:2px,color:#4a044e
+    classDef sense     fill:#fff7ed,stroke:#ea580c,stroke-width:2px,color:#431407
+    classDef act       fill:#fff1f2,stroke:#e11d48,stroke-width:2px,color:#4c0519
+    classDef release   fill:#f1f5f9,stroke:#475569,stroke-width:2px,color:#0f172a
+
+    class P0 exist
+    class P1 advertise
+    class P2 discover
+    class P3 trust
+    class P4 bind
+    class P5 sense
+    class P6 act
+    class P7 release
 ```
 
 A Raspberry Pi, a laptop, a phone under Termux, a drone companion computer — all run the same runtime code. The only difference is the set of capabilities each probes and advertises.
@@ -115,7 +133,7 @@ D2A assembles a working pipeline from **partial capabilities on different device
 
 ```mermaid
 flowchart TB
-    subgraph PLAN["PLAN — Stages 1 – 7"]
+    subgraph PLAN["🗺️  PLAN — Stages 1 – 7"]
         direction TB
         S1["1 · Goal Planner\ngoal → ordered role-specs"]
         S2["2 · Discovery\nfind all candidates per role"]
@@ -127,11 +145,11 @@ flowchart TB
         S1 --> S2 --> S3 --> S4 --> S5 --> S6 --> S7
     end
 
-    subgraph COMMIT["COMMIT — Stage 8"]
+    subgraph COMMIT["⚡  COMMIT — Stage 8"]
         S8["8 · Atomic Binder\nall hops bound or none\nreverse rollback on any failure"]
     end
 
-    subgraph OPERATE["OPERATE — Stages 9 – 10"]
+    subgraph OPERATE["🔄  OPERATE — Stages 9 – 10"]
         S9["9 · Runtime Monitor\non-demand health check\noptional daemon loop"]
         S10["10 · Release Manager\nidempotent · stops monitor daemon"]
     end
@@ -141,22 +159,41 @@ flowchart TB
     S8 -->|"bound composition"| S9
     S9 -->|"unhealthy → rebind on fallback"| S8
     S9 --> S10
+
+    classDef planNode    fill:#eff6ff,stroke:#2563eb,stroke-width:2px,color:#1e3a8a
+    classDef commitNode  fill:#fef9c3,stroke:#d97706,stroke-width:3px,color:#451a03
+    classDef operateNode fill:#f0fdf4,stroke:#16a34a,stroke-width:2px,color:#14532d
+
+    class S1,S2,S3,S4,S5,S6,S7 planNode
+    class S8 commitNode
+    class S9,S10 operateNode
 ```
 
 ### Adapter Chains in Practice
 
 ```mermaid
 flowchart LR
-    DC["drone-cam\nimage/raw_rgb\n1280×720 @30fps"]
-    PC["pi-cam\nimage/jpeg\n1920×1080 @15fps"]
-    M["Model\ntensor/float32\n640×480×3"]
+    DC["📷 drone-cam\nimage/raw_rgb\n1280×720 @30fps"]
+    PC["📷 pi-cam\nimage/jpeg\n1920×1080 @15fps"]
+    T1["tensor\n1280×720"]
+    R2["raw_rgb\n1920×1080"]
+    T2["tensor\n1920×1080"]
+    M["🧠 Model\ntensor/float32\n640×480×3"]
 
-    DC -->|"TensorizeAdapter\nraw_rgb → float32"| T1["tensor\n1280×720"]
+    DC -->|"TensorizeAdapter\nraw_rgb → float32"| T1
     T1 -->|"ResizeAdapter\n→ 640×480"| M
 
-    PC -->|"FormatDecodeAdapter\njpeg → raw_rgb"| R2["raw_rgb\n1920×1080"]
-    R2 -->|"TensorizeAdapter"| T2["tensor\n1920×1080"]
+    PC -->|"FormatDecodeAdapter\njpeg → raw_rgb"| R2
+    R2 -->|"TensorizeAdapter"| T2
     T2 -->|"ResizeAdapter\n→ 640×480"| M
+
+    classDef camera  fill:#dbeafe,stroke:#3b82f6,stroke-width:2px,color:#1e3a5f
+    classDef adapter fill:#fef9c3,stroke:#ca8a04,stroke-width:2px,color:#451a03
+    classDef model   fill:#f0fdf4,stroke:#16a34a,stroke-width:3px,color:#14532d
+
+    class DC,PC camera
+    class T1,R2,T2 adapter
+    class M model
 ```
 
 Both paths produce the same verified contract at the consumer. `contracts_compatible()` runs at plan time **and** again at runtime — the consumer confirms the guarantee held end-to-end.
@@ -171,9 +208,9 @@ Raw hardware signals are noisy, device-specific, and meaningless to most agents.
 
 ```mermaid
 flowchart LR
-    HW["Bare Hardware\n/proc · /sys · sysfs"]
+    HW["💾 Bare Hardware\n/proc · /sys · sysfs"]
 
-    subgraph SL["Sense Layer"]
+    subgraph SL["🧩  Sense Layer"]
         direction TB
         IM["Intent Matcher\nresource name → signal sources"]
         RC["Raw Collector\nread all sources"]
@@ -187,10 +224,26 @@ flowchart LR
 
     HW --> IM
 
-    VE -->|"shape=raw"| O1["Agent: per-source dicts\nexact kernel values"]
-    VE -->|"shape=normalized"| O2["Agent: 0 – 1 numerics\nready to compare"]
-    VE -->|"shape=features"| O3["Agent: flat float vector\nready for ML inference"]
-    VE -->|"shape=verdict"| O4["Agent: comfort / caution\nstrain / distress / fatigue\n+ advice string"]
+    VE -->|"shape=raw"| O1["📦 raw\nper-source dicts\nexact kernel values"]
+    VE -->|"shape=normalized"| O2["📊 normalized\n0 – 1 numerics\nready to compare"]
+    VE -->|"shape=features"| O3["🔢 features\nflat float vector\nready for ML inference"]
+    VE -->|"shape=verdict"| O4["🚦 verdict\ncomfort · caution\nstrain · distress · fatigue"]
+
+    classDef hw       fill:#f1f5f9,stroke:#475569,stroke-width:2px,color:#0f172a
+    classDef pipeline fill:#eff6ff,stroke:#3b82f6,stroke-width:2px,color:#1e3a8a
+    classDef conf     fill:#fdf4ff,stroke:#a21caf,stroke-width:2px,color:#4a044e
+    classDef outRaw   fill:#f8fafc,stroke:#94a3b8,stroke-width:1px,color:#334155
+    classDef outNorm  fill:#f0fdf4,stroke:#16a34a,stroke-width:1px,color:#14532d
+    classDef outFeat  fill:#fff7ed,stroke:#ea580c,stroke-width:1px,color:#431407
+    classDef outVerdict fill:#fef9c3,stroke:#ca8a04,stroke-width:2px,color:#451a03
+
+    class HW hw
+    class IM,RC,NM,FE,VE pipeline
+    class CE conf
+    class O1 outRaw
+    class O2 outNorm
+    class O3 outFeat
+    class O4 outVerdict
 ```
 
 **Verdict levels** (best → worst): `comfort` → `caution` → `strain` → `distress` → `fatigue`
