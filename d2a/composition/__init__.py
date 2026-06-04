@@ -5,9 +5,13 @@ from d2a.composition.contract_checker import ContractChecker
 from d2a.composition.adapter_generator import AdapterGenerator
 from d2a.composition.cost_evaluator import CostEvaluator, Blueprint
 from d2a.composition.fallback_planner import FallbackPlanner
+from d2a.composition.atomic_binder import AtomicBinder
+from d2a.composition.runtime_monitor import RuntimeMonitor
+from d2a.composition.release_manager import ReleaseManager
 
 __all__ = [
     "GoalPlanner", "Discovery", "CapabilityScorer",
     "ContractChecker", "AdapterGenerator", "CostEvaluator",
     "Blueprint", "FallbackPlanner",
+    "AtomicBinder", "RuntimeMonitor", "ReleaseManager",
 ]

@@ -5,7 +5,10 @@ from d2a.adapters import (
     RateThrottleAdapter, TensorizeAdapter, find_adapter_chain,
     ADAPTER_REGISTRY,
 )
-from d2a.composer import Composer, CompositionPlan
+from d2a.composer import Composer, CompositionPlan, Composition
+from d2a.composition.atomic_binder import AtomicBinder
+from d2a.composition.runtime_monitor import RuntimeMonitor
+from d2a.composition.release_manager import ReleaseManager
 from d2a.identity import generate_node_id, generate_keypair, sign_message, verify_signature
 from d2a.verbs import (
     make_bind_request, make_bind_token, verify_token, verify_bind_token,
@@ -52,6 +55,10 @@ __all__ = [
     # composition
     "Composer",
     "CompositionPlan",
+    "Composition",
+    "AtomicBinder",
+    "RuntimeMonitor",
+    "ReleaseManager",
     # schema
     "Capability",
     "BindRequest",
