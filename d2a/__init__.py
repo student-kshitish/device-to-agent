@@ -39,6 +39,14 @@ from d2a.resource_probes import probe_resources, RESOURCE_PROBES, RESOURCE_SENSI
 from d2a.policy import ResourcePolicy
 from d2a.sense_types import SenseRequest, SenseFrame, VALID_SHAPES, VALID_MODES, VERDICT_LEVELS, ADVICE
 from d2a.sense_layer import SenseLayer
+from d2a.guardian.relay import DumbRelay
+from d2a.guardian.virtual_object import VirtualSmartObject
+from agents.guardian_agent import GuardianAgent
+from d2a.composition.synthesis_types import (
+    SynthesisSpec, EmergentDevice, SYNTHESIS_REGISTRY,
+)
+from d2a.composition.synthesizer import Synthesizer
+from d2a.composition.emergent_runtime import EmergentDeviceHandle
 
 __all__ = [
     # contracts + adapters
@@ -120,4 +128,14 @@ __all__ = [
     "VERDICT_LEVELS",
     "ADVICE",
     "SenseLayer",
+    # guardian / Case 2
+    "DumbRelay",
+    "GuardianAgent",
+    "VirtualSmartObject",
+    # synthesis / Case 3
+    "SynthesisSpec",
+    "EmergentDevice",
+    "SYNTHESIS_REGISTRY",
+    "Synthesizer",
+    "EmergentDeviceHandle",
 ]

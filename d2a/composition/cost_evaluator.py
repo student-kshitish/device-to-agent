@@ -40,6 +40,9 @@ class Blueprint:
     total_cost: float
     valid: bool
     reject_reason: str = ""
+    # Synthesis goals attach an EmergentDevice blueprint here at plan time.
+    # None for regular producer→consumer goals.
+    synthesis_metadata: Optional[dict] = field(default=None, compare=False)
 
     def describe(self) -> str:
         lines = [f"Blueprint(goal={self.goal}, total_cost={self.total_cost:.3f}, valid={self.valid})"]

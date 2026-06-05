@@ -162,6 +162,14 @@ class Composer:
     def plan(self, goal: str) -> CompositionPlan:
         log: list[str] = []
 
+        # Synthesis sub-stage: if this is a synthesis goal, bypass the regular
+        # producer→consumer pipeline and run the Synthesizer instead.
+        # NOTHING binds here — synthesis is pure planning, same as stages 1-7.
+        from d2a.composition.synthesizer import Synthesizer
+        _synth = Synthesizer()
+        if _synth.can_synthesize(goal):
+            return self._plan_synthesis(goal, _synth, log)
+
         # Stage 1 — goal → role-specs
         try:
             role_specs = self._goal_planner.plan_requirements(goal)
@@ -235,6 +243,45 @@ class Composer:
             stages_log=log,
         )
 
+    def _plan_synthesis(
+        self, goal: str, synth, log: list[str]
+    ) -> CompositionPlan:
+        """
+        Synthesis sub-stage (called from plan() when goal is in SYNTHESIS_REGISTRY).
+        Runs Synthesizer to produce Blueprint objects, then the normal FallbackPlanner.
+        NOTHING is bound here — pure planning, same guarantee as stages 1-7.
+        """
+        log.append(f"Stage 1 GoalPlanner: synthesis goal '{goal}' → Synthesizer sub-stage")
+        pool = self._pool_provider()
+        log.append(f"Stage 2 Synthesizer: {len(pool)} candidates in pool")
+
+        blueprints = synth.enumerate_synthesis_plans(goal, pool)
+        valid_count = sum(1 for b in blueprints if b.valid)
+        log.append(
+            f"Stage S Synthesizer: {len(blueprints)} blueprints, {valid_count} valid"
+        )
+
+        if valid_count == 0:
+            reasons = [b.reject_reason for b in blueprints if not b.valid]
+            return CompositionPlan(
+                goal=goal, ok=False,
+                reason="; ".join(reasons[:2]) or "no valid synthesis plan",
+                stages_log=log,
+            )
+
+        primary, fallbacks = self._fallback_planner.plan(blueprints)
+        log.append(
+            f"Stage 7 FallbackPlanner: primary cost={primary.total_cost:.3f} "
+            f"fallbacks={len(fallbacks)}"
+        )
+        return CompositionPlan(
+            goal=goal,
+            ok=True,
+            primary_blueprint=primary,
+            fallback_blueprints=fallbacks,
+            stages_log=log,
+        )
+
     # ─────────────────────────────────────────────────────────────────────────
     # STAGE 8: BIND (atomic, with automatic fallback)
     # ─────────────────────────────────────────────────────────────────────────
@@ -245,6 +292,9 @@ class Composer:
         Tries primary blueprint first; on failure automatically tries each
         fallback blueprint in order. If all fail, returns (False, reason)
         having bound nothing. On success returns a Composition.
+
+        For synthesis goals, attaches an EmergentDeviceHandle as comp.handle
+        after a successful bind — the unified interface over all bound members.
         """
         if not plan.ok:
             return False, f"cannot bind a failed plan: {plan.reason}"
@@ -275,6 +325,10 @@ class Composer:
                     remaining_fallbacks=remaining,
                     priority=priority,
                 )
+                # Attach EmergentDeviceHandle for synthesis goals
+                if blueprint.synthesis_metadata:
+                    from d2a.composition.emergent_runtime import EmergentDeviceHandle
+                    comp.handle = EmergentDeviceHandle.from_composition(comp)
                 return comp
             last_reason = f"{label}: {result}"
 

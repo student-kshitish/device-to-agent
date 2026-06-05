@@ -581,6 +581,46 @@ class DeviceRuntime:
 
     # ── sense layer interface ──────────────────────────────────────────────────
 
+    # ── relay interface (Case 2 — Capability Guardian) ────────────────────────
+
+    def start_relay(self, resource_name: str | None = None):
+        """
+        Create a DumbRelay for a raw peripheral detected by resource_probes.
+
+        The relay exposes the device's raw path over D2A with zero intelligence.
+        The matching GuardianAgent runs elsewhere — same machine in tests, a
+        different node in a real deployment.  Only the transport differs.
+
+        Returns a DumbRelay instance, or None if no suitable peripheral found.
+        """
+        from d2a.guardian.relay import DumbRelay
+
+        rs = self.resource_snapshot
+
+        # Default: first available storage mount
+        if resource_name is None:
+            resource_name = next(
+                (n for n in ("storage",) if n in rs and rs[n].get("mounts")),
+                None,
+            )
+
+        path: str | None = None
+        if resource_name == "storage" and "storage" in rs:
+            mounts = rs["storage"].get("mounts", [])
+            path   = mounts[0]["path"] if mounts else "/"
+        elif resource_name and resource_name in rs:
+            res = rs[resource_name]
+            path = res.get("path") or (res.get("nodes") or [None])[0]
+
+        if not path:
+            return None
+
+        relay = DumbRelay(node_id=self.node_id, device_path_or_probe=path)
+        print(f"[{self.name}] relay started  resource='{resource_name}'  path={path}")
+        return relay
+
+    # ── sense layer interface ──────────────────────────────────────────────────
+
     def sense_reading(
         self,
         resource: str,
