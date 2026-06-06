@@ -88,8 +88,8 @@ print(f"    kind        = '{cap_record['kind']}'")
 print(f"    path        = {cap_record['path']}")
 print(f"    size_bytes  = {cap_record['size_bytes']}")
 print(f"    writable    = {cap_record['writable']}")
-assert cap_record["name"] == "raw_storage"
-assert cap_record["kind"] == "block_or_fs"
+assert cap_record["name"] == "raw_block_fs"
+assert cap_record["kind"] == "block_fs"
 
 # list_entries — primitive
 r = relay1.handle_op({"op": "list_entries", "path": ""})
