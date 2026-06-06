@@ -195,6 +195,156 @@ class EmergentDeviceHandle:
             return r
         return {"data": bytes.fromhex(r["data"]), "tier": "slow"}
 
+    # ── merged_stream ─────────────────────────────────────────────────────────
+
+    def read_merged(self, max_per_member: int = 64, timeout: float = 0.2) -> dict:
+        """
+        Read from all char_stream members in round-robin order.
+        Returns {"chunks": [{member_index, node_id, data_hex}, ...], "members": N}.
+
+        Each member is called with read_stream; empty/error chunks are skipped.
+        Members whose relay is unavailable are skipped silently (graceful degradation).
+        """
+        if self._kind != "merged_stream":
+            return {"error": "read_merged() only valid for merged_stream handle"}
+
+        chunks: list[dict] = []
+        for i, slot in sorted(self._placement.items()):
+            node_id = slot.get("node_id")
+            relay   = self._relay_map.get(node_id)
+            if relay is None:
+                continue
+            # Ensure the stream is open (idempotent: already-open returns an error we ignore)
+            relay.handle_op({"op": "open_stream"})
+            # No 'path' field: relay uses its own registered root (exact-path jail)
+            result = relay.handle_op({
+                "op":      "read_stream",
+                "max_bytes": max_per_member,
+                "timeout":   timeout,
+            })
+            # relay returns {"data": hex_str, ...} where "data" is the raw bytes as hex
+            raw_hex = result.get("data") or result.get("data_hex", "")
+            if "error" not in result and raw_hex:
+                chunks.append({
+                    "member_index": i,
+                    "node_id":      node_id,
+                    "data_hex":     raw_hex,
+                })
+        return {"chunks": chunks, "members": len(self._placement)}
+
+    def tail_all(self, lines: int = 10) -> dict:
+        """
+        Read the last `lines` text lines from each char_stream member.
+        Returns {"tails": {member_index: [str, ...]}}.
+        """
+        if self._kind != "merged_stream":
+            return {"error": "tail_all() only valid for merged_stream handle"}
+
+        tails: dict[int, list[str]] = {}
+        for i, slot in sorted(self._placement.items()):
+            node_id = slot.get("node_id")
+            relay   = self._relay_map.get(node_id)
+            if relay is None:
+                tails[i] = []
+                continue
+            # Ensure stream is open; collect block and split into lines
+            relay.handle_op({"op": "open_stream"})
+            result = relay.handle_op({
+                "op":       "read_stream",
+                "max_bytes": lines * 128,
+                "timeout":   0.1,
+            })
+            raw_hex = result.get("data") or result.get("data_hex", "")
+            if "error" in result or not raw_hex:
+                tails[i] = []
+            else:
+                raw   = bytes.fromhex(raw_hex).decode("utf-8", errors="replace")
+                tails[i] = raw.splitlines()[-lines:]
+        return {"tails": tails}
+
+    # ── sensor_array ──────────────────────────────────────────────────────────
+
+    def read_all(self) -> dict:
+        """
+        Read the current scalar value from each sensor_file member.
+        Returns {
+            "readings": {member_index: {"node_id": str, "value": str, "raw": str}},
+            "aggregate": {"min": float, "max": float, "mean": float, "count": int},
+        }.
+        Numeric conversion is best-effort; non-numeric values are included in
+        readings but excluded from the aggregate (not silently dropped).
+        """
+        if self._kind != "sensor_array":
+            return {"error": "read_all() only valid for sensor_array handle"}
+
+        readings: dict[int, dict] = {}
+        numeric:  list[float]     = []
+
+        for i, slot in sorted(self._placement.items()):
+            node_id = slot.get("node_id")
+            relay   = self._relay_map.get(node_id)
+            if relay is None:
+                readings[i] = {"node_id": node_id, "error": "relay_unavailable"}
+                continue
+            # No 'path' field: sensor_file relay reads its own registered path
+            result = relay.handle_op({"op": "read_value"})
+            raw = result.get("value", "")
+            rec = {"node_id": node_id, "raw": raw}
+            try:
+                val = float(raw.strip())
+                rec["value"] = val
+                numeric.append(val)
+            except (ValueError, AttributeError):
+                rec["value"] = raw
+            readings[i] = rec
+
+        agg: dict = {"count": len(numeric)}
+        if numeric:
+            agg["min"]  = min(numeric)
+            agg["max"]  = max(numeric)
+            agg["mean"] = round(sum(numeric) / len(numeric), 6)
+
+        return {"readings": readings, "aggregate": agg}
+
+    def verdict_all(self, warn: float, danger: float) -> dict:
+        """
+        Read all sensor members and classify: ok / warn / danger.
+        Returns {"verdicts": {member_index: "ok"|"warn"|"danger"|"error"},
+                 "summary": "ok"|"warn"|"danger"}.
+        Overall summary = worst level seen.
+        """
+        if self._kind != "sensor_array":
+            return {"error": "verdict_all() only valid for sensor_array handle"}
+
+        all_data = self.read_all()
+        if "error" in all_data:
+            return all_data
+
+        level_rank = {"ok": 0, "warn": 1, "danger": 2, "error": -1}
+        verdicts:  dict[int, str] = {}
+        worst      = "ok"
+
+        for idx, rec in all_data["readings"].items():
+            if "error" in rec:
+                verdicts[idx] = "error"
+                continue
+            try:
+                val = float(rec.get("raw", "").strip())
+            except (ValueError, AttributeError):
+                verdicts[idx] = "error"
+                continue
+            if val >= danger:
+                lv = "danger"
+            elif val >= warn:
+                lv = "warn"
+            else:
+                lv = "ok"
+            verdicts[idx] = lv
+            if level_rank.get(lv, 0) > level_rank.get(worst, 0):
+                worst = lv
+
+        return {"verdicts": verdicts, "summary": worst}
+
     # ── stats ─────────────────────────────────────────────────────────────────
 
     def stats(self) -> dict:
@@ -224,6 +374,22 @@ class EmergentDeviceHandle:
                 "fast_max":     self._fast_max,
                 "fast_keys":    list(self._fast_cache.keys()),
                 "fast_order":   list(self._fast_order),
+            })
+        elif self._kind == "merged_stream":
+            base.update({
+                "member_count": len(self._placement),
+                "members": {
+                    i: {"node_id": slot.get("node_id")}
+                    for i, slot in self._placement.items()
+                },
+            })
+        elif self._kind == "sensor_array":
+            base.update({
+                "member_count": len(self._placement),
+                "members": {
+                    i: {"node_id": slot.get("node_id"), "member_id": slot.get("member_id")}
+                    for i, slot in self._placement.items()
+                },
             })
         return base
 

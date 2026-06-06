@@ -87,6 +87,11 @@ class DeviceRuntime:
         # DataProvider so no duplicate source instances are created.
         self.sense = SenseLayer(self.data._sources, self.device_class)
 
+        # ── peripheral registry (Case 2 generalisation) ───────────────────────
+        # Tracks peripherals registered at runtime via attach_peripheral().
+        # Only paths the user/config explicitly provides — no auto-scan of /dev.
+        self._peripheral_paths: dict[str, str] = {}   # realpath → cap_name
+
         # Now apply override (may inject sources into self.data)
         if capability_override is not None:
             self.capabilities = self._apply_override(capability_override)
@@ -580,6 +585,97 @@ class DeviceRuntime:
         }
 
     # ── sense layer interface ──────────────────────────────────────────────────
+
+    # ── peripheral advertisement (Case 2 generalisation) ─────────────────────
+
+    def attach_peripheral(
+        self,
+        path: str,
+        kind_override: str | None = None,
+    ) -> dict:
+        """
+        Register a peripheral the user/config has explicitly pointed at.
+
+        SECURITY: Only paths passed in here are exposed — the runtime NEVER
+        auto-scans /dev or any directory.  Kind is auto-detected via
+        detect_kind() unless kind_override is given (for simulation/testing).
+
+        Sensitivity is tied directly into ResourcePolicy consistent with the
+        existing camera/mic model:
+          open kinds   → policy.allow()          (any remote agent may bind)
+          sensitive     → policy.require_approval() (owner approval required;
+                          default callback = DENY, exactly like camera/mic)
+
+        Returns the capability-record dict (same shape as
+        DumbRelay.capabilities()[0]) or {"error": ...} if unavailable.
+        """
+        from d2a.guardian.device_kinds import (
+            detect_kind, KIND_SENSITIVITY, KIND_PRIMITIVES,
+            is_system_input, KIND_UNAVAILABLE, KIND_INPUT_EVENT,
+        )
+
+        realpath = os.path.realpath(path)
+        kind     = kind_override if kind_override else detect_kind(realpath)
+
+        if kind == KIND_UNAVAILABLE:
+            return {"error": "device_unavailable", "path": path}
+
+        sensitivity = KIND_SENSITIVITY.get(kind, "open")
+        access      = "consent_required" if sensitivity == "sensitive" else "open"
+        sys_input   = is_system_input(realpath) if kind == KIND_INPUT_EVENT else False
+        primitives  = KIND_PRIMITIVES.get(kind, [])
+        cap_name    = f"raw_{kind}"
+
+        # Tie into ResourcePolicy — same gate as camera/mic
+        if access == "consent_required":
+            self.policy.require_approval(cap_name)
+        else:
+            self.policy.allow(cap_name)
+
+        cap = Capability(
+            name=cap_name,
+            tags=[cap_name, access, "peripheral"],
+            live_state={
+                "kind":        kind,
+                "path":        realpath,
+                "primitives":  primitives,
+                "access":      access,
+                "system_input": sys_input,
+            },
+            node_id=self.node_id,
+            public_key=self.public_key,
+        )
+
+        self.capabilities[cap_name]  = cap
+        self.broker.quotas[cap_name] = 1
+        self._peripheral_paths[realpath] = cap_name
+
+        print(f"[{self.name}] attach_peripheral  path={path!r}  "
+              f"kind={kind}  access={access}")
+
+        return {
+            "name":        cap_name,
+            "kind":        kind,
+            "path":        realpath,
+            "primitives":  primitives,
+            "access":      access,
+            "system_input": sys_input,
+            "relay_node_id": self.node_id,
+        }
+
+    def detach_peripheral(self, path: str) -> dict:
+        """
+        Remove a previously registered peripheral from the advertised capabilities.
+        Live update: immediately drops it from broker quotas and the capability set.
+        """
+        realpath = os.path.realpath(path)
+        cap_name = self._peripheral_paths.pop(realpath, None)
+        if cap_name is None:
+            return {"error": "peripheral_not_found", "path": path}
+        self.capabilities.pop(cap_name, None)
+        self.broker.quotas.pop(cap_name, None)
+        print(f"[{self.name}] detach_peripheral  path={path!r}  cap={cap_name}")
+        return {"status": "detached", "cap_name": cap_name, "path": path}
 
     # ── relay interface (Case 2 — Capability Guardian) ────────────────────────
 

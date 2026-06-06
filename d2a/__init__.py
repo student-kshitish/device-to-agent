@@ -42,8 +42,10 @@ from d2a.sense_layer import SenseLayer
 from d2a.guardian.relay import DumbRelay
 from d2a.guardian.virtual_object import VirtualSmartObject
 from agents.guardian_agent import GuardianAgent
+from d2a.guardian.device_kinds import detect_kind, KIND_SENSITIVITY, KIND_PRIMITIVES
 from d2a.composition.synthesis_types import (
     SynthesisSpec, EmergentDevice, SYNTHESIS_REGISTRY,
+    MERGED_STREAM_POLICY, SENSOR_ARRAY_AGG,
 )
 from d2a.composition.synthesizer import Synthesizer
 from d2a.composition.emergent_runtime import EmergentDeviceHandle
@@ -132,10 +134,15 @@ __all__ = [
     "DumbRelay",
     "GuardianAgent",
     "VirtualSmartObject",
+    "detect_kind",
+    "KIND_SENSITIVITY",
+    "KIND_PRIMITIVES",
     # synthesis / Case 3
     "SynthesisSpec",
     "EmergentDevice",
     "SYNTHESIS_REGISTRY",
+    "MERGED_STREAM_POLICY",
+    "SENSOR_ARRAY_AGG",
     "Synthesizer",
     "EmergentDeviceHandle",
 ]
