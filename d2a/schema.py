@@ -45,4 +45,7 @@ class Binding:
     scope: str
     created_at: float
     rebind_count: int = 0
-    status: str = "active"  # active | rebound | released | expired
+    status: str = "active"  # active | rebound | released | expired | preempted
+    # Why the binding left the active set. One of: "" (still active) | released |
+    # preempted | expired. Set only through the broker's shared teardown path.
+    release_reason: str = ""

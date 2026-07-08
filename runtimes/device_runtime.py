@@ -1,4 +1,5 @@
 import os
+import threading
 import time
 
 from d2a import (
@@ -33,9 +34,13 @@ class DeviceRuntime:
         open_resources:      list[str] | None = None,
         deny_resources:      list[str] | None = None,
         approval_callback                      = None,
+        # Binding lease TTL in seconds. The device clock is the sole authority for
+        # expiry; agents renew before this elapses (see RemoteAgent auto-renew).
+        lease_ttl:           int               = 300,
     ):
         self.name = name
         self.node_id = generate_node_id()
+        self.lease_ttl = int(lease_ttl)
         self.private_key, self.public_key = generate_keypair()
         self.keypair = KeyPair(
             node_id=self.node_id,
@@ -346,9 +351,97 @@ class DeviceRuntime:
         self.swarm.start()
         self.swarm.message_handler = self._on_message
         self.publish_capabilities()
+        self._start_lease_sweeper()
 
     def stop_swarm(self) -> None:
+        self._sweeper_running = False
         self.swarm.stop()
+
+    # ── lease expiry sweeper ────────────────────────────────────────────────────
+
+    def _start_lease_sweeper(self) -> None:
+        """
+        Background thread that reaps expired leases. Interval is min(TTL/10, 5s)
+        so a lapsed lease is freed within a small fraction of its TTL. All teardown
+        goes through broker.sweep_expired() → the shared release path (frees the
+        slot, fires the waitqueue auto-grant); we then kill the binding's stream and
+        send a best-effort lease_expired push. The device clock alone decides expiry.
+        """
+        self._sweeper_running = True
+        interval = min(max(self.lease_ttl / 10.0, 0.2), 5.0)
+
+        def _loop():
+            while self._sweeper_running:
+                time.sleep(interval)
+                if not self._sweeper_running:
+                    break
+                try:
+                    self._sweep_leases_once()
+                except Exception:
+                    pass
+
+        threading.Thread(target=_loop, daemon=True, name=f"lease-sweeper-{self.name}").start()
+
+    def _sweep_leases_once(self) -> list[dict]:
+        """One sweep pass. Returns the list of expired-binding infos (for tests)."""
+        expired = self.broker.sweep_expired()
+        for info in expired:
+            binding_id = info["binding_id"]
+            # 1. tear down any streaming subscription tied to this binding
+            self._cleanup_binding_stream(binding_id)
+            # 2. best-effort, fire-and-forget notification to the agent's last
+            #    known address (only reachable if the agent gave agent_address at
+            #    bind/subscribe time — otherwise silently undeliverable).
+            try:
+                self.swarm.send(info["agent_id"], {
+                    "type":            "lease_expired",
+                    "binding_id":      binding_id,
+                    "capability_name": info["capability_name"],
+                    "node_id":         self.node_id,
+                    "reason":          "ttl_expired",
+                    "expired_at":      time.time(),
+                })
+            except Exception:
+                pass
+            print(f"[{self.name}] lease expired binding={binding_id[:8]} "
+                  f"cap={info['capability_name']} → slot freed"
+                  + (f", auto-granted to {info['next_agent_id'][:8]}" if info.get("next_agent_id") else ""))
+        return expired
+
+    def _handle_renew(self, agent_id: str, binding_id: str, capability: str) -> dict:
+        """
+        Validate ownership + liveness, then extend the lease via the existing
+        renew() primitive (broker_renew → verbs.renew). Held under the broker lock
+        so the sweeper cannot expire this binding between the check and the renew.
+        The new expiry is computed from the DEVICE clock only.
+        """
+        denied = lambda reason: {
+            "type": "lease_renewed", "status": "denied",
+            "binding_id": binding_id, "reason": reason,
+        }
+        with self.broker._lock:
+            b = self.broker.get_binding(binding_id)
+            if b is None:
+                return denied("unknown_binding")
+            if b.agent_id != agent_id:
+                return denied("not_owner")
+            if capability and b.capability_name != capability:
+                return denied("capability_mismatch")
+            # A lease that already lapsed (or lost its slot) cannot be renewed —
+            # the agent must re-bind. Device clock is the sole authority here.
+            if b.status != "active" or time.time() > b.token.expires_at:
+                return denied("expired")
+
+            self.broker_renew(binding_id, self.lease_ttl)
+            b = self.broker.get_binding(binding_id)
+
+        print(f"[{self.name}] lease renewed binding={binding_id[:8]} "
+              f"cap={b.capability_name} ttl={self.lease_ttl}s")
+        return {
+            "type": "lease_renewed", "status": "renewed", "binding_id": binding_id,
+            "lease_ttl": self.lease_ttl, "lease_expires_at": b.token.expires_at,
+            "signature": b.token.signature,
+        }
 
     def publish_capabilities(self) -> None:
         ip, port = self.swarm.address
@@ -399,6 +492,15 @@ class DeviceRuntime:
             needs    = message.get("needs", [])
             priority = message.get("priority", 5)
 
+            # agent_address is UNVERIFIED — agent-claimed, unauthenticated. We use
+            # it only as a best-effort return path for lease_expired pushes. It is
+            # NOT a security boundary.
+            # TODO(ed25519): move agent_address inside the signed bind payload when
+            # HMAC is replaced with asymmetric keys, so it can't be spoofed.
+            agent_address = message.get("agent_address")
+            if agent_address and len(agent_address) == 2:
+                self.swarm.add_known_peer(agent_id, agent_address[0], int(agent_address[1]))
+
             # All TCP bind_requests are remote — always enforce policy
             decision = self.policy.check(cap_name, agent_id, is_remote=True)
             if decision == "deny":
@@ -424,12 +526,22 @@ class DeviceRuntime:
                     "agent_id":             token.agent_id,
                     "node_id":              token.node_id,
                     "scope":                token.scope,
-                    "expires_at":           token.expires_at,
+                    "expires_at":           token.expires_at,     # kept for back-compat
+                    "lease_ttl":            self.lease_ttl,
+                    "lease_expires_at":     token.expires_at,      # authoritative (device clock)
                     "signature":            token.signature,
                     "device_class":         self.device_class,
                     "verified_by_provider": True,
                 }
             return {"status": result.get("status"), "message": result.get("message", "")}
+
+        # ── lease renewal (wire-level) ────────────────────────────────────────
+        if mtype == "renew_binding":
+            return self._handle_renew(
+                agent_id=message.get("from_node", ""),
+                binding_id=message.get("binding_id", ""),
+                capability=message.get("capability_name", ""),
+            )
 
         # ── capability probe (TCP fallback for AP-isolation / probe_peer) ──────
         if mtype == "capabilities_request":

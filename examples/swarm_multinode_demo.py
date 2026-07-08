@@ -184,6 +184,9 @@ print(SEP)
 # seeker1 first (priority=1 — highest)
 r_s1 = seeker1.bind_remote_to(gpu_box.node_id, "gpu", priority=1)
 print(f"  seeker1 (priority=1) → {r_s1.get('status')}  verified={r_s1.get('verified')}")
+print(f"    lease: ttl={r_s1.get('lease_ttl')}s  "
+      f"expires_at=+{max(0, r_s1.get('lease_expires_at', 0) - time.time()):.0f}s "
+      f"(device clock; seeker auto-renews at ~½ TTL)")
 
 # seeker2 second (priority=5 — lower, slot already taken)
 r_s2 = seeker2.bind_remote_to(gpu_box.node_id, "gpu", priority=5)

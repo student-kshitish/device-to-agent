@@ -51,7 +51,7 @@ flowchart TB
 
     subgraph Transport["🌐  Swarm Transport"]
         LS["LANSwarm\nUDP broadcast + TCP"]
-        DS["DHTSwarm stub\nKademlia — in progress"]
+        DS["DHTSwarm\nKademlia UDP discovery + reused TCP core"]
     end
 
     A1 & A2 --> Core
@@ -280,6 +280,8 @@ Multiple agents compete for a finite number of hardware slots. The broker handle
 
 > ⚠️ Current signing is **HMAC-based** (`hmac.compare_digest` with a shared private key). Upgrading to **Ed25519 asymmetric verification** is **in progress**.
 
+**Binding leases (DHCP-style).** Every binding is a *lease* with a TTL (default 300 s), carried in the bind response as `lease_ttl` / `lease_expires_at`. **The device clock is the single source of truth for expiry — agent and device clocks are never compared.** The agent auto-renews at ~½ TTL (with jitter); a single dropped renew is retried (~every TTL/10) and does *not* kill a healthy binding — only an explicit denial or the device-clock deadline actually passing does. On expiry the device runs one unified teardown (the same broker path as explicit release and preemption): it frees the broker slot, hands it to any queued agent, tears down subscriptions, and invalidates the token. This means a crashed agent that never releases no longer holds a slot forever — the lease lapses within a fraction of a TTL and the resource is reclaimed. What expiry does **not** guarantee: the `lease_expired` notice pushed to the agent is **best-effort, fire-and-forget** (it needs the agent's UNVERIFIED, agent-claimed `agent_address`, and can be lost); an agent that misses it simply finds its next request rejected. Renewal is transport-agnostic — identical over `LANSwarm` and `DHTSwarm`.
+
 **Consent policy** (`policy.py`):
 
 ```
@@ -330,7 +332,7 @@ Each device probes itself at startup using `/proc/meminfo`, `/proc/loadavg`, `/s
 
 - **Real two-machine / cross-network deployment** — everything is tested single-process; cross-machine binding under real network conditions is not yet validated
 - **Ed25519 asymmetric signing** — current HMAC signing uses a shared private key; upgrade to proper asymmetric keypairs is planned
-- **EdgeMind DHT wiring** — `DHTSwarm` adapter exists as a thin stub; the external `anp-edge-swarm` package must be installed separately and validated end-to-end
+- **Cross-machine DHT validation** — `DHTSwarm` is a full pure-stdlib Kademlia discovery layer (routing table, multi-value STORE/FIND_VALUE with TTL, bootstrap) over the reused LANSwarm TCP core; it is validated end-to-end *single-machine* (N nodes on distinct ports). Real multi-host / NAT-traversal validation is the remaining step
 - **Sense Layer Part 2** — SafetyFilter (pre-return veto), ReflexPath (urgent fast-path), EventEmitter (verdict-change events), HealthAggregator (rolling health history)
 - **Real adapter implementations** — adapter descriptors correctly track `IOContract` through transforms; the actual pixel/tensor computations are simulated; wiring to real compute (OpenCV, NumPy) is a separate phase
 - **Multi-hop data routing** — `Composer.run()` verifies contracts and pulls from the producer; real cross-node data streaming (producer sends to consumer over the network) is a future phase
@@ -349,7 +351,8 @@ d2a/
 ├── resource_probes.py     Generic resource probes: camera, mic, location, storage …
 ├── policy.py              Owner-consent policy (safe defaults, sensitive = denied)
 ├── swarm.py               SwarmTransport ABC + LANSwarm (UDP broadcast + TCP)
-├── swarm_dht.py           DHTSwarm adapter stub (needs anp-edge-swarm)
+├── swarm_dht.py           DHTSwarm: Kademlia UDP discovery + reused TCP core
+├── kademlia.py            Pure-stdlib Kademlia node (routing table, STORE/FIND_VALUE)
 ├── data_provider.py       On-demand pull + opt-in streaming data engine
 ├── stream_source.py       Per-resource SignalSource readers
 ├── preprocessor.py        Delta / rate computation, ring buffer
@@ -420,5 +423,5 @@ All examples run single-process with no network setup required unless noted.
 
 - **Language:** Python 3.10+
 - **Dependencies:** standard library only — `socket`, `threading`, `hashlib`, `hmac`, `secrets`, `dataclasses`, `itertools`. No `pip install` required.
-- **Transport:** `LANSwarm` is built-in (UDP broadcast for discovery, TCP for messages). `DHTSwarm` is a thin adapter stub; the underlying Kademlia DHT comes from the [EdgeMind swarm project](https://github.com/student-kshitish/anp-edge-swarm) and must be installed separately.
+- **Transport:** `LANSwarm` is built-in (UDP broadcast for discovery, TCP for messages). `DHTSwarm` is a full pure-stdlib Kademlia discovery layer (`d2a/kademlia.py`) that reuses the LANSwarm TCP core for messaging — so `bind_remote()` works unchanged over the DHT. Its routing-table + XOR-metric design follows the [EdgeMind swarm project](https://github.com/student-kshitish/anp-edge-swarm), reworked here for multi-value TTL storage, event-driven lookups, parameterizable ports, and thread safety. See `examples/swarm_dht_demo.py` and `tests/test_dht.py`.
 - **Platforms tested:** Linux (kernel 6.x, x86). The `/proc` and `/sys` probe paths are Linux-native; macOS / BSD probes fall back gracefully when paths are absent.

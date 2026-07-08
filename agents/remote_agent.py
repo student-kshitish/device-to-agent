@@ -1,8 +1,23 @@
+import random
+import threading
 import time
 
 from d2a import generate_node_id, LANSwarm, SwarmTransport
 
 TTL = 30
+
+
+class LeaseLostError(Exception):
+    """
+    Raised when a binding's lease can no longer be kept alive — the device denied
+    a renewal, or the lease expired (renew never succeeded before the device-clock
+    deadline, or a lease_expired push arrived). Surfaced on the next use of the
+    binding (request_data / start_stream) so loss is never silent.
+    """
+    def __init__(self, binding_id: str, reason: str):
+        self.binding_id = binding_id
+        self.reason = reason
+        super().__init__(f"lease lost for binding {binding_id[:8]}: {reason}")
 
 
 class RemoteAgent:
@@ -18,7 +33,8 @@ class RemoteAgent:
     Works with any SwarmTransport — LANSwarm by default, DHTSwarm when installed.
     """
 
-    def __init__(self, name: str = "agent", transport: SwarmTransport = None):
+    def __init__(self, name: str = "agent", transport: SwarmTransport = None,
+                 auto_renew: bool = True):
         self.name = name
         self.agent_id = generate_node_id()
         self.needs: list[str] = []
@@ -28,19 +44,35 @@ class RemoteAgent:
         self._stream_handlers: dict[str, object]  = {}   # binding_id -> on_frame callable
         self._stream_sub_ids:  dict[str, str]      = {}   # binding_id -> device-side sub_id
 
+        # lease state: binding_id -> lease dict (see _start_lease). auto_renew=False
+        # reproduces the old "never renews" behavior — the binding then lives for
+        # exactly one TTL and expires cleanly.
+        self.auto_renew = auto_renew
+        self._leases: dict[str, dict] = {}
+        self._leases_lock = threading.Lock()
+        self.on_lease_lost = None   # optional callback(binding_id, reason)
+
     def start(self) -> None:
         self.swarm.start()
         # route incoming stream_frame messages to registered handlers
         self.swarm.message_handler = self._on_message
 
     def stop(self) -> None:
+        # Stop all auto-renew loops (simulates clean agent shutdown; a crashed
+        # agent that never calls stop() simply stops renewing and its leases lapse).
+        with self._leases_lock:
+            leases = list(self._leases.values())
+            self._leases.clear()
+        for lease in leases:
+            lease["stop"].set()
         self.swarm.stop()
 
     # ── incoming message router ────────────────────────────────────────────────
 
     def _on_message(self, message: dict) -> dict | None:
         """Handle messages pushed TO this agent (e.g. stream_frame from device)."""
-        if message.get("type") == "stream_frame":
+        mtype = message.get("type")
+        if mtype == "stream_frame":
             bid     = message.get("binding_id", "")
             frame   = message.get("frame", {})
             handler = self._stream_handlers.get(bid)
@@ -49,6 +81,15 @@ class RemoteAgent:
                     handler(frame)
                 except Exception:
                     pass
+        elif mtype == "lease_expired":
+            # Best-effort device notification that our lease is gone. Stop renewing
+            # and mark it lost so the next use raises LeaseLostError.
+            bid = message.get("binding_id", "")
+            with self._leases_lock:
+                lease = self._leases.get(bid)
+            if lease is not None:
+                lease["stop"].set()
+                self._mark_lost(lease, message.get("reason", "ttl_expired"))
         return None  # no TCP reply needed for inbound pushes
 
     # ── discovery / bind ──────────────────────────────────────────────────────
@@ -69,12 +110,21 @@ class RemoteAgent:
                 None,
             )
 
+        # agent_address is our TCP listener — an UNVERIFIED hint the device may use
+        # to push best-effort lease_expired notices back to us. Not authenticated.
+        try:
+            ip, port = self.swarm.address
+            agent_address = [ip, port]
+        except Exception:
+            agent_address = None
+
         request = {
             "type":            "bind_request",
             "from_node":       self.agent_id,
             "capability_name": capability_name,
             "needs":           self.needs,
             "priority":        priority,
+            "agent_address":   agent_address,
         }
 
         response = self.swarm.send_and_recv(target_node_id, request, timeout=5.0)
@@ -98,7 +148,111 @@ class RemoteAgent:
         # Surface policy denials clearly for agent authors — no silent failure
         if response.get("status") == "denied":
             response["policy_message"] = response.get("message", "denied by device policy")
+        # A verified bind starts a lease we keep alive (unless auto_renew is off).
+        if verified:
+            self._start_lease(response)
         return response
+
+    # ── lease lifecycle (auto-renew) ───────────────────────────────────────────
+
+    def _start_lease(self, binding: dict) -> None:
+        """Record a lease for a freshly-verified binding and (if auto_renew) begin
+        renewing it before the device-clock deadline."""
+        bid = binding.get("binding_id", "")
+        if not bid:
+            return
+        ttl = binding.get("lease_ttl") or 300
+        exp = binding.get("lease_expires_at") or binding.get("expires_at") or (time.time() + ttl)
+        lease = {
+            "binding_id":       bid,
+            "capability":       binding.get("capability_name", ""),
+            "provider_node_id": binding.get("provider_node_id", ""),
+            "lease_ttl":        ttl,
+            "lease_expires_at": exp,
+            "stop":             threading.Event(),
+            "lost":             None,
+        }
+        with self._leases_lock:
+            # replace any prior lease for this binding_id
+            old = self._leases.get(bid)
+            if old:
+                old["stop"].set()
+            self._leases[bid] = lease
+        if self.auto_renew:
+            t = threading.Thread(target=self._renew_loop, args=(lease,), daemon=True,
+                                 name=f"renew-{bid[:8]}")
+            lease["thread"] = t
+            t.start()
+
+    def _renew_loop(self, lease: dict) -> None:
+        """
+        Renew at TTL*(0.5±0.1). A single failed renew must NOT kill a healthy
+        binding: on network failure/timeout we retry ~every TTL/10 (jittered) until
+        success, an explicit denial, or the device-clock deadline actually passes.
+        Only a denial or a real expiry marks the lease lost.
+        """
+        stop = lease["stop"]
+        while not stop.is_set():
+            ttl = lease["lease_ttl"]
+            wait = ttl * (0.5 + random.uniform(-0.1, 0.1))
+            if stop.wait(wait):
+                return                                    # released / stopped cleanly
+
+            # renew attempt with transient-failure retry
+            while not stop.is_set():
+                resp = self.swarm.send_and_recv(lease["provider_node_id"], {
+                    "type":            "renew_binding",
+                    "from_node":       self.agent_id,
+                    "binding_id":      lease["binding_id"],
+                    "capability_name": lease["capability"],
+                }, timeout=5.0)
+
+                if resp is None:
+                    # transient — don't give up unless the lease has truly expired
+                    if time.time() >= lease["lease_expires_at"]:
+                        self._mark_lost(lease, "ttl_expired")
+                        return
+                    retry = max(lease["lease_ttl"] / 10.0, 0.2) * (0.9 + random.uniform(0.0, 0.2))
+                    if stop.wait(retry):
+                        return
+                    continue
+
+                if resp.get("status") == "renewed":
+                    lease["lease_expires_at"] = resp.get("lease_expires_at", lease["lease_expires_at"])
+                    lease["lease_ttl"]        = resp.get("lease_ttl", ttl)
+                    break                                 # renewed — back to half-TTL sleep
+
+                # explicit denial → lease is unrecoverable, surface immediately
+                self._mark_lost(lease, resp.get("reason", "denied"))
+                return
+
+    def _mark_lost(self, lease: dict, reason: str) -> None:
+        already = None
+        with self._leases_lock:
+            already = lease.get("lost")
+            lease["lost"] = lease.get("lost") or reason
+        if already:
+            return
+        print(f"[{self.name}] LEASE LOST binding={lease['binding_id'][:8]} reason={reason}")
+        cb = self.on_lease_lost
+        if cb:
+            try:
+                cb(lease["binding_id"], reason)
+            except Exception:
+                pass
+
+    def _raise_if_lost(self, binding_id: str) -> None:
+        with self._leases_lock:
+            lease = self._leases.get(binding_id)
+            reason = lease.get("lost") if lease else None
+        if reason:
+            raise LeaseLostError(binding_id, reason)
+
+    def _stop_lease(self, binding_id: str) -> None:
+        with self._leases_lock:
+            lease = self._leases.pop(binding_id, None)
+        if lease:
+            lease["stop"].set()
 
     def bind_remote(self, capability_name: str, priority: int = 5) -> dict:
         """
@@ -141,6 +295,7 @@ class RemoteAgent:
             {"type":"reading", "capability":..., "binding_id":..., "frame": {raw, derived, ts, seq}}
             or {"type":"error", "error": reason} if rejected.
         """
+        self._raise_if_lost(binding.get("binding_id", ""))
         cap    = capability or binding.get("capability_name", "")
         target = binding.get("provider_node_id", "")
         request = {
@@ -167,6 +322,7 @@ class RemoteAgent:
         Use this for monitoring over time. Prefer request_data() for one-shot needs.
         Frames stop immediately when stop_stream() is called.
         """
+        self._raise_if_lost(binding.get("binding_id", ""))
         cap    = binding.get("capability_name", "")
         target = binding.get("provider_node_id", "")
         bid    = binding.get("binding_id", "")
@@ -208,6 +364,7 @@ class RemoteAgent:
 
     def release_binding(self, binding: dict) -> dict:
         """Release a binding on the provider. Called by ResourceHandle on exit."""
+        self._stop_lease(binding.get("binding_id", ""))   # stop auto-renew first
         cap_name = binding.get("capability_name", "")
         target   = binding.get("provider_node_id", "")
         response = self.swarm.send_and_recv(target, {

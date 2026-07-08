@@ -17,6 +17,7 @@ from d2a.verbs import (
 from d2a.broker import CapabilityBroker
 from d2a.probes import probe_all, available_resources, PROBES
 from d2a.swarm import SwarmTransport, LANSwarm
+from d2a.swarm_dht import DHTSwarm
 from d2a.stream_source import (
     SignalSource,
     CPUSource,
@@ -104,6 +105,7 @@ __all__ = [
     # swarm
     "SwarmTransport",
     "LANSwarm",
+    "DHTSwarm",
     # data delivery — signal sources
     "SignalSource",
     "CPUSource",
