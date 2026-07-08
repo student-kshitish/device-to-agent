@@ -176,7 +176,7 @@ def simulate_attach(path: str, cap_registry: dict, quota_registry: dict,
             "system_input":  system_input,
         },
         node_id="test-node",
-        public_key=b"",
+        public_key="",
     )
     cap_registry[cap_name]   = cap
     quota_registry[cap_name] = 1

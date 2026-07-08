@@ -62,7 +62,8 @@ class CapabilityBroker:
 
     def _issue_token(self, agent_id: str, capability_name: str, needs: list[str], priority: int) -> ActiveBind:
         req = make_bind_request(agent_id, capability_name, needs, priority)
-        token = make_bind_token(req, self.runtime.node_id, self.runtime.private_key, self._lease_ttl())
+        token = make_bind_token(req, self.runtime.node_id, self.runtime.private_key,
+                                self.runtime.public_key, self._lease_ttl())
         binding = make_binding(token)
         self.bindings[binding.binding_id] = binding
         return ActiveBind(

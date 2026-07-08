@@ -3,14 +3,15 @@ import threading
 import time
 
 from d2a import (
-    Capability, KeyPair, BindToken,
-    generate_node_id, generate_keypair,
+    Capability, BindToken,
     verify_bind_token, CapabilityBroker,
     rebind, renew,
     probe_all,
     LANSwarm, SwarmTransport,
     IOContract, CapabilityContract,
+    crypto,
 )
+from d2a import signing
 from d2a.resource_probes import probe_resources, RESOURCE_SENSITIVITY
 from d2a.policy import ResourcePolicy
 from d2a.stream_source import (
@@ -39,14 +40,19 @@ class DeviceRuntime:
         lease_ttl:           int               = 300,
     ):
         self.name = name
-        self.node_id = generate_node_id()
         self.lease_ttl = int(lease_ttl)
-        self.private_key, self.public_key = generate_keypair()
-        self.keypair = KeyPair(
-            node_id=self.node_id,
-            private_key=self.private_key,
-            public_key=self.public_key,
-        )
+        # Persisted Ed25519 identity. node_id is DERIVED from the public key
+        # (crypto.derive_node_id), so this node cannot claim an id it doesn't
+        # hold the key for. Keyed by `name` → stable across restarts, which is
+        # what makes peers' TOFU pins hold. NOTE: two runtimes sharing a name
+        # (and D2A_HOME) share one identity — name your nodes uniquely.
+        self.keypair = crypto.load_or_create_keypair(name)
+        self.node_id = self.keypair.node_id
+        self.private_key = self.keypair.private_key
+        self.public_key = self.keypair.public_key
+        # This device pins the AGENTS that bind to it. Per-name pin file so
+        # concurrent nodes in one process don't clobber each other's pins.
+        self.pins = crypto.PinStore(path=crypto.d2a_home() / f"pins-{name}.json")
 
         # ── hardware + resource probes ────────────────────────────────────────
         self.snapshot          = probe_all()
@@ -415,10 +421,10 @@ class DeviceRuntime:
         so the sweeper cannot expire this binding between the check and the renew.
         The new expiry is computed from the DEVICE clock only.
         """
-        denied = lambda reason: {
+        denied = lambda reason: self._sign({
             "type": "lease_renewed", "status": "denied",
             "binding_id": binding_id, "reason": reason,
-        }
+        })
         with self.broker._lock:
             b = self.broker.get_binding(binding_id)
             if b is None:
@@ -437,11 +443,12 @@ class DeviceRuntime:
 
         print(f"[{self.name}] lease renewed binding={binding_id[:8]} "
               f"cap={b.capability_name} ttl={self.lease_ttl}s")
-        return {
+        return self._sign({
             "type": "lease_renewed", "status": "renewed", "binding_id": binding_id,
             "lease_ttl": self.lease_ttl, "lease_expires_at": b.token.expires_at,
-            "signature": b.token.signature,
-        }
+            "node_id": self.node_id,
+            "token_sig": b.token.signature,
+        })
 
     def publish_capabilities(self) -> None:
         ip, port = self.swarm.address
@@ -456,7 +463,7 @@ class DeviceRuntime:
                 "device_class": self.device_class,
                 "ts":           time.time(),
             }
-            self.swarm.publish(record)
+            self.swarm.publish(signing.sign_record(record, self.private_key, self.public_key))
 
     # ── binding scope verification ─────────────────────────────────────────────
 
@@ -482,21 +489,37 @@ class DeviceRuntime:
 
     # ── message handler ────────────────────────────────────────────────────────
 
+    def _sign(self, msg: dict) -> dict:
+        """Ed25519-sign an outbound trust message with this device's key
+        (v + ts stamped inside the signed payload)."""
+        return signing.sign_message(msg, self.private_key, self.public_key)
+
     def _on_message(self, message: dict) -> dict | None:
         mtype = message.get("type")
 
         # ── bind request (with policy check) ──────────────────────────────────
         if mtype == "bind_request":
             agent_id = message.get("from_node", "unknown")
+
+            # ── Ed25519 trust gate ────────────────────────────────────────────
+            # bind is a trust operation: it MUST be signed by an agent whose
+            # node_id derives from its signing key and matches any prior pin.
+            # Unsigned (e.g. a 1.0 peer) → hard reject as POLICY (ruling #3),
+            # with a reason distinct from version_mismatch.
+            reason = signing.verify_message(message, agent_id, self.pins)
+            if reason is not None:
+                print(f"[{self.name}] bind_request from {agent_id[:8]} REJECTED — {reason}")
+                return self._sign({"type": "bind_response", "status": "denied",
+                                   "reason": reason,
+                                   "message": f"trust check failed: {reason}"})
+
             cap_name = message.get("capability_name", "")
             needs    = message.get("needs", [])
             priority = message.get("priority", 5)
 
-            # agent_address is UNVERIFIED — agent-claimed, unauthenticated. We use
-            # it only as a best-effort return path for lease_expired pushes. It is
-            # NOT a security boundary.
-            # TODO(ed25519): move agent_address inside the signed bind payload when
-            # HMAC is replaced with asymmetric keys, so it can't be spoofed.
+            # agent_address now rides INSIDE the signed payload — a verified,
+            # tamper-evident hint the device may use to push lease_expired notices
+            # back to the agent. (Closed TODO: was unauthenticated in the HMAC era.)
             agent_address = message.get("agent_address")
             if agent_address and len(agent_address) == 2:
                 self.swarm.add_known_peer(agent_id, agent_address[0], int(agent_address[1]))
@@ -506,21 +529,21 @@ class DeviceRuntime:
             if decision == "deny":
                 print(f"[{self.name}] bind_request from {agent_id[:8]} for '{cap_name}' "
                       f"→ denied (policy: blocked)")
-                return {"type": "bind_response", "status": "denied",
-                        "message": "resource blocked by device policy"}
+                return self._sign({"type": "bind_response", "status": "denied",
+                                   "message": "resource blocked by device policy"})
             if decision == "needs_approval":
                 if not self.policy.approve(cap_name, agent_id):
                     print(f"[{self.name}] bind_request from {agent_id[:8]} for '{cap_name}' "
                           f"→ denied (sensitive: approval required)")
-                    return {"type": "bind_response", "status": "denied",
-                            "message": "owner approval required for sensitive resource"}
+                    return self._sign({"type": "bind_response", "status": "denied",
+                                       "message": "owner approval required for sensitive resource"})
 
             result = self.broker_request(agent_id, cap_name, needs, priority)
             print(f"[{self.name}] bind_request from {agent_id[:8]} for '{cap_name}' "
                   f"→ {result['status']}")
             if result.get("status") in ("granted", "granted_by_preemption"):
                 token = result["token"]
-                return {
+                return self._sign({
                     "type":                 "bind_response",
                     "status":               result["status"],
                     "binding_id":           result.get("binding_id"),
@@ -531,17 +554,24 @@ class DeviceRuntime:
                     "expires_at":           token.expires_at,     # kept for back-compat
                     "lease_ttl":            self.lease_ttl,
                     "lease_expires_at":     token.expires_at,      # authoritative (device clock)
-                    "signature":            token.signature,
+                    "token_sig":            token.signature,       # device-signed token artifact
                     "device_class":         self.device_class,
                     "verified_by_provider": True,
-                }
-            return {"type": "bind_response", "status": result.get("status"),
-                    "message": result.get("message", "")}
+                })
+            return self._sign({"type": "bind_response", "status": result.get("status"),
+                               "message": result.get("message", "")})
 
         # ── lease renewal (wire-level) ────────────────────────────────────────
         if mtype == "renew_binding":
+            agent_id = message.get("from_node", "")
+            reason = signing.verify_message(message, agent_id, self.pins)
+            if reason is not None:
+                print(f"[{self.name}] renew_binding from {agent_id[:8]} REJECTED — {reason}")
+                return self._sign({"type": "lease_renewed", "status": "denied",
+                                   "binding_id": message.get("binding_id", ""),
+                                   "reason": reason})
             return self._handle_renew(
-                agent_id=message.get("from_node", ""),
+                agent_id=agent_id,
                 binding_id=message.get("binding_id", ""),
                 capability=message.get("capability_name", ""),
             )
@@ -551,7 +581,7 @@ class DeviceRuntime:
             ip, port = self.swarm.address
             records = []
             for cap in self.advertise():
-                records.append({
+                records.append(signing.sign_record({
                     "node_id":      self.node_id,
                     "name":         cap.name,
                     "tags":         list(cap.tags),
@@ -560,7 +590,7 @@ class DeviceRuntime:
                     "address":      [ip, port],
                     "device_class": self.device_class,
                     "ts":           time.time(),
-                })
+                }, self.private_key, self.public_key))
             return {"type": "capabilities_response", "records": records}
 
         # ── on-demand data pull (THE DEFAULT) ─────────────────────────────────
@@ -630,16 +660,21 @@ class DeviceRuntime:
         # ── remote release (from ResourceHandle.release) ──────────────────────
         if mtype == "release_binding":
             agent_id = message.get("from_node", "")
+            reason = signing.verify_message(message, agent_id, self.pins)
+            if reason is not None:
+                print(f"[{self.name}] release_binding from {agent_id[:8]} REJECTED — {reason}")
+                return self._sign({"type": "released", "status": "denied", "reason": reason})
             cap_name = message.get("capability_name", "")
             result   = self.broker_release(agent_id, cap_name)
-            return {"type": "released", "status": result.get("status", "ok")}
+            return self._sign({"type": "released", "status": result.get("status", "ok")})
 
         return None
 
     # ── broker interface ───────────────────────────────────────────────────────
 
     def verify_agent_token(self, token: BindToken) -> bool:
-        return verify_bind_token(token, self.private_key)
+        # A device-issued token is verified against the device's OWN public key.
+        return verify_bind_token(token, self.public_key)
 
     def broker_request(self, agent_id: str, capability_name: str,
                        needs: list[str], priority: int = 5) -> dict:

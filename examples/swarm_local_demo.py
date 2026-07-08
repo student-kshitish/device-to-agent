@@ -100,8 +100,8 @@ if result.get("verified"):
     print(f"  expires_at  : {result.get('expires_at'):.2f}")
     print(f"  verified    : {result['verified']}")
     print()
-    print("  Verification note: node_id match + provider-confirmed + not-expired.")
-    print("  (Full client-side sig verification needs Ed25519; HMAC needs private key.)")
+    print("  Verification note: Ed25519 signature verified + device key TOFU-pinned")
+    print("  (node_id derives from the key) + provider-confirmed + not-expired.")
 else:
     print(f"BIND FAILED: {result}")
     print(SEP)

@@ -33,6 +33,17 @@ from d2a.swarm_dht import DHTSwarm
 from d2a.kademlia import KademliaNode
 from runtimes.device_runtime import DeviceRuntime
 from agents.remote_agent import RemoteAgent, LeaseLostError
+from d2a import crypto
+from tests._env import use_tmp_home, restore_home
+
+
+def setUpModule():
+    # Isolate persisted Ed25519 keys + TOFU pins to a tmpdir (never touch ~/.d2a).
+    use_tmp_home()
+
+
+def tearDownModule():
+    restore_home()
 
 TTL = 2   # short lease for fast tests; sweeper interval = min(TTL/10, 5) = 0.2s
 
@@ -48,8 +59,10 @@ def free_udp_port() -> int:
 # ── (b) pure-broker: preemption and expiry share one teardown path ───────────────
 
 class _FakeRuntime:
-    node_id = "dev-node"
-    private_key = "k" * 32
+    # Real Ed25519 keypair now (the broker signs tokens with it); node_id is
+    # derived so token verification against public_key holds. Was "k"*32 HMAC.
+    private_key, public_key = crypto.generate_keypair()
+    node_id = crypto.derive_node_id(public_key)
     lease_ttl = TTL
     def get_capability(self, name):
         return True if name == "x" else None
@@ -127,10 +140,14 @@ class LeaseTestsMixin:
         return agent.bind_remote_to(device.node_id, cap, priority)
 
     def renew_over_wire(self, agent, binding) -> dict:
-        return agent.swarm.send_and_recv(binding["provider_node_id"], {
+        # renew_binding is a trust op now — sign it with the agent's Ed25519 key,
+        # exactly as RemoteAgent._renew_loop does (v1.1 wire requirement).
+        from d2a import signing
+        msg = signing.sign_message({
             "type": "renew_binding", "from_node": agent.agent_id,
             "binding_id": binding["binding_id"], "capability_name": binding["capability_name"],
-        }, timeout=5.0)
+        }, agent.private_key, agent.public_key)
+        return agent.swarm.send_and_recv(binding["provider_node_id"], msg, timeout=5.0)
 
     # 1 — TTL present in bind response
     def test_bind_response_carries_lease(self):

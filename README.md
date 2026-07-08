@@ -36,7 +36,7 @@ flowchart TB
 
     subgraph Pipeline["⚙️  Resolution Pipeline"]
         AD["Advertise"]
-        TG["Trust Gate\nHMAC-signed token"]
+        TG["Trust Gate\nEd25519-signed token"]
         BR["Contention Broker\npriority · quota · preemption"]
         BI["Binding\nscoped · expiring"]
         AD --> TG --> BR --> BI
@@ -86,7 +86,7 @@ flowchart LR
     P0["⚡ 0 · Exist\nprobe self"]
     P1["📡 1 · Advertise\npublish capabilities"]
     P2["🔍 2 · Discover\nagent finds providers"]
-    P3["🔑 3 · Trust\nHMAC token issued"]
+    P3["🔑 3 · Trust\nEd25519 token issued"]
     P4["🔗 4 · Bind\nbroker grants slot"]
     P5["👁️ 5 · Sense\nread via sense layer"]
     P6["🎯 6 · Act\nuse the capability"]
@@ -272,13 +272,33 @@ Multiple agents compete for a finite number of hardware slots. The broker handle
 
 ---
 
-## Trust & Safety
+## Security model (Ed25519, v1.1)
 
-**Identity:** Each node generates a random 16-hex node ID and an HMAC keypair at startup (`identity.py`).
+As of **v1.1** the trust gate is real asymmetric cryptography. **Identity is a keypair.**
 
-**Tokens:** A `BindToken` is scoped to one capability on one node for one agent, with a TTL expiry and an HMAC signature. The device verifies the token before honouring any data request.
+> **What the old model actually was (honesty first).** Before v1.1, "signing" was HMAC where the device signed a token with its *own* secret and later verified it with the *same* secret. The published `public_key` was `sha256(private_key)` and was **never used in any verification path**. Net effect: **there was no cross-node authentication at all** — a device only ever "trusted" a token it had minted itself, and no agent or device ever cryptographically verified the other. v1.1 replaces this wholesale.
 
-> ⚠️ Current signing is **HMAC-based** (`hmac.compare_digest` with a shared private key). Upgrading to **Ed25519 asymmetric verification** is **in progress**.
+**Identity = keypair.** Each node (device *and* agent) has a persisted Ed25519 keypair, and its `node_id` is **derived from its public key** (`node_id = sha256(pubkey)[:16]`, `crypto.derive_node_id`). You cannot claim a `node_id` you don't hold the key for. Keys live in `~/.d2a/keys/<name>.json` (mode `0600`; override the base dir with `D2A_HOME` / `XDG_DATA_HOME`), keyed by node name so identity is stable across restarts.
+
+**Dual crypto backend, one wire format.** `d2a/crypto.py` auto-detects a backend at import: **PyNaCl → `cryptography` → a pure-Python RFC 8032 fallback** (`d2a/_ed25519_fallback.py`). Signatures are byte-identical across all three (verified against the RFC 8032 §7.1 test vectors and cross-backend), so nodes on different backends interoperate.
+
+> ⚠️ **The pure-Python fallback is DEMO-GRADE ONLY: not constant-time, slow, and vulnerable to timing side channels that can leak the signing key.** It exists so the core has zero third-party dependencies and still produces real signatures on a bare install. **Production deployments MUST install a real backend** (`pip install pynacl` or `cryptography`); detection is automatic. Check `d2a.crypto.ACTIVE_BACKEND` / `crypto.using_fallback()`.
+
+**What is signed.** The five security-critical trust messages —
+`bind_request`, `bind_response`, `renew_binding`, `lease_renewed`, `release_binding` — plus published **capability records**. The `BindToken` itself is device-signed over *all* its fields (`capability_name, agent_id, node_id, scope, expires_at, ts`), closing an earlier gap where `expires_at`/`scope` rode along unsigned. Canonical signing is sorted-key, compact-separator, UTF-8 JSON; `sig_key` (the signer's pubkey) is inside the signed bytes, `sig` is outside. The protocol version `v` and a timestamp `ts` are inside the signed payload too — so `agent_address` and `v` are now **tamper-evident** (both previously-flagged unauthenticated fields are closed).
+
+**TOFU (trust on first use).** A peer's key is pinned on first contact (`~/.d2a/known_peers.json` via `crypto.PinStore`); both roles pin (agents pin devices, devices pin agents). Two independent checks guard every signed message, each with a distinct reason: **derivation** — `node_id` must derive from the presented key (`node_id_derivation_mismatch`); and **pin** — a known `node_id` presenting a different key is rejected loudly (`tofu_key_mismatch`). A bare signature check is never trusted on its own — a self-consistent forgery that claims another node's identity fails the derivation check.
+
+**Replay window.** A signed message with `|receiver_now − ts| > 60 s` is rejected (`stale_signature`). The receiver clock is authoritative, consistent with the lease design. Records reuse the transport's TTL for freshness instead of a signed replay window (the transport rewrites a record's `ts` on ingest, so `ts` is excluded from a record's signature).
+
+**Data-path messages stay bearer-authenticated (deliberately).** `get_reading` / `subscribe` / `stream_frame` are **not** signed per-request; the device authorizes them by looking up the `binding_id` in its own in-memory store. The signed `bind_response` is what proves the binding is real; the `binding_id` then acts as a bearer capability handle.
+
+**What is explicitly NOT provided:**
+
+- **No transport encryption.** Messages are signed, not encrypted — signing prevents *forgery*, not *eavesdropping*. A `binding_id` is a bearer token and is **sniffable on-path**; anyone who observes it can use it until the lease expires. **Leases are what bound the damage window** (default 300 s). Put D2A on a trusted network or add TLS/WireGuard underneath if confidentiality matters.
+- **No revocation** and **no key rotation.** A pinned key is pinned until the pin store is edited; there is no CRL/OCSP and a re-keyed node presents as a new identity.
+- **No PKI / no CA.** Trust is TOFU only — no certificate chains, no web of trust.
+- **No forward secrecy.** There is no session key exchange; compromise of a signing key compromises all past and future signatures by it.
 
 **Binding leases (DHCP-style).** Every binding is a *lease* with a TTL (default 300 s), carried in the bind response as `lease_ttl` / `lease_expires_at`. **The device clock is the single source of truth for expiry — agent and device clocks are never compared.** The agent auto-renews at ~½ TTL (with jitter); a single dropped renew is retried (~every TTL/10) and does *not* kill a healthy binding — only an explicit denial or the device-clock deadline actually passing does. On expiry the device runs one unified teardown (the same broker path as explicit release and preemption): it frees the broker slot, hands it to any queued agent, tears down subscriptions, and invalidates the token. This means a crashed agent that never releases no longer holds a slot forever — the lease lapses within a fraction of a TTL and the resource is reclaimed. What expiry does **not** guarantee: the `lease_expired` notice pushed to the agent is **best-effort, fire-and-forget** (it needs the agent's UNVERIFIED, agent-claimed `agent_address`, and can be lost); an agent that misses it simply finds its next request rejected. Renewal is transport-agnostic — identical over `LANSwarm` and `DHTSwarm`.
 
@@ -300,15 +320,17 @@ Sensitive resources → DENIED to all remote agents by default
 
 ## Versioning & Compatibility
 
-**The wire format is officially `v1.0`** as of the lease work — `d2a.PROTOCOL_VERSION = "1.0"` (defined in `d2a/protocol.py`). Every outbound message and every published capability record carries a top-level `"v"` field, injected at the serialization chokepoints (TCP `_tcp_send` / `_handle_tcp`, LAN UDP `_broadcast` / `_handle_udp`, Kademlia `_send` / `_handle`, and both `publish()` sites). It is a plain field, **not** an envelope, so handlers that read `msg["type"]` are unaffected.
+**The wire format is `v1.1`** as of the Ed25519 trust work — `d2a.PROTOCOL_VERSION = "1.1"` (defined in `d2a/protocol.py`). v1.1 is an **additive** minor bump over v1.0: it adds the `sig` / `sig_key` / `ts` fields to signed messages and records. Every outbound message and every published capability record carries a top-level `"v"` field, injected at the serialization chokepoints (TCP `_tcp_send` / `_handle_tcp`, LAN UDP `_broadcast` / `_handle_udp`, Kademlia `_send` / `_handle`, and both `publish()` sites). It is a plain field, **not** an envelope, so handlers that read `msg["type"]` are unaffected.
 
 The compatibility contract:
 
 | Peer version | Rule |
 |---|---|
-| **Same major** (`1.x` ↔ `1.y`) | Compatible. Process normally. **Minor versions are additive-only; unknown fields are ignored** — a `1.0` node and a future `1.4` node interoperate. |
+| **Same major** (`1.x` ↔ `1.y`) | Compatible. Process normally. **Minor versions are additive-only; unknown fields are ignored** — a `1.0` node and a `1.1` node interoperate on the data path. *(One deliberate exception below.)* |
 | **Different major** (`1.x` ↔ `2.x`) | Incompatible (breaking). TCP requests get `{"type":"error","reason":"version_mismatch","peer_version":…}`; the agent raises a typed **`ProtocolVersionError`** naming both versions. Kademlia UDP messages from a different major are logged and **dropped with no reply** (no error-reply loops). |
 | **Missing `"v"`** (legacy `0.x`) | Accepted for now, with a one-time deprecation warning per peer. **Planned to be rejected in the next major.** |
+
+**Deliberate security exception to additive-only (v1.1).** The five trust operations must be Ed25519-signed. An **unsigned** `bind_request` / `renew_binding` / `release_binding` — e.g. from a v1.0 peer that predates signing — is **hard-rejected** with `{"reason":"unsigned_trust_op"}` (distinct from `version_mismatch`), even though the peers share a major. This narrowly breaks the additive-only promise **on purpose**: a half-trusted binding is worse than a failed one, so trust operations are not silently downgraded. **The data path is unaffected** — an unsigned `get_reading` / `subscribe` / `stream_frame` from a v1.0 peer still works, because those were never trust operations. So v1.0↔v1.1 interoperate for data, but v1.1 will not *establish* a binding for an unsigned peer.
 
 **Relay caveat (message-level vs record-level `v`).** A message's `"v"` gates only the *immediate peer*. But a capability record is data that can be *relayed*: a DHT node running the same major can legitimately serve you a record **authored by a different-major node** inside a perfectly valid same-major `VALUE`/`announce` message. Records therefore carry their **own** author `"v"`, and a foreign-major record is **ingested** (not dropped) with a `debug`-level log — record-level `v` is the eventual gate for author compatibility, message-level `v` gates the hop. Rejecting foreign-major records on ingest is deferred to the next major.
 
@@ -332,7 +354,7 @@ Each device probes itself at startup using `/proc/meminfo`, `/proc/loadavg`, `/s
 
 - Self-probing `DeviceRuntime`: CPU, memory, GPU, thermal, battery, disk I/O, network I/O, camera presence, microphone presence, location, storage, display
 - Capability advertisement and discovery via LANSwarm (UDP broadcast + TCP)
-- HMAC-based trust gate: signed scoped expiring `BindToken`
+- Ed25519 trust gate: device-signed scoped expiring `BindToken`; signed bind/renew/release + records; TOFU key pinning; pubkey-derived node IDs; replay window
 - Contention broker: priority, quotas, preemption, wait-queue, auto-grant, audit log, cancel-queue
 - Binding lifecycle: bind / rebind / renew / unbind
 - On-demand data pull (default path, zero background work)
@@ -347,7 +369,7 @@ Each device probes itself at startup using `/proc/meminfo`, `/proc/loadavg`, `/s
 ### 🔧 In Progress
 
 - **Real two-machine / cross-network deployment** — everything is tested single-process; cross-machine binding under real network conditions is not yet validated
-- **Ed25519 asymmetric signing** — current HMAC signing uses a shared private key; upgrade to proper asymmetric keypairs is planned
+- **Key revocation / rotation & PKI** — trust is TOFU-only (see the security model); revocation, rotation, and any certificate/CA model are explicitly out of scope. Transport encryption (confidentiality) is also not provided — signing prevents forgery, not eavesdropping
 - **Cross-machine DHT validation** — `DHTSwarm` is a full pure-stdlib Kademlia discovery layer (routing table, multi-value STORE/FIND_VALUE with TTL, bootstrap) over the reused LANSwarm TCP core; it is validated end-to-end *single-machine* (N nodes on distinct ports). Real multi-host / NAT-traversal validation is the remaining step
 - **Sense Layer Part 2** — SafetyFilter (pre-return veto), ReflexPath (urgent fast-path), EventEmitter (verdict-change events), HealthAggregator (rolling health history)
 - **Real adapter implementations** — adapter descriptors correctly track `IOContract` through transforms; the actual pixel/tensor computations are simulated; wiring to real compute (OpenCV, NumPy) is a separate phase
@@ -360,7 +382,10 @@ Each device probes itself at startup using `/proc/meminfo`, `/proc/loadavg`, `/s
 ```
 d2a/
 ├── schema.py              Capability + Binding data contracts (frozen)
-├── identity.py            Node ID + HMAC keypair generation
+├── crypto.py              Ed25519 (dual backend + RFC 8032 fallback), TOFU pins, node_id derivation
+├── _ed25519_fallback.py   Pure-Python RFC 8032 Ed25519 (demo-grade, not constant time)
+├── signing.py             Wire-message + record signing/verification (trust gate)
+├── identity.py            Node ID (binding handles) + Ed25519 token signing
 ├── protocol.py            Wire version (PROTOCOL_VERSION="1.0") + negotiation helpers
 ├── verbs.py               bind / rebind / renew / unbind operations
 ├── broker.py              Contention broker: priority · quota · preemption · waitqueue
@@ -423,7 +448,7 @@ All examples run single-process with no network setup required unless noted.
 | `bind_one.py` | Single bind: agent discovers a runtime, binds a capability, receives a scoped token | `python3 examples/bind_one.py` |
 | `broker_demo.py` | Broker: quota, preemption (priority 1 beats priority 5), wait-queue, auto-grant on release, full audit log | `python3 examples/broker_demo.py` |
 | `rebind_demo.py` | Rebind to a different capability, renew a token TTL, unbind cleanly | `python3 examples/rebind_demo.py` |
-| `trust_demo.py` | HMAC token signing and verification; scoped token; expiry check | `python3 examples/trust_demo.py` |
+| `trust_demo.py` | Ed25519 token signing and verification; cross-runtime token rejected; scoped token; expiry check | `python3 examples/trust_demo.py` |
 | `ondemand_demo.py` | On-demand data pull: agent requests one fresh hardware frame per call, zero background work | `python3 examples/ondemand_demo.py` |
 | `stream_optin_demo.py` | Opt-in streaming: device pushes frames at configurable Hz; agent calls stop to return to silence | `python3 examples/stream_optin_demo.py` |
 | `simple_agent_demo.py` | `with agent.use("compute") as r: r.data()` — 5-line agent experience | `python3 examples/simple_agent_demo.py` |

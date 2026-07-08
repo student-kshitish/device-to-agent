@@ -26,6 +26,12 @@ class BindToken:
     scope: str
     expires_at: float
     signature: str
+    # v1.1 (additive): ts anchors replay/issue time; sig_key is the issuing
+    # device's Ed25519 public key. The signature now covers ALL of the above
+    # (except itself) — closing the old HMAC gap where expires_at/scope were
+    # unsigned. Defaults keep any positional/legacy construction from breaking.
+    ts: float = 0.0
+    sig_key: str = ""
 
 
 @dataclass(frozen=True)
@@ -33,6 +39,11 @@ class KeyPair:
     node_id: str
     private_key: str
     public_key: str
+
+    def __repr__(self) -> str:
+        # Never expose the private seed in logs/reprs/tracebacks.
+        return (f"KeyPair(node_id={self.node_id!r}, "
+                f"public_key={self.public_key!r}, private_key=<redacted>)")
 
 
 @dataclass

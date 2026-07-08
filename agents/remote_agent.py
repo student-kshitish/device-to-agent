@@ -2,7 +2,8 @@ import random
 import threading
 import time
 
-from d2a import generate_node_id, LANSwarm, SwarmTransport, PROTOCOL_VERSION, ProtocolVersionError
+from d2a import LANSwarm, SwarmTransport, PROTOCOL_VERSION, ProtocolVersionError, crypto
+from d2a import signing
 
 TTL = 30
 
@@ -36,7 +37,15 @@ class RemoteAgent:
     def __init__(self, name: str = "agent", transport: SwarmTransport = None,
                  auto_renew: bool = True):
         self.name = name
-        self.agent_id = generate_node_id()
+        # Persisted Ed25519 identity — agents are first-class signing principals
+        # now. agent_id is DERIVED from the public key (can't be spoofed) and
+        # stable across restarts. Keyed by name (share a name → share identity).
+        self.keypair = crypto.load_or_create_keypair(name)
+        self.agent_id = self.keypair.node_id
+        self.private_key = self.keypair.private_key
+        self.public_key = self.keypair.public_key
+        # This agent pins the DEVICES it talks to. Per-name file.
+        self.pins = crypto.PinStore(path=crypto.d2a_home() / f"pins-{name}.json")
         self.needs: list[str] = []
         self.swarm: SwarmTransport = transport if transport is not None else LANSwarm(node_id=self.agent_id)
 
@@ -128,14 +137,21 @@ class RemoteAgent:
         except Exception:
             agent_address = None
 
-        request = {
+        # Defense-in-depth: if we hold a signed record for this provider, verify
+        # and TOFU-pin its device key now, so the bind_response's key must match.
+        if provider_record and signing.is_signed(provider_record):
+            signing.verify_record(provider_record, self.pins)
+
+        # bind_request is a trust op — sign it (v + ts inside the signed payload;
+        # agent_address now rides inside, tamper-evident).
+        request = signing.sign_message({
             "type":            "bind_request",
             "from_node":       self.agent_id,
             "capability_name": capability_name,
             "needs":           self.needs,
             "priority":        priority,
             "agent_address":   agent_address,
-        }
+        }, self.private_key, self.public_key)
 
         response = self.swarm.send_and_recv(target_node_id, request, timeout=5.0)
         if not response:
@@ -146,14 +162,23 @@ class RemoteAgent:
             }
         self._check_version(response)                     # raises on major mismatch
 
+        # The device MUST have signed its response with a key that derives to the
+        # node_id we dialed (and matches any prior pin). This rejects a MITM /
+        # identity-claim forgery even if it copies status/node_id fields.
+        trust_error = signing.verify_message(response, target_node_id, self.pins)
+        response["provider_node_id"] = target_node_id
+        if trust_error is not None:
+            response["verified"]    = False
+            response["trust_error"] = trust_error
+            return response
+
         verified = (
             response.get("status") in ("granted", "granted_by_preemption")
             and response.get("node_id") == target_node_id
             and response.get("verified_by_provider", False)
             and response.get("expires_at", 0) > time.time()
         )
-        response["verified"]         = verified
-        response["provider_node_id"] = target_node_id
+        response["verified"] = verified
         if provider_record:
             response.setdefault("device_class", provider_record.get("device_class", "unknown"))
         # Surface policy denials clearly for agent authors — no silent failure
@@ -211,12 +236,12 @@ class RemoteAgent:
 
             # renew attempt with transient-failure retry
             while not stop.is_set():
-                resp = self.swarm.send_and_recv(lease["provider_node_id"], {
+                resp = self.swarm.send_and_recv(lease["provider_node_id"], signing.sign_message({
                     "type":            "renew_binding",
                     "from_node":       self.agent_id,
                     "binding_id":      lease["binding_id"],
                     "capability_name": lease["capability"],
-                }, timeout=5.0)
+                }, self.private_key, self.public_key), timeout=5.0)
 
                 if resp is None:
                     # transient — don't give up unless the lease has truly expired
@@ -233,6 +258,19 @@ class RemoteAgent:
                 if resp.get("reason") == "version_mismatch":
                     self._mark_lost(lease, "version_mismatch")
                     return
+
+                # The lease_renewed must be authentically from the pinned device.
+                # An unsigned/forged/stale response is NOT trusted — treated like a
+                # dropped packet (fail-safe): retry until success or real expiry, so
+                # a MITM stripping signatures can only let the lease lapse.
+                if signing.verify_message(resp, lease["provider_node_id"], self.pins) is not None:
+                    if time.time() >= lease["lease_expires_at"]:
+                        self._mark_lost(lease, "ttl_expired")
+                        return
+                    retry = max(lease["lease_ttl"] / 10.0, 0.2) * (0.9 + random.uniform(0.0, 0.2))
+                    if stop.wait(retry):
+                        return
+                    continue
 
                 if resp.get("status") == "renewed":
                     lease["lease_expires_at"] = resp.get("lease_expires_at", lease["lease_expires_at"])
@@ -386,9 +424,9 @@ class RemoteAgent:
         self._stop_lease(binding.get("binding_id", ""))   # stop auto-renew first
         cap_name = binding.get("capability_name", "")
         target   = binding.get("provider_node_id", "")
-        response = self.swarm.send_and_recv(target, {
+        response = self.swarm.send_and_recv(target, signing.sign_message({
             "type":            "release_binding",
             "from_node":       self.agent_id,
             "capability_name": cap_name,
-        }, timeout=3.0)
+        }, self.private_key, self.public_key), timeout=3.0)
         return response or {"status": "ok"}

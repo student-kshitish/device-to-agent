@@ -26,6 +26,16 @@ from d2a.kademlia import (
 from d2a.swarm_dht import DHTSwarm
 from runtimes.device_runtime import DeviceRuntime
 from agents.remote_agent import RemoteAgent
+from tests._env import use_tmp_home, restore_home
+
+
+def setUpModule():
+    # Isolate persisted Ed25519 keys + TOFU pins to a tmpdir (never touch ~/.d2a).
+    use_tmp_home()
+
+
+def tearDownModule():
+    restore_home()
 
 
 def free_udp_port() -> int:
