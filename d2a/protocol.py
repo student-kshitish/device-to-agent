@@ -23,7 +23,7 @@ wire dumps/logs and unambiguous in JSON. Major is int(v.split(".")[0]).
 
 import logging
 
-PROTOCOL_VERSION = "1.1"
+PROTOCOL_VERSION = "1.2"
 VERSION_FIELD = "v"
 
 logger = logging.getLogger("d2a.protocol")

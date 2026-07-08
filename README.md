@@ -318,9 +318,82 @@ Sensitive resources → DENIED to all remote agents by default
 
 ---
 
+## Capability Manifests (v1.2)
+
+Every capability record can carry a **manifest** — a signed, machine-readable self-description so an agent learns what a capability *is* (its reading schema, actions, consent tier, whether it streams) from discovery alone, without reading any device code. This is D2A's equivalent of an **MCP tool schema / A2A agent card**, and the prerequisite for a mechanical `d2a→MCP` bridge.
+
+The manifest lives inside the capability record, which is **already Ed25519-signed at publish** (`signing.sign_record`), so **manifests are authenticated for free** — a tampered manifest fails `verify_record`. The manifest is injected at the single record builder (`DeviceRuntime._capability_record`, shared by the UDP/DHT publish path and the TCP `capabilities_request` path) *before* signing. Manifests are **optional** (a record without one is valid — additive contract) and validated at publish time (`d2a/manifest.py`, a stdlib leaf).
+
+**Deliberately a small fixed vocabulary, not full JSON Schema** (no `$ref`, `oneOf`, or deep nesting) — so manifests are writable by hand, diffable, verifiable, and translatable to MCP schemas mechanically. The whole grammar:
+
+```
+manifest = {
+  "description": <str>,                      # one line, human-readable        (required)
+  "reading":  { <field>: <fieldspec> },      # what a data frame contains      (optional)
+  "actions":  { <name>: { "description": <str>,
+                          "params": { <param>: <paramspec> } } },              (optional)
+  "consent_tier": "open" | "sensitive",      # MUST equal the policy SSOT      (required)
+  "streaming": <bool>                         # does subscribe() apply?      (default false)
+}
+
+fieldspec / paramspec = {
+  "type": "number" | "string" | "boolean" | "object" | "array",               (required)
+  "items": "number" | "string" | "boolean" | "object",   # required iff type=="array";
+                                                          # forbidden otherwise; NO nested arrays
+  "unit":  <str>,          # optional, e.g. "%", "MB", "C"
+  "description": <str>,    # optional
+  "format": "hex",         # optional; ONLY on type=="string" — declares hex-encoded bytes
+  "required": <bool>       # paramspec only
+}
+```
+
+**Bytes** are represented as hex-encoded `"string"` fields, optionally annotated `"format": "hex"` so the encoding is machine-readable.
+
+**consent_tier is not free text.** It must equal the resource's *intrinsic* sensitivity — the single source of truth is `RESOURCE_SENSITIVITY` (resource capabilities) / `KIND_SENSITIVITY` (peripheral kinds), unknown → `"sensitive"`. The validator rejects any manifest whose `consent_tier` contradicts it. Rationale: **the manifest describes the resource's *nature*; whether *this* device grants it is a bind-time policy decision** (see the consent policy), never encoded in the manifest — so it can't drift from, or lie about, the policy layer.
+
+**Size cap.** A manifest larger than **4 KB** is rejected at publish. This matters because Kademlia `FIND_VALUE` returns **all** live provider records for a capability in **one** UDP datagram (`{"records": [...]}`, `MAX_PACKET = 65535`) — so the datagram size is `N_providers × record_size`, not a single record. A realistic manifest is ~0.6 KB (record ~1.2 KB); the 4 KB cap keeps a single verbose manifest from breaking discovery, but heavy provider fan-in on one capability still trends toward the 64 KB ceiling. A finer mitigation (cap records-per-`VALUE`, or TCP fallback for large result sets) is **explicitly deferred** — out of scope for v1.2.
+
+**Worked example** — the `sensing` capability manifest (note the array-typed fields, the SSOT-derived `consent_tier`, and units):
+
+```json
+{
+  "description": "Thermal zones and hardware sensor inputs of the host.",
+  "reading": {
+    "thermal_zones":  { "type": "number", "description": "count of thermal zones" },
+    "sample_temps_c": { "type": "array", "items": "number", "unit": "C",
+                        "description": "sample of current zone temperatures" },
+    "sensor_inputs":  { "type": "number", "description": "count of hwmon sensor inputs" },
+    "hwmons":         { "type": "array", "items": "string",
+                        "description": "hardware monitor chip names" }
+  },
+  "consent_tier": "open",
+  "streaming": true
+}
+```
+
+**Agent side:** `discover()` results expose `record["manifest"]`; `RemoteAgent.describe(capability_name)` returns the parsed manifest from the discovery cache. See `examples/manifest_demo.py`.
+
+Built-in manifests ship for `compute`, `sensing`, `camera`, and `raw_<kind>` peripheral relays. Guardian (Case 2) and Synthesis (Case 3) virtual capabilities carry their own composed manifests when they go on-wire — see below.
+
+---
+
+## Composition on the Wire
+
+Guardian VirtualSmartObjects (Case 2) and Synthesis emergent devices (Case 3) are no longer in-process only — a host node **publishes them as first-class capabilities** that other agents discover, bind, and drive over the network, through the **same** broker quota, lease lifecycle, and consent policy as any real capability.
+
+**Guardian — `DeviceRuntime.publish_virtual(vso)`.** Publishes the VSO's *smart* surface (e.g. `smart_sensor` with `verdict`/`monitor` actions) as a distinctly-named capability, signed with the host key, alongside the `raw_<kind>` relay capability (which keeps its own raw-primitive manifest). Both surfaces are independently discoverable. The manifest is composed from the kind's action map — the smart actions, not the raw primitives.
+
+**Synthesis — `DeviceRuntime.publish_emergent(handle)`.** The **coordinator** node that holds the `EmergentDeviceHandle` publishes the emergent device (e.g. `pooled_storage_2x` with `write`/`read`). The manifest is composed **only** from the synthesis kind + `combined_contract` — **member records are never embedded**, so no per-part manifest or member `node_id` leaks into the emergent record (there's a test asserting exactly this).
+
+**Binding & actions.** A virtual capability is registered in the host's capability set + broker quota + consent policy (its consent tier comes from `KIND_SENSITIVITY`), so bind/renew/release, lease expiry, and consent gating all apply identically — **there is no consent bypass through the virtual path** (a sensitive-kind VSO denies an unapproved remote agent, proven by test). Reads route through the virtual dispatcher; a new additive **`action`** message (binding-scope-gated, like `get_reading`) invokes a manifest-declared action via `RemoteAgent.call_action(binding, action, params)`. Bytes cross the wire hex-encoded.
+
+> **Honest coordinator caveat.** The coordinator/host is a **single point of failure and a trust chokepoint**: agents trust *its* Ed25519 signature over the virtual/emergent record and its routing, and the **member devices are invisible behind it** — an agent cannot see or independently verify the parts a coordinator fused, nor reach them directly. The emergent *record* carries no member identity, but a runtime *action response* (e.g. a pooled `read`) may still reference the member that served it. Distributed multi-coordinator trust and per-member attestation are out of scope.
+
+---
+
 ## Versioning & Compatibility
 
-**The wire format is `v1.1`** as of the Ed25519 trust work — `d2a.PROTOCOL_VERSION = "1.1"` (defined in `d2a/protocol.py`). v1.1 is an **additive** minor bump over v1.0: it adds the `sig` / `sig_key` / `ts` fields to signed messages and records. Every outbound message and every published capability record carries a top-level `"v"` field, injected at the serialization chokepoints (TCP `_tcp_send` / `_handle_tcp`, LAN UDP `_broadcast` / `_handle_udp`, Kademlia `_send` / `_handle`, and both `publish()` sites). It is a plain field, **not** an envelope, so handlers that read `msg["type"]` are unaffected.
+**The wire format is `v1.2`** as of the capability-manifest work — `d2a.PROTOCOL_VERSION = "1.2"` (defined in `d2a/protocol.py`). v1.1 added the `sig` / `sig_key` / `ts` fields (Ed25519 trust); v1.2 **additively** adds an optional `manifest` field to capability records (see *Capability Manifests* above). Records without a manifest remain valid. Every outbound message and every published capability record carries a top-level `"v"` field, injected at the serialization chokepoints (TCP `_tcp_send` / `_handle_tcp`, LAN UDP `_broadcast` / `_handle_udp`, Kademlia `_send` / `_handle`, and both `publish()` sites). It is a plain field, **not** an envelope, so handlers that read `msg["type"]` are unaffected.
 
 The compatibility contract:
 
@@ -385,6 +458,7 @@ d2a/
 ├── crypto.py              Ed25519 (dual backend + RFC 8032 fallback), TOFU pins, node_id derivation
 ├── _ed25519_fallback.py   Pure-Python RFC 8032 Ed25519 (demo-grade, not constant time)
 ├── signing.py             Wire-message + record signing/verification (trust gate)
+├── manifest.py            Capability manifest vocabulary + validator + built-ins (v1.2)
 ├── identity.py            Node ID (binding handles) + Ed25519 token signing
 ├── protocol.py            Wire version (PROTOCOL_VERSION="1.0") + negotiation helpers
 ├── verbs.py               bind / rebind / renew / unbind operations
@@ -456,6 +530,8 @@ All examples run single-process with no network setup required unless noted.
 | `composition_plan_demo.py` | Plan phase (stages 1–7): goal→blueprint, scorer prefers healthy GPU, two cameras get different adapter chains, mismatch rejected cleanly | `python3 examples/composition_plan_demo.py` |
 | `composition_run_demo.py` | Full 10-stage pipeline: happy path, atomic rollback, fallback-on-bind, runtime distress + re-bind, atomic context-manager release | `python3 examples/composition_run_demo.py` |
 | `composition_simple_demo.py` | `with agent.achieve("vision") as comp: comp.run()` — the 2-line goal API with auto-release | `python3 examples/composition_simple_demo.py` |
+| `manifest_demo.py` | Capability manifests: discover records, print each capability's signed self-description (reading schema, actions, consent tier) | `python3 examples/manifest_demo.py` |
+| `composition_wire_demo.py` | Composition on the wire: host publishes a Guardian VSO's smart surface; agent discovers its manifest, binds under a lease, drives a `verdict` action | `python3 examples/composition_wire_demo.py` |
 | `swarm_local_demo.py` | LANSwarm on localhost: publish a record, discover it, send a TCP message | `python3 examples/swarm_local_demo.py` |
 | `swarm_multinode_demo.py` | Two runtimes + one agent on a real LAN (**requires two terminals or two machines**) | `python3 examples/run_node.py` then `run_provider.py` then `run_seeker.py` |
 

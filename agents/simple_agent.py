@@ -96,17 +96,11 @@ class Agent:
         """
         ip, port = runtime.swarm.address
         self._remote.swarm.add_known_peer(runtime.node_id, ip, port)
-        now = time.time()
         for cap in runtime.advertise():
-            self._remote.swarm.records[(runtime.node_id, cap.name)] = {
-                "node_id":    runtime.node_id,
-                "name":       cap.name,
-                "tags":       list(cap.tags),
-                "live_state": dict(cap.live_state),
-                "public_key": runtime.public_key,
-                "address":    [ip, port],
-                "ts":         now,
-            }
+            # Mirror the real publish field set exactly (device_class + manifest +
+            # signature) by reusing the runtime's single record builder.
+            self._remote.swarm.records[(runtime.node_id, cap.name)] = \
+                runtime._capability_record(cap, ip, port)
         # Register for in-process binding + contracts
         self._seeded_runtimes[runtime.node_id] = runtime
         if hasattr(runtime, "capability_contracts"):

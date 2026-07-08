@@ -12,6 +12,7 @@ from d2a import (
     crypto,
 )
 from d2a import signing
+from d2a import manifest as _manifest
 from d2a.resource_probes import probe_resources, RESOURCE_SENSITIVITY
 from d2a.policy import ResourcePolicy
 from d2a.stream_source import (
@@ -92,6 +93,12 @@ class DeviceRuntime:
 
         # binding_id -> data_provider sub_id (stream cleanup on release/preemption)
         self._binding_subs: dict[str, str] = {}
+
+        # Virtual capabilities (Guardian VSO / Synthesis emergent) registered via
+        # publish_virtual / publish_emergent. name -> {"reading": fn, "action": fn}.
+        # get_reading / the action verb consult this BEFORE the DataProvider, so
+        # virtual caps bind & serve through the SAME broker/lease/policy path.
+        self._virtual: dict[str, dict] = {}
 
         # ── sense layer ───────────────────────────────────────────────────────
         # Nothing runs until handle() is called. Shares the same sources dict as
@@ -450,20 +457,35 @@ class DeviceRuntime:
             "token_sig": b.token.signature,
         })
 
+    def _capability_record(self, cap, ip, port) -> dict:
+        """
+        THE single capability-record builder — used by BOTH the UDP/DHT publish
+        path and the TCP capabilities_request path, so the two can never drift
+        (e.g. a manifest present over one transport but not the other).
+
+        The manifest (if the capability carries one, or a built-in exists) is
+        injected HERE, BEFORE signing, so it rides inside the Ed25519-signed
+        bytes and is authenticated for free.
+        """
+        record = {
+            "node_id":      self.node_id,
+            "name":         cap.name,
+            "tags":         list(cap.tags),
+            "live_state":   {k: v for k, v in cap.live_state.items()},
+            "public_key":   self.public_key,
+            "address":      [ip, port],
+            "device_class": self.device_class,
+            "ts":           time.time(),
+        }
+        man = cap.manifest if getattr(cap, "manifest", None) else _manifest.builtin_manifest(cap)
+        if man is not None:
+            record["manifest"] = man
+        return signing.sign_record(record, self.private_key, self.public_key)
+
     def publish_capabilities(self) -> None:
         ip, port = self.swarm.address
         for cap in self.advertise():
-            record = {
-                "node_id":      self.node_id,
-                "name":         cap.name,
-                "tags":         list(cap.tags),
-                "live_state":   {k: v for k, v in cap.live_state.items()},
-                "public_key":   self.public_key,
-                "address":      [ip, port],
-                "device_class": self.device_class,
-                "ts":           time.time(),
-            }
-            self.swarm.publish(signing.sign_record(record, self.private_key, self.public_key))
+            self.swarm.publish(self._capability_record(cap, ip, port))
 
     # ── binding scope verification ─────────────────────────────────────────────
 
@@ -579,18 +601,7 @@ class DeviceRuntime:
         # ── capability probe (TCP fallback for AP-isolation / probe_peer) ──────
         if mtype == "capabilities_request":
             ip, port = self.swarm.address
-            records = []
-            for cap in self.advertise():
-                records.append(signing.sign_record({
-                    "node_id":      self.node_id,
-                    "name":         cap.name,
-                    "tags":         list(cap.tags),
-                    "live_state":   {k: v for k, v in cap.live_state.items()},
-                    "public_key":   self.public_key,
-                    "address":      [ip, port],
-                    "device_class": self.device_class,
-                    "ts":           time.time(),
-                }, self.private_key, self.public_key))
+            records = [self._capability_record(cap, ip, port) for cap in self.advertise()]
             return {"type": "capabilities_response", "records": records}
 
         # ── on-demand data pull (THE DEFAULT) ─────────────────────────────────
@@ -603,13 +614,33 @@ class DeviceRuntime:
                     "binding_id": binding_id,
                     "error":      "binding_invalid_or_out_of_scope",
                 }
-            frame = self.data.get_reading(capability)
+            # Virtual capabilities (VSO / emergent) serve their reading through
+            # their own dispatcher; real capabilities go to the DataProvider.
+            v = self._virtual.get(capability)
+            frame = v["reading"]() if v else self.data.get_reading(capability)
             return {
                 "type":       "reading",
                 "capability": capability,
                 "binding_id": binding_id,
                 "frame":      frame,
             }
+
+        # ── virtual-capability action invocation (VSO / emergent) ─────────────
+        if mtype == "action":
+            binding_id = message.get("binding_id", "")
+            capability = message.get("capability", "")
+            action     = message.get("action", "")
+            params     = message.get("params", {}) or {}
+            if not self._verify_binding_scope(binding_id, capability):
+                return {"type": "error", "binding_id": binding_id,
+                        "error": "binding_invalid_or_out_of_scope"}
+            v = self._virtual.get(capability)
+            if v is None:
+                return {"type": "error", "binding_id": binding_id,
+                        "error": "not_an_action_capability"}
+            result = v["action"](action, params)
+            return {"type": "action_result", "capability": capability,
+                    "binding_id": binding_id, "action": action, "result": result}
 
         # ── opt-in streaming: subscribe ───────────────────────────────────────
         if mtype == "subscribe":
@@ -826,6 +857,126 @@ class DeviceRuntime:
         self.broker.quotas.pop(cap_name, None)
         print(f"[{self.name}] detach_peripheral  path={path!r}  cap={cap_name}")
         return {"status": "detached", "cap_name": cap_name, "path": path}
+
+    # ── virtual capabilities on-wire (Case 2 VSO + Case 3 emergent) ───────────
+
+    @staticmethod
+    def _jsonsafe(obj):
+        """Recursively hex-encode bytes so a virtual action result is JSON/wire safe."""
+        if isinstance(obj, bytes):
+            return obj.hex()
+        if isinstance(obj, dict):
+            return {k: DeviceRuntime._jsonsafe(v) for k, v in obj.items()}
+        if isinstance(obj, (list, tuple)):
+            return [DeviceRuntime._jsonsafe(v) for v in obj]
+        return obj
+
+    def _register_virtual(self, name, kind, consent_tier, manifest, tags,
+                          live_state, reading_fn, action_fn) -> dict:
+        """
+        Register a virtual capability so it binds/serves through the SAME broker,
+        lease, and consent path as a real one. Consent tier drives the policy rule
+        (sensitive → require_approval, open → allow) — no bypass through the
+        virtual path. Publishes the signed record (manifest inside) immediately.
+        """
+        access = "consent_required" if consent_tier == "sensitive" else "open"
+        if consent_tier == "sensitive":
+            self.policy.require_approval(name)
+        else:
+            self.policy.allow(name)
+
+        cap = Capability(
+            name=name,
+            tags=list(tags),
+            live_state=dict(live_state),
+            node_id=self.node_id,
+            public_key=self.public_key,
+            manifest=manifest,
+        )
+        self.capabilities[name] = cap
+        self.broker.quotas[name] = 1
+        self._virtual[name] = {"reading": reading_fn, "action": action_fn, "kind": kind}
+
+        ip, port = self.swarm.address
+        self.swarm.publish(self._capability_record(cap, ip, port))
+        print(f"[{self.name}] publish_virtual name={name} kind={kind} access={access}")
+        return {"name": name, "kind": kind, "access": access, "node_id": self.node_id}
+
+    def publish_virtual(self, vso, name: str | None = None) -> dict:
+        """
+        Publish a Guardian VirtualSmartObject's SMART surface as a signed,
+        discoverable, bindable capability on THIS host node — distinct from the
+        raw_<kind> relay capability. The manifest describes the smart actions
+        (verdict/monitor/search/…), not the raw primitives.
+        """
+        kind = vso._kind
+        adv  = vso.advertised_capability()
+        name = name or adv.get("name", f"smart_{kind}")
+        man  = _manifest.smart_manifest(kind)
+
+        def reading_fn():
+            return vso.advertised_capability().get("live_state", {})
+
+        def action_fn(action, params):
+            return self._jsonsafe(vso.handle_request({"action": action, **(params or {})}))
+
+        return self._register_virtual(
+            name, kind, man["consent_tier"], man,
+            tags=list(adv.get("tags", [])) + ["virtual_smart_object"],
+            live_state=adv.get("live_state", {}),
+            reading_fn=reading_fn, action_fn=action_fn,
+        )
+
+    def publish_emergent(self, handle, name: str | None = None) -> dict:
+        """
+        Publish a Synthesis EmergentDeviceHandle as a signed, discoverable,
+        bindable capability on THIS (coordinator) node. The record's node_id/
+        address are the coordinator's; it is signed with the coordinator's key.
+        The manifest is composed from the synthesis kind + combined_contract ONLY
+        — member records are NEVER embedded (no per-part leak).
+        """
+        device = handle._device
+        kind   = device.kind
+        name   = name or device.name
+        man    = _manifest.emergent_manifest(kind, device.combined_contract)
+
+        # live_state carries ONLY the emergent contract — no member node_ids/records.
+        live_state = {k: v for k, v in device.live_state.items()
+                      if not isinstance(v, (list, dict))}
+
+        def reading_fn():
+            return dict(live_state)
+
+        def action_fn(action, params):
+            return self._jsonsafe(self._emergent_action(handle, action, params or {}))
+
+        return self._register_virtual(
+            name, kind, man["consent_tier"], man,
+            tags=[kind, "emergent_device"],
+            live_state=live_state,
+            reading_fn=reading_fn, action_fn=action_fn,
+        )
+
+    @staticmethod
+    def _emergent_action(handle, action, params) -> dict:
+        """Dispatch a wire action to the EmergentDeviceHandle. Bytes params are hex."""
+        if action == "write":
+            return handle.write(params.get("key", ""), bytes.fromhex(params.get("data", "")))
+        if action == "read":
+            return handle.read(params.get("key", ""))
+        if action == "put":
+            return handle.put(params.get("key", ""), bytes.fromhex(params.get("value", "")))
+        if action == "get":
+            return handle.get(params.get("key", ""))
+        if action == "read_merged":
+            return handle.read_merged(int(params.get("max_per_member", 64)))
+        if action == "tail_all":
+            return handle.tail_all(int(params.get("lines", 10)))
+        if action == "read_all":
+            return handle.read_all()
+        if action == "verdict_all":
+            return handle.verdict_all(float(params.get("warn", 75.0)), float(params.get("danger", 90.0)))
+        return {"error": f"unknown_action:{action}"}
 
     # ── relay interface (Case 2 — Capability Guardian) ────────────────────────
 

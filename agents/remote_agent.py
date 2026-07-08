@@ -114,8 +114,28 @@ class RemoteAgent:
     # ── discovery / bind ──────────────────────────────────────────────────────
 
     def find_capability(self, name: str = None) -> list[dict]:
-        """Discover capability records from the network."""
+        """Discover capability records from the network. Records may carry a
+        signed `manifest` (v1.2) describing the capability — see describe()."""
         return self.swarm.discover(name)
+
+    def describe(self, capability_name: str, node_id: str = None) -> dict | None:
+        """
+        Return the parsed capability manifest for `capability_name` from the
+        discovery cache (the machine-readable self-description: reading schema,
+        actions, consent tier, streaming), or None if the record has no manifest
+        / is unknown. Pass node_id to disambiguate multiple providers.
+
+        The manifest was signed inside the capability record, so if the record
+        passed verification the manifest is authentic. Call find_capability()
+        first if the cache is cold.
+        """
+        with self.swarm._lock:
+            for (nid, name), rec in self.swarm.records.items():
+                if name == capability_name and (node_id is None or nid == node_id):
+                    man = rec.get("manifest")
+                    if man is not None:
+                        return man
+        return None
 
     def bind_remote_to(self, target_node_id: str, capability_name: str, priority: int = 5) -> dict:
         """
@@ -366,6 +386,31 @@ class RemoteAgent:
         # verify the response is for our binding
         if response.get("binding_id") != binding.get("binding_id"):
             return {"type": "error", "error": "binding_id_mismatch"}
+        return response
+
+    def call_action(self, binding: dict, action: str, params: dict = None,
+                    capability: str = None) -> dict:
+        """
+        Invoke a virtual capability's action (Guardian VSO / Synthesis emergent)
+        declared in its manifest — e.g. describe()['actions']. Same binding-scope
+        gate as request_data (a data-path op; the token/lease already authorized
+        it). Returns {"type":"action_result", ..., "result": {...}} or an error.
+        """
+        self._raise_if_lost(binding.get("binding_id", ""))
+        cap    = capability or binding.get("capability_name", "")
+        target = binding.get("provider_node_id", "")
+        request = {
+            "type":       "action",
+            "from_node":  self.agent_id,
+            "binding_id": binding.get("binding_id", ""),
+            "capability": cap,
+            "action":     action,
+            "params":     params or {},
+        }
+        response = self.swarm.send_and_recv(target, request, timeout=5.0)
+        if not response:
+            return {"type": "error", "error": "no_response", "binding_id": binding.get("binding_id")}
+        self._check_version(response)
         return response
 
     # ── data delivery: OPT-IN (streaming) ─────────────────────────────────────

@@ -8,6 +8,10 @@ class Capability:
     live_state: dict
     node_id: str
     public_key: str = ""
+    # v1.2 (additive): optional machine-readable self-description. When set, it
+    # is copied into the published record (before signing) so it is authenticated
+    # for free. None = no manifest shipped (records stay valid — additive).
+    manifest: dict | None = None
 
 
 @dataclass(frozen=True)
