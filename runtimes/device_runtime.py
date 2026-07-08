@@ -506,12 +506,13 @@ class DeviceRuntime:
             if decision == "deny":
                 print(f"[{self.name}] bind_request from {agent_id[:8]} for '{cap_name}' "
                       f"→ denied (policy: blocked)")
-                return {"status": "denied", "message": "resource blocked by device policy"}
+                return {"type": "bind_response", "status": "denied",
+                        "message": "resource blocked by device policy"}
             if decision == "needs_approval":
                 if not self.policy.approve(cap_name, agent_id):
                     print(f"[{self.name}] bind_request from {agent_id[:8]} for '{cap_name}' "
                           f"→ denied (sensitive: approval required)")
-                    return {"status": "denied",
+                    return {"type": "bind_response", "status": "denied",
                             "message": "owner approval required for sensitive resource"}
 
             result = self.broker_request(agent_id, cap_name, needs, priority)
@@ -520,6 +521,7 @@ class DeviceRuntime:
             if result.get("status") in ("granted", "granted_by_preemption"):
                 token = result["token"]
                 return {
+                    "type":                 "bind_response",
                     "status":               result["status"],
                     "binding_id":           result.get("binding_id"),
                     "capability_name":      token.capability_name,
@@ -533,7 +535,8 @@ class DeviceRuntime:
                     "device_class":         self.device_class,
                     "verified_by_provider": True,
                 }
-            return {"status": result.get("status"), "message": result.get("message", "")}
+            return {"type": "bind_response", "status": result.get("status"),
+                    "message": result.get("message", "")}
 
         # ── lease renewal (wire-level) ────────────────────────────────────────
         if mtype == "renew_binding":

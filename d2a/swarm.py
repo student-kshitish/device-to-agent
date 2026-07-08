@@ -12,6 +12,11 @@ import socket
 import threading
 import time
 
+from d2a.protocol import (
+    PROTOCOL_VERSION, VERSION_FIELD, stamp, classify, versions_compatible,
+    warn_legacy_once, logger as _plog,
+)
+
 TTL = 30  # seconds — records older than this are pruned from discover()
 
 
@@ -148,12 +153,24 @@ class LANSwarm(SwarmTransport):
                 break
 
     def _handle_udp(self, msg: dict, addr) -> None:
+        kind = classify(msg.get(VERSION_FIELD))
+        if kind == "incompatible":
+            _plog.debug("LAN UDP: dropping foreign-major %s from %s", msg.get("type"), addr[0])
+            return                                     # drop, no reply (no error loops)
+        if kind == "legacy":
+            warn_legacy_once(f"lan-udp:{addr[0]}")
+
         mtype = msg.get("type")
         if mtype == "announce":
             rec = msg.get("record", {})
             nid = rec.get("node_id")
             if not nid:
                 return
+            rec_v = rec.get(VERSION_FIELD)
+            if rec_v is not None and not versions_compatible(rec_v, PROTOCOL_VERSION):
+                # Records ride inside a valid same-major message but may be authored
+                # by a different-major node (relay). Ingest, but note it.
+                _plog.debug("LAN UDP: ingesting foreign-major record v=%s from %s", rec_v, nid)
             rec["ts"] = time.time()
             with self._lock:
                 self.records[(nid, rec.get("name", ""))] = rec
@@ -168,7 +185,7 @@ class LANSwarm(SwarmTransport):
 
     def _broadcast(self, msg: dict) -> None:
         try:
-            data = json.dumps(msg, default=str).encode()
+            data = json.dumps(stamp(msg), default=str).encode()
             s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
             s.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
             s.settimeout(1.0)
@@ -203,9 +220,22 @@ class LANSwarm(SwarmTransport):
             if not line:
                 return
             msg = json.loads(line.decode())
+
+            # ── protocol version gate (single inbound-request chokepoint) ──
+            kind = classify(msg.get(VERSION_FIELD))
+            if kind == "incompatible":
+                err = stamp({
+                    "type": "error", "reason": "version_mismatch",
+                    "peer_version": PROTOCOL_VERSION,
+                })
+                conn.sendall((json.dumps(err) + "\n").encode())
+                return
+            if kind == "legacy":
+                warn_legacy_once(f"tcp:{msg.get('from_node', '') or 'unknown'}")
+
             response = self.message_handler(msg) if self.message_handler else None
             if response is not None:
-                conn.sendall((json.dumps(response, default=str) + "\n").encode())
+                conn.sendall((json.dumps(stamp(response), default=str) + "\n").encode())
         except Exception:
             pass
         finally:
@@ -219,6 +249,7 @@ class LANSwarm(SwarmTransport):
     def publish(self, record: dict) -> None:
         rec = dict(record)
         rec.setdefault("ts", time.time())
+        stamp(rec)                                     # record carries its author's version
         with self._lock:
             self.records[(rec.get("node_id", ""), rec.get("name", ""))] = rec
             if rec.get("node_id") and rec.get("address"):
@@ -255,7 +286,7 @@ class LANSwarm(SwarmTransport):
             s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
             s.settimeout(timeout)
             s.connect(addr)
-            s.sendall((json.dumps(message, default=str) + "\n").encode())
+            s.sendall((json.dumps(stamp(message), default=str) + "\n").encode())
             if recv:
                 data = b""
                 while b"\n" not in data:
@@ -286,7 +317,9 @@ class LANSwarm(SwarmTransport):
             s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
             s.settimeout(5.0)
             s.connect((ip, port))
-            s.sendall((json.dumps({"type": "capabilities_request", "from_node": self.node_id}) + "\n").encode())
+            # probe_peer bypasses _tcp_send, so it stamps + checks on its own.
+            req = stamp({"type": "capabilities_request", "from_node": self.node_id})
+            s.sendall((json.dumps(req) + "\n").encode())
             data = b""
             while b"\n" not in data:
                 chunk = s.recv(65535)
@@ -297,7 +330,12 @@ class LANSwarm(SwarmTransport):
             line = data.split(b"\n")[0].strip()
             if not line:
                 return []
-            records = json.loads(line.decode()).get("records", [])
+            resp = json.loads(line.decode())
+            if classify(resp.get(VERSION_FIELD)) == "incompatible" or resp.get("reason") == "version_mismatch":
+                _plog.debug("probe_peer: incompatible peer %s:%s (v=%s) — no records",
+                            ip, port, resp.get(VERSION_FIELD) or resp.get("peer_version"))
+                return []
+            records = resp.get("records", [])
             now = time.time()
             with self._lock:
                 for r in records:

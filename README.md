@@ -298,6 +298,22 @@ Sensitive resources → DENIED to all remote agents by default
 
 ---
 
+## Versioning & Compatibility
+
+**The wire format is officially `v1.0`** as of the lease work — `d2a.PROTOCOL_VERSION = "1.0"` (defined in `d2a/protocol.py`). Every outbound message and every published capability record carries a top-level `"v"` field, injected at the serialization chokepoints (TCP `_tcp_send` / `_handle_tcp`, LAN UDP `_broadcast` / `_handle_udp`, Kademlia `_send` / `_handle`, and both `publish()` sites). It is a plain field, **not** an envelope, so handlers that read `msg["type"]` are unaffected.
+
+The compatibility contract:
+
+| Peer version | Rule |
+|---|---|
+| **Same major** (`1.x` ↔ `1.y`) | Compatible. Process normally. **Minor versions are additive-only; unknown fields are ignored** — a `1.0` node and a future `1.4` node interoperate. |
+| **Different major** (`1.x` ↔ `2.x`) | Incompatible (breaking). TCP requests get `{"type":"error","reason":"version_mismatch","peer_version":…}`; the agent raises a typed **`ProtocolVersionError`** naming both versions. Kademlia UDP messages from a different major are logged and **dropped with no reply** (no error-reply loops). |
+| **Missing `"v"`** (legacy `0.x`) | Accepted for now, with a one-time deprecation warning per peer. **Planned to be rejected in the next major.** |
+
+**Relay caveat (message-level vs record-level `v`).** A message's `"v"` gates only the *immediate peer*. But a capability record is data that can be *relayed*: a DHT node running the same major can legitimately serve you a record **authored by a different-major node** inside a perfectly valid same-major `VALUE`/`announce` message. Records therefore carry their **own** author `"v"`, and a foreign-major record is **ingested** (not dropped) with a `debug`-level log — record-level `v` is the eventual gate for author compatibility, message-level `v` gates the hop. Rejecting foreign-major records on ingest is deferred to the next major.
+
+---
+
 ## Device-Agnostic by Design
 
 The same `DeviceRuntime` code runs on:
@@ -345,6 +361,7 @@ Each device probes itself at startup using `/proc/meminfo`, `/proc/loadavg`, `/s
 d2a/
 ├── schema.py              Capability + Binding data contracts (frozen)
 ├── identity.py            Node ID + HMAC keypair generation
+├── protocol.py            Wire version (PROTOCOL_VERSION="1.0") + negotiation helpers
 ├── verbs.py               bind / rebind / renew / unbind operations
 ├── broker.py              Contention broker: priority · quota · preemption · waitqueue
 ├── probes.py              OS probes: CPU, memory, GPU, thermal, battery, disk, net

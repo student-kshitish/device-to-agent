@@ -30,6 +30,11 @@ import socket
 import threading
 import time
 
+from d2a.protocol import (
+    PROTOCOL_VERSION, VERSION_FIELD, stamp, classify, versions_compatible,
+    warn_legacy_once, logger as _plog,
+)
+
 K = 20        # max nodes per bucket / replication fan-out
 ALPHA = 3     # lookup parallelism (advisory; we fan out to K on tiny nets)
 ID_BITS = 160
@@ -212,7 +217,7 @@ class KademliaNode:
 
     def _send(self, ip: str, port: int, msg: dict) -> None:
         try:
-            self._sock.sendto(json.dumps(msg, default=str).encode(), (ip, port))
+            self._sock.sendto(json.dumps(stamp(msg), default=str).encode(), (ip, port))
             if self.verbose:
                 print(f"[kad:{self.udp_port}] -> {msg.get('type')} {ip}:{port}", flush=True)
         except Exception as e:
@@ -270,6 +275,11 @@ class KademliaNode:
         pid = record.get("node_id", "")
         if not pid:
             return
+        rec_v = record.get(VERSION_FIELD)
+        if rec_v is not None and not versions_compatible(rec_v, PROTOCOL_VERSION):
+            # A same-major peer can hand us a record authored by a different-major
+            # node (relay). We ingest it — record-level v is the eventual gate.
+            _plog.debug("DHT: ingesting foreign-major record v=%s for key=%s", rec_v, key)
         with self._lock:
             bucket = self.storage.setdefault(key, {})
             existing = bucket.get(pid)
@@ -370,6 +380,16 @@ class KademliaNode:
     # ── message handler ──────────────────────────────────────────────────────────
 
     def _handle(self, msg: dict, addr) -> None:
+        # ── protocol version gate (single inbound UDP chokepoint) ──
+        kind = classify(msg.get(VERSION_FIELD))
+        if kind == "incompatible":
+            if self.verbose:
+                print(f"[kad:{self.udp_port}] drop foreign-major {msg.get('type')} from {addr[0]}", flush=True)
+            _plog.debug("DHT: dropping foreign-major %s from %s", msg.get("type"), addr[0])
+            return                                     # drop, no reply (no error loops)
+        if kind == "legacy":
+            warn_legacy_once(f"dht:{addr[0]}")
+
         sender_id = msg.get("sender_id")
         sender_ip = msg.get("sender_ip", addr[0])
         sender_port = msg.get("sender_port", addr[1])

@@ -1,3 +1,4 @@
+from d2a.protocol import PROTOCOL_VERSION, ProtocolVersionError
 from d2a.schema import Capability, BindRequest, BindToken, KeyPair, Binding
 from d2a.contracts import IOContract, CapabilityContract, contracts_compatible
 from d2a.adapters import (
@@ -52,6 +53,9 @@ from d2a.composition.synthesizer import Synthesizer
 from d2a.composition.emergent_runtime import EmergentDeviceHandle
 
 __all__ = [
+    # protocol
+    "PROTOCOL_VERSION",
+    "ProtocolVersionError",
     # contracts + adapters
     "IOContract",
     "CapabilityContract",

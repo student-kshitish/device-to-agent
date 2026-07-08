@@ -2,7 +2,7 @@ import random
 import threading
 import time
 
-from d2a import generate_node_id, LANSwarm, SwarmTransport
+from d2a import generate_node_id, LANSwarm, SwarmTransport, PROTOCOL_VERSION, ProtocolVersionError
 
 TTL = 30
 
@@ -92,6 +92,16 @@ class RemoteAgent:
                 self._mark_lost(lease, message.get("reason", "ttl_expired"))
         return None  # no TCP reply needed for inbound pushes
 
+    def _check_version(self, response: dict) -> None:
+        """
+        Raise ProtocolVersionError if a response reports a version mismatch. Called
+        at every point where a wire response is consumed, so a different-major peer
+        surfaces as a clear typed exception naming both versions — never a silent
+        failure or a confusing downstream error.
+        """
+        if isinstance(response, dict) and response.get("reason") == "version_mismatch":
+            raise ProtocolVersionError(PROTOCOL_VERSION, response.get("peer_version"))
+
     # ── discovery / bind ──────────────────────────────────────────────────────
 
     def find_capability(self, name: str = None) -> list[dict]:
@@ -134,6 +144,7 @@ class RemoteAgent:
                 "message":          f"No response from {target_node_id[:8]}",
                 "provider_node_id": target_node_id,
             }
+        self._check_version(response)                     # raises on major mismatch
 
         verified = (
             response.get("status") in ("granted", "granted_by_preemption")
@@ -216,6 +227,12 @@ class RemoteAgent:
                     if stop.wait(retry):
                         return
                     continue
+
+                # A version mismatch is a hard, permanent failure — treat it like a
+                # denial (stop renewing, surface loss), NEVER as a retryable drop.
+                if resp.get("reason") == "version_mismatch":
+                    self._mark_lost(lease, "version_mismatch")
+                    return
 
                 if resp.get("status") == "renewed":
                     lease["lease_expires_at"] = resp.get("lease_expires_at", lease["lease_expires_at"])
@@ -307,6 +324,7 @@ class RemoteAgent:
         response = self.swarm.send_and_recv(target, request, timeout=5.0)
         if not response:
             return {"type": "error", "error": "no_response", "binding_id": binding.get("binding_id")}
+        self._check_version(response)                     # raises on major mismatch
         # verify the response is for our binding
         if response.get("binding_id") != binding.get("binding_id"):
             return {"type": "error", "error": "binding_id_mismatch"}
@@ -338,6 +356,7 @@ class RemoteAgent:
             "hz":            hz,
         }
         response = self.swarm.send_and_recv(target, request, timeout=5.0)
+        self._check_version(response)                     # raises on major mismatch
         if response and response.get("status") == "subscribed":
             sub_id = response.get("sub_id", "")
             self._stream_sub_ids[bid]  = sub_id

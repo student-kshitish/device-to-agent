@@ -34,6 +34,7 @@ import time
 
 from d2a.swarm import LANSwarm
 from d2a.kademlia import KademliaNode
+from d2a.protocol import stamp
 
 
 class DHTSwarm(LANSwarm):
@@ -103,6 +104,7 @@ class DHTSwarm(LANSwarm):
     def publish(self, record: dict) -> None:
         rec = dict(record)
         rec.setdefault("ts", time.time())
+        stamp(rec)                                     # record carries its author's version
         nid = rec.get("node_id", "")
         name = rec.get("name", "")
 
