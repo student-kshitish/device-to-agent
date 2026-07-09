@@ -15,6 +15,24 @@ from d2a.stream_source import SignalSource
 from d2a.preprocessor import Preprocessor
 
 
+class _CallableSource(SignalSource):
+    """A SignalSource backed by a plain reading callable — lets a VIRTUAL
+    capability's reading_fn be sampled by the shared streaming loop exactly like
+    a hardware source, so condition-events on virtual caps ride the same bounded
+    background loop (and the same teardown) as real ones. Never raises."""
+
+    def __init__(self, name: str, fn) -> None:
+        self.name = name
+        self._fn  = fn
+
+    def read(self) -> dict | None:
+        try:
+            r = self._fn()
+            return r if isinstance(r, dict) else None
+        except Exception:
+            return None
+
+
 class DataProvider:
     """
     sources_by_capability: maps capability name -> list of SignalSource instances.
@@ -56,6 +74,17 @@ class DataProvider:
 
         pp = self._preprocessors.setdefault(capability_name, Preprocessor())
         return pp.make_frame(raw)
+
+    def register_reading_source(self, capability_name: str, reading_fn) -> None:
+        """
+        Register a VIRTUAL capability's reading callable as a pseudo-source so the
+        shared sampling loop can drive condition-event evaluation on it — the
+        preferred path for VSO / emergent event subscriptions (no parallel
+        evaluator). reading_fn returns the live snapshot whose keys match the
+        capability's manifest reading fields.
+        """
+        self._sources[capability_name] = [_CallableSource(capability_name, reading_fn)]
+        self._preprocessors.setdefault(capability_name, Preprocessor())
 
     # ── DEFAULT PATH ───────────────────────────────────────────────────────────
 

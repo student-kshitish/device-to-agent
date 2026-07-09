@@ -41,8 +41,17 @@ class SenseLayer:
     requested shape so even a caller requesting "raw" gets the health judgment.
     """
 
-    def __init__(self, sources_by_capability: dict, device_class: str) -> None:
+    def __init__(self, sources_by_capability: dict, device_class: str,
+                 event_emitter=None) -> None:
         self.device_class       = device_class
+        # Part 2 (v1.3) event hook. A callable(event_type: str, payload: dict)
+        # invoked on a verdict TRANSITION. None = no sink wired (default).
+        self._event_emitter     = event_emitter
+        # Part 2 (v1.3) safety_check hook. A callable(frame) -> frame, run as the
+        # final pre-return step: it may veto (set frame.vetoed/veto_reason) OR
+        # drive a device-LOCAL reflex (condition → local action, no agent). None
+        # = no hook (default). See DeviceRuntime.wire_reflex_demo().
+        self._safety_hook       = None
         self._intent_matcher    = IntentMatcher(sources_by_capability)
         self._raw_collector     = RawCollector()
         self._normalizer        = Normalizer()
@@ -54,6 +63,15 @@ class SenseLayer:
         self._last_verdicts: dict[str, str | None] = {}  # for Part 2 event hook
         self._lock = threading.Lock()
 
+    def set_event_emitter(self, fn) -> None:
+        """Wire (or replace) the verdict-transition event sink after construction."""
+        self._event_emitter = fn
+
+    def set_safety_hook(self, fn) -> None:
+        """Wire (or replace) the pre-return safety_check hook: callable(frame) ->
+        frame. Used for a pre-return veto and/or a device-local reflex."""
+        self._safety_hook = fn
+
     def handle(self, request: SenseRequest) -> SenseFrame:
         """
         Run the full forward pipeline for one SenseRequest.
@@ -61,8 +79,14 @@ class SenseLayer:
         """
         ts = time.time()
 
-        # ── TODO (Part 2): urgent/reflex fast-path ────────────────────────────
-        # Skip optional pipeline stages when speed is critical:
+        # ── Part 2 (v1.3) — reflex fast-path. NAME-COLLISION NOTE ─────────────
+        # The ORIGINAL reflex_path TODO meant a LATENCY optimization: skip
+        # optional pipeline stages when mode=="urgent". The v1.3 "reflex path"
+        # is a DIFFERENT feature — a device-LOCAL condition→action hook that runs
+        # with no agent (see d2a/conditions.py + the EVENT LAYER). They share a
+        # name only. The local-action reflex demo lands at the safety hook below
+        # in v1.3 Phase 2; this urgent skip-stages optimization stays DEFERRED
+        # (unbuilt — no speculative code).
         # if request.mode == "urgent":
         #     return self._reflex_path(request, ts)
 
@@ -117,14 +141,21 @@ class SenseLayer:
             prev_verdict = self._last_verdicts.get(request.resource)
             self._last_verdicts[request.resource] = verdict
 
-        # ── TODO (Part 2): emit event on verdict change ───────────────────────
-        # if verdict != prev_verdict and prev_verdict is not None:
-        #     self._event_emitter.emit("verdict_change", {
-        #         "resource": request.resource,
-        #         "from": prev_verdict,
-        #         "to": verdict,
-        #         "ts": ts,
-        #     })
+        # ── Part 2 (v1.3) event hook — CLOSED: emit on verdict transition ─────
+        # Fires as a "changed"-style edge: only on an actual transition, and
+        # NEVER on the baseline (prev_verdict is None on the first sample for a
+        # resource). Mirrors conditions.EdgeEvaluator's changed-op semantics.
+        if (self._event_emitter is not None
+                and prev_verdict is not None and verdict != prev_verdict):
+            try:
+                self._event_emitter("verdict_change", {
+                    "resource": request.resource,
+                    "from":     prev_verdict,
+                    "to":       verdict,
+                    "ts":       ts,
+                })
+            except Exception:
+                pass
 
         frame = SenseFrame(
             resource=request.resource,
@@ -138,7 +169,14 @@ class SenseLayer:
             seq=seq,
         )
 
-        # ── TODO (Part 2): safety_check() veto before return ──────────────────
-        # frame = self._safety_filter.check(frame)
+        # ── Part 2 (v1.3) safety_check() — CLOSED: pre-return hook ────────────
+        # Final step before returning: may veto (set frame.vetoed / veto_reason)
+        # or drive a device-LOCAL reflex (condition → local action, no agent).
+        # No hook wired → frame passes through unchanged (Part 1 behavior).
+        if self._safety_hook is not None:
+            try:
+                frame = self._safety_hook(frame) or frame
+            except Exception:
+                pass
 
         return frame

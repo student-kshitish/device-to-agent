@@ -391,9 +391,72 @@ Guardian VirtualSmartObjects (Case 2) and Synthesis emergent devices (Case 3) ar
 
 ---
 
+## Event Layer — Conditional Events (v1.3)
+
+Before v1.3 an agent could **pull** (`get_reading`), **raw-stream** (`subscribe`), and **request/response** (`action`) — but it could not be *notified when something it cares about happens*. The event layer adds the missing interaction primitive: **"notify me when field X crosses Y."**
+
+**Condition vocabulary — small and fixed**, exactly like the manifest vocabulary. A condition is one manifest reading field + one operator:
+
+```json
+{"field": "value", "op": "gt", "value": 50}      // op ∈ gt|lt|ge|le|eq|ne|changed
+{"field": "level", "op": "changed"}               // "changed" takes no value
+```
+
+**One condition per subscription.** An agent wanting AND/OR composes it agent-side with multiple subscriptions — there is deliberately **no expression language**, which is what keeps this spec-able. Conditions are validated **at subscribe time against the capability's manifest**: an unknown field, or an op/type mismatch (`gt` on a string field, `eq` on an array), is rejected with `{"error": "invalid_condition", "detail": …}`. Ordered ops (`gt`/`lt`/`ge`/`le`) require a numeric field; `eq`/`ne` require the value to match the field's declared scalar type; arrays/objects are not conditionable.
+
+**Edge semantics — fires on the crossing, not the level.** A `gt` condition fires on the sample where the field *crosses* the threshold (False→True), **not** on every sample it stays above it, and **re-arms** automatically when the field drops back below. `changed` fires on any value change. The **first sample only establishes a baseline and never fires** — even if the condition is already true at subscribe time (there is no prior edge to cross). Each subscription keeps its own edge state, so N conditions on one capability each track their own crossings off the single shared sample.
+
+```python
+# agent-side convenience
+sub = agent.on_event(binding,
+                     {"field": "value", "op": "gt", "value": 50},
+                     lambda ev: print("crossed!", ev["seq"], ev["reading"]),
+                     eval_hz=5)
+# ... later
+agent.off_event(binding, sub["event_sub_id"])
+```
+
+**Delivery — best-effort, no guarantee (documented honestly).** An `event` is a **data-path** message: `binding_id`-bearer, **not signed** (same class as `stream_frame`), fire-and-forget to the agent's address, carrying the **triggering reading snapshot** and a **per-subscription monotonic `seq`** so the agent can detect gaps (a jump surfaces as `event["_gap"]`). There is **no re-delivery** — an agent that needs certainty re-reads on event receipt.
+
+**Principle guard — bounded background work, purchased by a live lease.** Condition evaluation is opt-in work that only runs while a lease is live. It rides the **same per-capability sampling loop** as streaming (no parallel evaluator; virtual VSO/emergent capabilities are driven through the same loop via a registered pseudo-source). Two guards, with **distinct** rejection reasons:
+
+| Guard | Default | Rejection reason |
+|---|---|---|
+| Per-binding cap (what one lease may buy) | `8` | `event_cap_exceeded` |
+| Per-capability device ceiling (shared-loop defense-in-depth) | `32` | `device_event_capacity` |
+
+The device **owns the cadence**: an agent-requested `eval_hz` is clamped to `MAX_SAMPLE_HZ` (10) and the effective rate is echoed in the subscribe response. *(The same clamp now also guards `subscribe` streaming, which was previously unclamped.)* **Every event subscription dies with the binding** — lease expiry, release, and preemption all tear down events through the *same* unified cleanup path as streams (proven by a multi-sweep test: zero events after expiry).
+
+**Sense-layer verdict events.** The Sense Layer's long-standing `event_emitter` hook is closed: a device-local health **verdict transition** (`comfort → caution → distress`) fires as a `verdict_change` event with the same changed-op edge semantics (never on the baseline).
+
+### Async task lifecycle (Phase 2)
+
+Some actions are slow — a `monitor` that samples a sensor N times over minutes cannot return synchronously (it would block the handler past the agent's 5 s request timeout). A dispatcher **declares an action long-running** in its manifest (`actions.<name>.long_running: true`); the device then runs it on a worker thread and returns **immediately**:
+
+```json
+{"type":"action_result", "result": {"task_id": "…", "status": "running"}}
+```
+
+Completion (or failure) arrives later as a **`kind:"task"` event on the same channel** — `{"kind":"task","task_id":…,"status":"done"|"failed","result":…}` — so no new delivery machinery is needed; the subscription is implicit with the task. Poll meanwhile with the **`task_status`** verb (`running` → `done`/`failed`/`cancelled`/`unknown`). `RemoteAgent.call_action(binding, action, params, on_complete=cb)` registers the completion callback; the call itself returns the moment the `task_id` is issued.
+
+**Which actions are long-running (measured, not assumed).** The Guardian `monitor` (an `intervals × delay` loop, unbounded by agent params) is declared long-running. The emergent `read_all` / `verdict_all` were measured to be **single-pass** aggregate reads (one `read_value` per member, no sleep loop; `verdict_all` delegates to one `read_all`) — they stay synchronous, **no exemption invented**.
+
+**Tasks are binding-scoped: lease death cancels them** through the *same* unified teardown path as streams and events. Here the honest limit is explicit:
+
+- A **cooperatively cancellable** action (its function accepts a cancel token) sees the token set and returns early — **truly cancelled**.
+- A **non-cancellable** action (e.g. the VSO `monitor` for-loop, which has no stop check) keeps running in the background — **orphaned**. The device drops its task record so the completion event is **suppressed** and `task_status` returns `unknown`, but the loop itself is *not* interrupted. The demo long-running action is written with a cancel token to exercise real cancellation; the VSO monitor is honestly orphaned.
+
+### Device-local reflex path (Phase 2)
+
+A **reflex** is a device-local `condition → action` binding that runs with **no agent involved** — the fast path for "if the health verdict crosses into `distress`, flag it locally *now*." It is wired through the Sense Layer's **`safety_check` hook** (the other closed Part-2 stub) and reuses `conditions.EdgeEvaluator`, so it fires on the edge and re-arms exactly like a wire condition — but evaluated and actioned entirely on-device (`DeviceRuntime.wire_reflex_demo()`). This is deliberately **one hook + one demo reflex**; full reflex *policy* (multiple reflexes, agent-authored local bindings) is out of scope.
+
+> **Name-collision note.** The original Sense-Layer `reflex_path` TODO meant a *latency optimization* (skip optional pipeline stages when `mode=="urgent"`). The v1.3 reflex is a *different* feature — a local condition→action hook. They share a name only; a pointer comment marks this at the old TODO site, and the urgent skip-stages optimization stays deferred.
+
+---
+
 ## Versioning & Compatibility
 
-**The wire format is `v1.2`** as of the capability-manifest work — `d2a.PROTOCOL_VERSION = "1.2"` (defined in `d2a/protocol.py`). v1.1 added the `sig` / `sig_key` / `ts` fields (Ed25519 trust); v1.2 **additively** adds an optional `manifest` field to capability records (see *Capability Manifests* above). Records without a manifest remain valid. Every outbound message and every published capability record carries a top-level `"v"` field, injected at the serialization chokepoints (TCP `_tcp_send` / `_handle_tcp`, LAN UDP `_broadcast` / `_handle_udp`, Kademlia `_send` / `_handle`, and both `publish()` sites). It is a plain field, **not** an envelope, so handlers that read `msg["type"]` are unaffected.
+**The wire format is `v1.3`** as of the event-layer work — `d2a.PROTOCOL_VERSION = "1.3"` (defined in `d2a/protocol.py`). v1.1 added the `sig` / `sig_key` / `ts` fields (Ed25519 trust); v1.2 **additively** added an optional `manifest` field to capability records; v1.3 **additively** adds the `subscribe_event` / `unsubscribe_event` / `event` / `task_status` verbs, an optional per-action `long_running` manifest key, and a small set of eventable live-frame reading fields to the built-in manifests (see *Event Layer* above). Records/messages without any of these remain valid. Records without a manifest remain valid. Every outbound message and every published capability record carries a top-level `"v"` field, injected at the serialization chokepoints (TCP `_tcp_send` / `_handle_tcp`, LAN UDP `_broadcast` / `_handle_udp`, Kademlia `_send` / `_handle`, and both `publish()` sites). It is a plain field, **not** an envelope, so handlers that read `msg["type"]` are unaffected.
 
 The compatibility contract:
 
@@ -431,8 +494,11 @@ Each device probes itself at startup using `/proc/meminfo`, `/proc/loadavg`, `/s
 - Contention broker: priority, quotas, preemption, wait-queue, auto-grant, audit log, cancel-queue
 - Binding lifecycle: bind / rebind / renew / unbind
 - On-demand data pull (default path, zero background work)
-- Opt-in streaming at configurable Hz (background daemon, strictly opt-in)
-- Sense Layer Part 1: all 4 shapes, verdict + confidence, CPU burn load test
+- Opt-in streaming at configurable Hz (background daemon, strictly opt-in; device-clamped)
+- **Conditional events (v1.3 Phase 1): manifest-validated conditions, edge-fire + re-arm, per-sub gapless sequence, per-binding + per-capability caps, device eval-hz clamp, unified lease teardown, VSO-reading conditions over both transports** — `agent.on_event(binding, condition, cb)`
+- **Async task lifecycle (v1.3 Phase 2): `long_running` manifest key, `action` returns `task_id` immediately, completion as `kind:"task"` event, `task_status` polling, binding-scoped lease-death cancellation (cooperative cancel vs honest orphan)** — `agent.call_action(..., on_complete=cb)`
+- **Device-local reflex (v1.3 Phase 2): condition → local action with no agent, via the Sense `safety_check` hook** — `device.wire_reflex_demo()`
+- Sense Layer Part 1: all 4 shapes, verdict + confidence, CPU burn load test; **verdict-transition `event_emitter` + `safety_check` hooks closed (Part 2)**
 - Full 10-stage Capability Composition: plan → atomic bind → runtime monitor + fallback → atomic release
 - Consent policy: safe defaults, sensitive = denied unless owner opts in
 - `with agent.achieve("vision") as comp: comp.run()` — goal API with context-manager auto-release
@@ -444,7 +510,8 @@ Each device probes itself at startup using `/proc/meminfo`, `/proc/loadavg`, `/s
 - **Real two-machine / cross-network deployment** — everything is tested single-process; cross-machine binding under real network conditions is not yet validated
 - **Key revocation / rotation & PKI** — trust is TOFU-only (see the security model); revocation, rotation, and any certificate/CA model are explicitly out of scope. Transport encryption (confidentiality) is also not provided — signing prevents forgery, not eavesdropping
 - **Cross-machine DHT validation** — `DHTSwarm` is a full pure-stdlib Kademlia discovery layer (routing table, multi-value STORE/FIND_VALUE with TTL, bootstrap) over the reused LANSwarm TCP core; it is validated end-to-end *single-machine* (N nodes on distinct ports). Real multi-host / NAT-traversal validation is the remaining step
-- **Sense Layer Part 2** — SafetyFilter (pre-return veto), ReflexPath (urgent fast-path), EventEmitter (verdict-change events), HealthAggregator (rolling health history)
+- **Orchestrator sense surface on the wire** — the SenseLayer's aggregate device-health verdict is consumed *locally* by the reflex; publishing it as a `device_health` virtual capability (so agents can set conditions on aggregate health) is a small additive follow-up. The common per-sensor case is already covered by `smart_sensor.verdict` conditions.
+- **Sense Layer Part 2 remainder** — SafetyFilter *veto* semantics (the hook is wired for reflex; a real deny-policy is not built), ReflexPath (urgent skip-stages fast-path — distinct from the v1.3 local-action reflex), HealthAggregator (rolling health history). *EventEmitter and the safety_check hook are now closed — see the Event Layer above.*
 - **Real adapter implementations** — adapter descriptors correctly track `IOContract` through transforms; the actual pixel/tensor computations are simulated; wiring to real compute (OpenCV, NumPy) is a separate phase
 - **Multi-hop data routing** — `Composer.run()` verifies contracts and pulls from the producer; real cross-node data streaming (producer sends to consumer over the network) is a future phase
 
@@ -459,6 +526,7 @@ d2a/
 ├── _ed25519_fallback.py   Pure-Python RFC 8032 Ed25519 (demo-grade, not constant time)
 ├── signing.py             Wire-message + record signing/verification (trust gate)
 ├── manifest.py            Capability manifest vocabulary + validator + built-ins (v1.2)
+├── conditions.py          Event condition vocabulary: validate-against-manifest + edge/re-arm (v1.3)
 ├── identity.py            Node ID (binding handles) + Ed25519 token signing
 ├── protocol.py            Wire version (PROTOCOL_VERSION="1.0") + negotiation helpers
 ├── verbs.py               bind / rebind / renew / unbind operations

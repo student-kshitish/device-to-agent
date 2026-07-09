@@ -58,7 +58,7 @@ _ALL_TYPES = _SCALAR_TYPES | {"array"}
 _CONSENT_TIERS = {"open", "sensitive"}
 _FIELD_KEYS = {"type", "unit", "description", "items", "format"}
 _PARAM_KEYS = _FIELD_KEYS | {"required"}
-_ACTION_KEYS = {"description", "params"}
+_ACTION_KEYS = {"description", "params", "long_running"}
 
 
 class ManifestError(ValueError):
@@ -157,6 +157,8 @@ def validate_manifest(manifest: dict, expected_consent_tier: str,
         adesc = aspec.get("description")
         if not isinstance(adesc, str) or not adesc:
             raise ManifestError(f"actions.{aname}: 'description' is required")
+        if "long_running" in aspec and not isinstance(aspec["long_running"], bool):
+            raise ManifestError(f"actions.{aname}: 'long_running' must be a boolean")
         params = aspec.get("params", {})
         if not isinstance(params, dict):
             raise ManifestError(f"actions.{aname}.params: must be an object")
@@ -200,6 +202,13 @@ _COMPUTE = {
         "mem_used_percent": {"type": "number", "unit": "%"},
         "disk_free_gb":     {"type": "number", "unit": "GB"},
         "disk_used_pct":    {"type": "number", "unit": "%"},
+        # Eventable live-frame scalars (v1.3). Dotted names are the exact
+        # DataProvider frame paths (source.field) so a subscribe_event condition
+        # on them resolves against the sampled reading with no name bridging.
+        "cpu.util_pct":        {"type": "number", "unit": "%",
+                                "description": "mean per-core CPU utilization"},
+        "cpu.load1":           {"type": "number", "unit": "ratio"},
+        "memory.used_percent": {"type": "number", "unit": "%"},
     },
     "consent_tier": "open",
     "streaming": True,
@@ -214,6 +223,9 @@ _SENSING = {
         "sensor_inputs":  {"type": "number", "description": "count of hwmon sensor inputs"},
         "hwmons":         {"type": "array", "items": "string",
                            "description": "hardware monitor chip names"},
+        # Eventable live-frame scalar (v1.3) — dotted DataProvider frame path.
+        "thermal.max_temp_c": {"type": "number", "unit": "C",
+                               "description": "hottest thermal zone, sampled live"},
     },
     "consent_tier": "open",
     "streaming": True,
@@ -317,6 +329,7 @@ _SMART = {
                     "description": "ok | warn | danger"}, "readable": {"type": "boolean"}},
         "actions": {
             "monitor": {"description": "sample the sensor N times",
+                        "long_running": True,   # intervals*delay loop — runs async, task_id now
                         "params": {"intervals": {"type": "number", "required": False},
                                    "delay": {"type": "number", "required": False}}},
             "verdict": {"description": "classify the current reading",

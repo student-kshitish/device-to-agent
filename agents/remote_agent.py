@@ -53,6 +53,13 @@ class RemoteAgent:
         self._stream_handlers: dict[str, object]  = {}   # binding_id -> on_frame callable
         self._stream_sub_ids:  dict[str, str]      = {}   # binding_id -> device-side sub_id
 
+        # event state: event_sub_id -> {cb, binding_id, last_seq}. Keyed by the
+        # device-assigned event_sub_id so many conditions can coexist per binding.
+        self._event_handlers: dict[str, dict] = {}
+        # async task state: task_id -> {cb, binding_id}. Completion arrives as a
+        # kind:"task" event on the same channel and fires the callback once.
+        self._task_handlers: dict[str, dict] = {}
+
         # lease state: binding_id -> lease dict (see _start_lease). auto_renew=False
         # reproduces the old "never renews" behavior — the binding then lives for
         # exactly one TTL and expires cleanly.
@@ -90,6 +97,33 @@ class RemoteAgent:
                     handler(frame)
                 except Exception:
                     pass
+        elif mtype == "event" and message.get("kind") == "task":
+            # Async task completion (subscription implicit with the task). Fires
+            # the registered on_complete once, then drops the handler (terminal).
+            tid = message.get("task_id", "")
+            h   = self._task_handlers.pop(tid, None)
+            if h:
+                try:
+                    h["cb"](message)
+                except Exception:
+                    pass
+        elif mtype == "event":
+            # Conditional event pushed from the device (fire-and-forget, unsigned
+            # data-path, same class as stream_frame). Route to the handler by
+            # event_sub_id and surface any sequence gap (no delivery guarantee —
+            # an agent needing certainty re-reads on receipt).
+            esid = message.get("event_sub_id", "")
+            h    = self._event_handlers.get(esid)
+            if h:
+                seq  = message.get("seq", 0)
+                last = h.get("last_seq", 0)
+                if isinstance(seq, int) and seq > last + 1:
+                    message["_gap"] = seq - last - 1   # frames missed since last
+                h["last_seq"] = seq
+                try:
+                    h["cb"](message)
+                except Exception:
+                    pass
         elif mtype == "lease_expired":
             # Best-effort device notification that our lease is gone. Stop renewing
             # and mark it lost so the next use raises LeaseLostError.
@@ -99,6 +133,15 @@ class RemoteAgent:
             if lease is not None:
                 lease["stop"].set()
                 self._mark_lost(lease, message.get("reason", "ttl_expired"))
+            # drop any event + task handlers for the dead binding
+            self._event_handlers = {
+                k: v for k, v in self._event_handlers.items()
+                if v.get("binding_id") != bid
+            }
+            self._task_handlers = {
+                k: v for k, v in self._task_handlers.items()
+                if v.get("binding_id") != bid
+            }
         return None  # no TCP reply needed for inbound pushes
 
     def _check_version(self, response: dict) -> None:
@@ -389,27 +432,54 @@ class RemoteAgent:
         return response
 
     def call_action(self, binding: dict, action: str, params: dict = None,
-                    capability: str = None) -> dict:
+                    capability: str = None, on_complete=None) -> dict:
         """
         Invoke a virtual capability's action (Guardian VSO / Synthesis emergent)
         declared in its manifest — e.g. describe()['actions']. Same binding-scope
         gate as request_data (a data-path op; the token/lease already authorized
         it). Returns {"type":"action_result", ..., "result": {...}} or an error.
+
+        LONG-RUNNING actions (manifest actions.<name>.long_running) return
+        immediately with result == {"task_id", "status":"running"} — the call does
+        NOT block for the work. Completion arrives later as a kind:"task" event;
+        pass on_complete(event) to be called when it does, or poll task_status().
         """
         self._raise_if_lost(binding.get("binding_id", ""))
         cap    = capability or binding.get("capability_name", "")
         target = binding.get("provider_node_id", "")
+        bid    = binding.get("binding_id", "")
         request = {
             "type":       "action",
             "from_node":  self.agent_id,
-            "binding_id": binding.get("binding_id", ""),
+            "binding_id": bid,
             "capability": cap,
             "action":     action,
             "params":     params or {},
         }
         response = self.swarm.send_and_recv(target, request, timeout=5.0)
         if not response:
-            return {"type": "error", "error": "no_response", "binding_id": binding.get("binding_id")}
+            return {"type": "error", "error": "no_response", "binding_id": bid}
+        self._check_version(response)
+        # register the completion callback if this returned a running task
+        result = response.get("result") if isinstance(response, dict) else None
+        if isinstance(result, dict) and result.get("task_id") and result.get("status") == "running":
+            if on_complete is not None:
+                self._task_handlers[result["task_id"]] = {"cb": on_complete, "binding_id": bid}
+        return response
+
+    def task_status(self, binding: dict, task_id: str) -> dict:
+        """Poll a long-running task. Returns {"status": running|done|failed|
+        cancelled|unknown, "result"?, "error"?}. "unknown" once the task's
+        lease dies (record dropped) or the id is not this binding's."""
+        target = binding.get("provider_node_id", "")
+        response = self.swarm.send_and_recv(target, {
+            "type":       "task_status",
+            "from_node":  self.agent_id,
+            "binding_id": binding.get("binding_id", ""),
+            "task_id":    task_id,
+        }, timeout=5.0)
+        if not response:
+            return {"type": "error", "error": "no_response", "task_id": task_id}
         self._check_version(response)
         return response
 
@@ -464,8 +534,76 @@ class RemoteAgent:
             "binding_id": bid,
         }, timeout=3.0)
 
+    # ── conditional events: OPT-IN (v1.3) ─────────────────────────────────────
+
+    def on_event(self, binding: dict, condition: dict, callback,
+                 eval_hz: float = 5.0, capability: str = None) -> dict:
+        """
+        OPT-IN conditional events. Ask the provider to notify this agent when
+        `condition` fires on the capability's live reading.
+
+        `condition` is ONE manifest reading field + operator:
+            {"field": <manifest field>, "op": gt|lt|ge|le|eq|ne|changed,
+             "value": <scalar; omit for "changed">}
+        Validated device-side against the capability manifest — an unknown field
+        or op/type mismatch comes back as {"error": "invalid_condition", ...}.
+
+        Events fire on EDGE (the crossing), not every sample above threshold, and
+        re-arm when the condition becomes false again. callback(event) runs per
+        delivered event; event carries the triggering reading snapshot and a
+        per-subscription monotonic "seq" (a jump means frames were missed —
+        delivery is best-effort, so re-read if you need certainty).
+
+        Returns the device response (contains "event_sub_id" on success).
+        """
+        self._raise_if_lost(binding.get("binding_id", ""))
+        cap    = capability or binding.get("capability_name", "")
+        target = binding.get("provider_node_id", "")
+        bid    = binding.get("binding_id", "")
+
+        ip, port = self.swarm.address
+        request = {
+            "type":          "subscribe_event",
+            "from_node":     self.agent_id,
+            "agent_address": [ip, port],
+            "binding_id":    bid,
+            "capability":    cap,
+            "condition":     condition,
+            "eval_hz":       eval_hz,
+        }
+        response = self.swarm.send_and_recv(target, request, timeout=5.0)
+        if not response:
+            return {"type": "error", "error": "no_response", "binding_id": bid}
+        self._check_version(response)
+        if response.get("status") == "subscribed":
+            esid = response.get("event_sub_id", "")
+            self._event_handlers[esid] = {"cb": callback, "binding_id": bid, "last_seq": 0}
+        return response
+
+    def off_event(self, binding: dict, event_sub_id: str) -> dict:
+        """Cancel one conditional-event subscription. Clears the local handler
+        immediately, then tells the provider to stop evaluating it."""
+        self._event_handlers.pop(event_sub_id, None)
+        target = binding.get("provider_node_id", "")
+        response = self.swarm.send_and_recv(target, {
+            "type":         "unsubscribe_event",
+            "from_node":    self.agent_id,
+            "binding_id":   binding.get("binding_id", ""),
+            "event_sub_id": event_sub_id,
+        }, timeout=3.0)
+        return response or {"status": "ok"}
+
     def release_binding(self, binding: dict) -> dict:
         """Release a binding on the provider. Called by ResourceHandle on exit."""
+        bid = binding.get("binding_id", "")
+        # drop any event + task handlers for this binding (device tears down its
+        # side through the unified lease/stream cleanup path on release)
+        self._event_handlers = {
+            k: v for k, v in self._event_handlers.items() if v.get("binding_id") != bid
+        }
+        self._task_handlers = {
+            k: v for k, v in self._task_handlers.items() if v.get("binding_id") != bid
+        }
         self._stop_lease(binding.get("binding_id", ""))   # stop auto-renew first
         cap_name = binding.get("capability_name", "")
         target   = binding.get("provider_node_id", "")

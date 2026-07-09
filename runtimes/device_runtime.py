@@ -1,7 +1,10 @@
+import inspect
 import os
 import threading
 import time
+import uuid
 
+from d2a import conditions
 from d2a import (
     Capability, BindToken,
     verify_bind_token, CapabilityBroker,
@@ -24,6 +27,14 @@ from d2a.stream_source import (
 from d2a.data_provider import DataProvider
 from d2a.sense_layer import SenseLayer
 from d2a.sense_types import SenseRequest, SenseFrame
+
+# ── event layer (v1.3) tunables ────────────────────────────────────────────────
+# Device clamp applied to BOTH stream sampling hz and event eval_hz — the device
+# owns cadence; an agent asking for 1000 Hz gets MAX_SAMPLE_HZ. One knob, one
+# vulnerability closed for both paths.
+MAX_SAMPLE_HZ = 10.0
+EVENT_SUBS_PER_BINDING   = 8    # what a single live lease may purchase
+EVENT_SUBS_PER_CAPABILITY = 32  # device-wide ceiling on one shared loop
 
 
 class DeviceRuntime:
@@ -93,6 +104,39 @@ class DeviceRuntime:
 
         # binding_id -> data_provider sub_id (stream cleanup on release/preemption)
         self._binding_subs: dict[str, str] = {}
+
+        # ── event layer (v1.3) ────────────────────────────────────────────────
+        # Condition-event subscriptions ride the SAME DataProvider sampling loop
+        # and die through the SAME teardown path as streams (see
+        # _cleanup_binding_stream). binding_id -> {event_sub_id -> data_sub_id};
+        # event_sub_id -> {capability, binding_id, data_sub_id} for the caps.
+        self._binding_event_subs: dict[str, dict] = {}
+        self._event_meta:         dict[str, dict] = {}
+        # Bounded background work, purchased by a live lease. Two guards:
+        #   per-binding  — what one lease may buy (default 8).
+        #   per-capability — device-wide ceiling on a shared loop (default 32),
+        #     defense-in-depth since the loop's cost scales with total subs.
+        # Distinct rejection reasons so an agent can tell which limit it hit.
+        # Instance attrs (not module constants) so deployments/tests can tune.
+        self._event_subs_per_binding = EVENT_SUBS_PER_BINDING
+        self._event_cap_ceiling      = EVENT_SUBS_PER_CAPABILITY
+
+        # ── async tasks (v1.3 Phase 2) ────────────────────────────────────────
+        # Long-running actions run on a worker thread and return {task_id} now;
+        # completion arrives later as a kind:"task" event on the SAME channel.
+        # Tasks are binding-scoped: lease death cancels them through the SAME
+        # unified teardown path as streams/events (see _cleanup_binding_stream).
+        # task_id -> {binding_id, capability, action, status, result, error,
+        #             cancel(Event), agent_node_id, created_at}. binding_id ->
+        # {task_id, ...} for teardown. Guarded by _tasks_lock.
+        self._tasks:         dict[str, dict] = {}
+        self._binding_tasks: dict[str, set]  = {}
+        self._tasks_lock = threading.Lock()
+
+        # Optional device-LOCAL reflex hook (condition → local action, no agent).
+        # Wired on demand via wire_reflex_demo(); consumed by the SenseLayer
+        # safety_check hook. Records fired reflexes here for inspection/demo.
+        self.reflex_events: list = []
 
         # Virtual capabilities (Guardian VSO / Synthesis emergent) registered via
         # publish_virtual / publish_emergent. name -> {"reading": fn, "action": fn}.
@@ -504,10 +548,154 @@ class DeviceRuntime:
         return True
 
     def _cleanup_binding_stream(self, binding_id: str) -> None:
-        """Stop any streaming subscription tied to this binding."""
+        """
+        THE unified data-path teardown for a binding. Stops any streaming
+        subscription AND every condition-event subscription tied to this binding.
+        Every teardown trigger — lease expiry sweep, explicit release, preemption,
+        unsubscribe — already funnels here, so widening this one method (rather
+        than adding a parallel event-cleanup path) makes ALL event subscriptions
+        die with the binding exactly like stream subscriptions.
+        """
         sub_id = self._binding_subs.pop(binding_id, None)
         if sub_id is not None:
             self.data.unsubscribe(sub_id)
+
+        evsubs = self._binding_event_subs.pop(binding_id, {})
+        for event_sub_id, data_sub_id in evsubs.items():
+            self.data.unsubscribe(data_sub_id)
+            self._event_meta.pop(event_sub_id, None)
+
+        # Cancel any running tasks for this binding. HONEST distinction:
+        #   - a cooperatively-cancellable action (accepts a cancel token) sees the
+        #     Event set and returns early — truly cancelled.
+        #   - a non-cancellable action (e.g. the VSO monitor for-loop) keeps
+        #     running in the background = ORPHANED; we drop its record so its
+        #     completion event is SUPPRESSED, but the loop is not interrupted.
+        # Either way the task is gone from the agent's view immediately.
+        with self._tasks_lock:
+            task_ids = self._binding_tasks.pop(binding_id, set())
+            for task_id in task_ids:
+                t = self._tasks.pop(task_id, None)
+                if t is not None:
+                    t["cancel"].set()
+
+    def _cleanup_event_sub(self, binding_id: str, event_sub_id: str) -> bool:
+        """Tear down ONE event subscription (explicit unsubscribe_event).
+        Returns True if it existed."""
+        evsubs = self._binding_event_subs.get(binding_id, {})
+        data_sub_id = evsubs.pop(event_sub_id, None)
+        if data_sub_id is None:
+            return False
+        self.data.unsubscribe(data_sub_id)
+        self._event_meta.pop(event_sub_id, None)
+        if not evsubs:
+            self._binding_event_subs.pop(binding_id, None)
+        return True
+
+    def _manifest_for(self, capability: str) -> dict | None:
+        """The manifest a condition validates against: the capability's own
+        manifest (virtual caps) or the shipped built-in (compute/sensing/…)."""
+        cap = self.capabilities.get(capability)
+        if cap is None:
+            return None
+        if getattr(cap, "manifest", None):
+            return cap.manifest
+        return _manifest.builtin_manifest(cap)
+
+    # ── async tasks (v1.3 Phase 2) ──────────────────────────────────────────────
+
+    def _is_long_running(self, capability: str, action: str) -> bool:
+        """A dispatcher declares an action long-running via its manifest
+        (actions.<name>.long_running == True). Everything else stays synchronous."""
+        man = self._manifest_for(capability)
+        if not man:
+            return False
+        spec = (man.get("actions", {}) or {}).get(action, {})
+        return bool(spec.get("long_running"))
+
+    @staticmethod
+    def _call_action_fn(fn, action: str, params: dict, cancel: threading.Event):
+        """
+        Invoke a virtual action_fn, passing the cancel token ONLY to functions
+        that accept it (arity >= 3). This is the honest orphan/cancel split: a
+        cooperative action (action, params, cancel) can stop early; a 2-arg
+        action (the VSO monitor) never sees cancel and can only be orphaned.
+        """
+        try:
+            if len(inspect.signature(fn).parameters) >= 3:
+                return fn(action, params, cancel)
+        except (ValueError, TypeError):
+            pass
+        return fn(action, params)
+
+    def _run_task(self, task_id: str, v: dict, action: str,
+                  params: dict, cancel: threading.Event) -> None:
+        """Worker: run the action, then deliver a completion event — UNLESS the
+        task was torn down mid-flight (lease death), in which case the record is
+        already gone and we suppress delivery (orphan/cancel)."""
+        status, result, error = "done", None, None
+        try:
+            result = self._jsonsafe(self._call_action_fn(v["action"], action, params, cancel))
+        except Exception as e:
+            status, error = "failed", str(e)
+        if cancel.is_set():
+            status = "cancelled"
+
+        with self._tasks_lock:
+            t = self._tasks.get(task_id)
+            if t is None:
+                return                      # torn down while running → suppress
+            t["status"], t["result"], t["error"] = status, result, error
+            agent_node_id = t["agent_node_id"]
+            binding_id    = t["binding_id"]
+            capability    = t["capability"]
+
+        # Completion delivered on the SAME channel as condition events
+        # (kind:"task"); fire-and-forget, unsigned data path.
+        try:
+            self.swarm.send(agent_node_id, {
+                "type":       "event",
+                "kind":       "task",
+                "capability": capability,
+                "binding_id": binding_id,
+                "task_id":    task_id,
+                "status":     status,
+                "result":     result,
+                "error":      error,
+                "ts":         time.time(),
+            })
+        except Exception:
+            pass
+
+    # ── device-local reflex (v1.3 Phase 2, minimal demo) ────────────────────────
+
+    def wire_reflex_demo(self, verdict: str = "distress") -> None:
+        """
+        Wire ONE device-LOCAL reflex through the SenseLayer safety_check hook:
+        when the health verdict crosses INTO `verdict`, run a local action (here,
+        record a flag) with NO agent involved. Reuses conditions.EdgeEvaluator so
+        the reflex fires on the edge and re-arms — the same semantics as a wire
+        condition, but evaluated and actioned entirely on-device.
+
+        Full reflex POLICY (multiple reflexes, agent-authored bindings) is out of
+        scope; this is the hook + one demo, as scoped.
+        """
+        evaluator = conditions.EdgeEvaluator({"field": "verdict", "op": "eq", "value": verdict})
+
+        def _safety_hook(frame):
+            view = {"verdict": frame.verdict, "advice": frame.advice,
+                    "confidence": frame.confidence}
+            if evaluator.update(view):
+                # LOCAL action — no network, no agent. Demo: flag + log.
+                self.reflex_events.append({
+                    "resource": frame.resource, "verdict": frame.verdict,
+                    "advice": frame.advice, "ts": frame.ts,
+                })
+                print(f"[{self.name}] REFLEX fired verdict={frame.verdict} "
+                      f"resource={frame.resource} → local flag (no agent)")
+            return frame
+
+        self.sense.set_safety_hook(_safety_hook)
 
     # ── message handler ────────────────────────────────────────────────────────
 
@@ -638,15 +826,61 @@ class DeviceRuntime:
             if v is None:
                 return {"type": "error", "binding_id": binding_id,
                         "error": "not_an_action_capability"}
+
+            # Long-running action (manifest-declared) → async: return a task_id
+            # immediately, deliver completion later as a kind:"task" event. This
+            # is what stops a slow monitor from blocking the TCP handler past the
+            # agent's 5 s send_and_recv timeout.
+            if self._is_long_running(capability, action):
+                task_id       = uuid.uuid4().hex
+                agent_node_id = message.get("from_node", "")
+                cancel        = threading.Event()
+                with self._tasks_lock:
+                    self._tasks[task_id] = {
+                        "binding_id": binding_id, "capability": capability,
+                        "action": action, "status": "running", "result": None,
+                        "error": None, "cancel": cancel,
+                        "agent_node_id": agent_node_id, "created_at": time.time(),
+                    }
+                    self._binding_tasks.setdefault(binding_id, set()).add(task_id)
+                threading.Thread(
+                    target=self._run_task,
+                    args=(task_id, v, action, params, cancel),
+                    daemon=True, name=f"task-{task_id[:8]}",
+                ).start()
+                print(f"[{self.name}] action(long_running) binding={binding_id[:8]} "
+                      f"cap={capability} action={action} → task={task_id[:8]}")
+                return {"type": "action_result", "capability": capability,
+                        "binding_id": binding_id, "action": action,
+                        "result": {"task_id": task_id, "status": "running"}}
+
             result = v["action"](action, params)
             return {"type": "action_result", "capability": capability,
                     "binding_id": binding_id, "action": action, "result": result}
+
+        # ── async task polling (v1.3 Phase 2) ─────────────────────────────────
+        if mtype == "task_status":
+            binding_id = message.get("binding_id", "")
+            task_id    = message.get("task_id", "")
+            with self._tasks_lock:
+                t = self._tasks.get(task_id)
+                # A task is only visible to its own (still-valid) binding. Once the
+                # lease dies the record is dropped → "unknown" (cancelled/gone).
+                if t is None or t["binding_id"] != binding_id:
+                    return {"type": "task_status", "task_id": task_id,
+                            "binding_id": binding_id, "status": "unknown"}
+                return {"type": "task_status", "task_id": task_id,
+                        "binding_id": binding_id, "status": t["status"],
+                        "result": t["result"], "error": t["error"]}
 
         # ── opt-in streaming: subscribe ───────────────────────────────────────
         if mtype == "subscribe":
             binding_id    = message.get("binding_id", "")
             capability    = message.get("capability", "")
-            hz            = float(message.get("hz", 5.0))
+            # Device owns cadence: clamp agent-requested hz to MAX_SAMPLE_HZ.
+            # (Was unclamped before v1.3 — a 1000 Hz request would have spun the
+            # sampling loop flat out. Same clamp now guards events; see below.)
+            hz            = max(0.1, min(float(message.get("hz", 5.0)), MAX_SAMPLE_HZ))
             agent_node_id = message.get("from_node", "")
             agent_address = message.get("agent_address")
 
@@ -675,11 +909,106 @@ class DeviceRuntime:
             print(f"[{self.name}] subscribe binding={binding_id[:8]} cap={capability} "
                   f"hz={hz} sub={sub_id[:8]}")
             return {
-                "type":       "subscribed",
-                "status":     "subscribed",
-                "sub_id":     sub_id,
-                "binding_id": binding_id,
+                "type":         "subscribed",
+                "status":       "subscribed",
+                "sub_id":       sub_id,
+                "binding_id":   binding_id,
+                "effective_hz": hz,       # echo the clamped rate
             }
+
+        # ── conditional events: subscribe_event (v1.3) ────────────────────────
+        if mtype == "subscribe_event":
+            binding_id    = message.get("binding_id", "")
+            capability    = message.get("capability", "")
+            condition     = message.get("condition") or {}
+            agent_node_id = message.get("from_node", "")
+            agent_address = message.get("agent_address")
+            req_hz        = float(message.get("eval_hz", 5.0))
+
+            if not self._verify_binding_scope(binding_id, capability):
+                return {"type": "error", "binding_id": binding_id,
+                        "error": "binding_invalid_or_out_of_scope"}
+
+            manifest = self._manifest_for(capability)
+            if manifest is None:
+                return {"type": "error", "binding_id": binding_id,
+                        "error": "no_manifest_for_conditions"}
+            try:
+                cond = conditions.validate_condition(condition, manifest)
+            except conditions.ConditionError as e:
+                return {"type": "error", "binding_id": binding_id,
+                        "error": "invalid_condition", "detail": str(e)}
+
+            # Two guards, distinct reasons (per-binding is what the lease bought;
+            # per-capability is the device ceiling on the shared loop).
+            per_binding = self._binding_event_subs.get(binding_id, {})
+            if len(per_binding) >= self._event_subs_per_binding:
+                return {"type": "error", "binding_id": binding_id,
+                        "error": "event_cap_exceeded",
+                        "detail": f"per-binding limit {self._event_subs_per_binding} reached"}
+            cap_count = sum(1 for m in self._event_meta.values()
+                            if m["capability"] == capability)
+            if cap_count >= self._event_cap_ceiling:
+                return {"type": "error", "binding_id": binding_id,
+                        "error": "device_event_capacity",
+                        "detail": f"per-capability limit {self._event_cap_ceiling} reached"}
+
+            eval_hz = max(0.1, min(req_hz, MAX_SAMPLE_HZ))
+            if agent_address and len(agent_address) == 2:
+                self.swarm.add_known_peer(agent_node_id, agent_address[0], int(agent_address[1]))
+
+            event_sub_id = uuid.uuid4().hex
+            evaluator    = conditions.EdgeEvaluator(cond)
+            seq_box      = {"seq": 0}
+
+            def _event_cb(frame, _ev=evaluator, _esid=event_sub_id, _bid=binding_id,
+                          _cap=capability, _nid=agent_node_id, _cond=cond, _box=seq_box):
+                # Runs inside the sampling loop. Edge-triggered: emits only on a
+                # crossing. Data-path message: binding_id-bearer, NOT signed
+                # (same class as stream_frame), fire-and-forget with a per-sub
+                # monotonic seq so the agent can detect gaps.
+                try:
+                    if _ev.update(frame):
+                        _box["seq"] += 1
+                        self.swarm.send(_nid, {
+                            "type":         "event",
+                            "capability":   _cap,
+                            "binding_id":   _bid,
+                            "event_sub_id": _esid,
+                            "seq":          _box["seq"],
+                            "kind":         "condition",
+                            "condition":    _cond,
+                            "reading":      frame,       # triggering snapshot
+                            "ts":           time.time(),
+                        })
+                except Exception:
+                    pass
+
+            data_sub_id = self.data.subscribe(capability, _event_cb, eval_hz)
+            self._binding_event_subs.setdefault(binding_id, {})[event_sub_id] = data_sub_id
+            self._event_meta[event_sub_id] = {
+                "capability": capability, "binding_id": binding_id, "data_sub_id": data_sub_id,
+            }
+            print(f"[{self.name}] subscribe_event binding={binding_id[:8]} cap={capability} "
+                  f"cond={cond['field']}/{cond['op']} eval_hz={eval_hz} ev={event_sub_id[:8]}")
+            return {
+                "type":              "event_subscribed",
+                "status":            "subscribed",
+                "event_sub_id":      event_sub_id,
+                "binding_id":        binding_id,
+                "effective_eval_hz": eval_hz,   # echo the clamped rate
+                "condition":         cond,
+            }
+
+        # ── conditional events: unsubscribe_event (v1.3) ──────────────────────
+        if mtype == "unsubscribe_event":
+            binding_id   = message.get("binding_id", "")
+            event_sub_id = message.get("event_sub_id", "")
+            existed = self._cleanup_event_sub(binding_id, event_sub_id)
+            print(f"[{self.name}] unsubscribe_event binding={binding_id[:8]} "
+                  f"ev={event_sub_id[:8]} existed={existed}")
+            return {"type": "unsubscribed_event", "status": "ok" if existed else "unknown",
+                    "binding_id": binding_id, "event_sub_id": event_sub_id}
 
         # ── opt-in streaming: unsubscribe ─────────────────────────────────────
         if mtype == "unsubscribe":
@@ -896,6 +1225,13 @@ class DeviceRuntime:
         self.capabilities[name] = cap
         self.broker.quotas[name] = 1
         self._virtual[name] = {"reading": reading_fn, "action": action_fn, "kind": kind}
+
+        # Register the virtual reading fn as a DataProvider pseudo-source so
+        # condition-events on this cap ride the SAME shared sampling loop (and the
+        # SAME lease teardown) as real capabilities — no parallel evaluator. The
+        # reading_fn's keys already match the manifest reading fields, so a
+        # condition validates and extracts cleanly against the sampled frame.
+        self.data.register_reading_source(name, reading_fn)
 
         ip, port = self.swarm.address
         self.swarm.publish(self._capability_record(cap, ip, port))
