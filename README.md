@@ -454,19 +454,120 @@ A **reflex** is a device-local `condition → action` binding that runs with **n
 
 ---
 
+## Error model (v1.4)
+
+Before v1.4 the wire had **five** different error shapes accreted across arcs —
+`{"type":"error","reason":…}`, `{"type":"error","error":…,"detail":…}`,
+`{"type":"lease_renewed","status":"denied","reason":…}`,
+`{"status":"error","message":…}`, and policy denials that carried only a human
+`message` with **no machine code at all**. An agent could not branch on a stable
+value; it had to string-match prose. v1.4 collapses all of them onto **one shape
+with one carrier key** and a single source-of-truth registry: `d2a/errors.py`.
+
+**The two shapes.** A *fault* and a *coded denial* differ only in whether the
+message is itself the answer to a request:
+
+```jsonc
+// error — a fault, no useful body
+{"type": "error", "code": "binding_invalid_or_out_of_scope", "detail": "...",
+ "binding_id": "…"}          // + contextual fields (task_id, peer_version) where they apply
+
+// coded denial — a semantic "no" that keeps its own type + status,
+// but carries the SAME code from the SAME registry
+{"type": "lease_renewed", "status": "denied", "code": "lease_expired",
+ "binding_id": "…", "detail": "..."}
+```
+
+Denials that are responses (`bind_response`, `lease_renewed`, `released`) keep
+their `type` and `status:"denied"` and **gain** `code`; everything else that was
+an error becomes `type:"error"` + `code`. A dying-lease **notice** push
+(`lease_expired`) carries `code` too, so the agent's `LeaseLostError.code` is
+uniform — `errors.LEASE_EXPIRED` on a silent TTL death, `errors.DEVICE_SHUTDOWN`
+on an announced departure. Agent-side exceptions expose `.code`
+(`LeaseLostError.code`, `WireError.code`); `.reason` remains a value-identical
+alias.
+
+**The registry** (`d2a/errors.py`, one leaf module, every code a named constant;
+trust/identity codes are re-exported from `d2a.signing` / `d2a.crypto` so each has
+exactly one name):
+
+| Group | Codes |
+|---|---|
+| Transport / version | `version_mismatch` |
+| Trust / identity | `unsigned_trust_op`, `stale_signature`, `bad_signature`, `node_id_derivation_mismatch`, `tofu_key_mismatch` |
+| Lease / binding lifecycle | `unknown_binding`, `not_owner`, `capability_mismatch`, `lease_expired`, `device_shutdown` |
+| Policy | `policy_blocked`, `approval_required` |
+| Broker | `capability_not_found`, `no_active_bind`, `binding_not_found` |
+| Scope / action / event guards | `binding_invalid_or_out_of_scope`, `not_an_action_capability`, `no_manifest_for_conditions`, `invalid_condition`, `event_cap_exceeded`, `device_event_capacity` |
+| Agent-side | `no_response`, `binding_id_mismatch`, `no_provider` |
+
+**Boundary — what is NOT in the registry.** Codes that appear **inside**
+`action_result.result` — the Guardian/emergent *brain* results (e.g.
+`consent_required`, `device_unavailable`, `path_sandbox_violation`,
+`skill_not_enabled`) — are **application-level, not protocol-registry members**.
+They ride nested in an otherwise-*successful* `action_result` and are not protocol
+control-flow, so an agent never branches on them to keep a binding alive. Folding
+those onto the same `{code, detail}` shape is **deferred** as a follow-up; the
+registry and its drift guard cover the protocol error surface only.
+
+**Free-text is not a code.** A caught exception string from a failed async task is
+delivered under `error_detail` (on the `kind:"task"` event and `task_status`),
+deliberately *not* `code`/`error`, so a stack-trace string can never be mistaken
+for a registry member.
+
+**Drift guard.** `tests/test_errors.py` fails if a sixth shape ever appears: it
+asserts `errors.py` has no duplicate code values and that `ALL_CODES` equals its
+constants, then AST-scans the wire-facing modules to assert every protocol
+error/denial dict carries its code under `code` (never the abolished `reason` /
+`error` carriers) and that any literal code is a registry member.
+
+## Graceful departure (v1.4)
+
+A device can leave the mesh two ways. **Ungraceful** — the process crashes or is
+killed — is handled by the lease machinery exactly as before: renews start failing,
+the agent's `LeaseLostError.code` becomes `lease_expired`, and every peer TTL-ages
+the stale record out of discovery (up to one record-TTL of "ghost"). **Graceful** —
+`device.stop()` / `device.stop_swarm()` / context-manager exit — now does better,
+best-effort, *before* the transport closes:
+
+1. **Unified teardown.** Every active binding is torn down through the *one*
+   codepath (`broker.teardown_all` → `_remove_active_bind`, reason `"shutdown"`,
+   recorded on the `Binding`), killing each binding's streams, event subs, and
+   tasks via the same `_cleanup_binding_stream` used by lease expiry.
+2. **Announced notice.** Each bound agent gets a `device_shutdown` push (a
+   data-path message, same class as `lease_expired`) carrying
+   `code: "device_shutdown"`. The agent surfaces this **distinctly** —
+   `LeaseLostError.code == errors.DEVICE_SHUTDOWN`, not `lease_expired` — so a
+   harness can branch: *announced shutdown → don't retry this device soon; silent
+   vanish → back-off rediscovery.*
+3. **Immediate unpublish.** The device retracts its records so discovery drops it
+   **now**, not after a TTL:
+   - **LAN** broadcasts a `withdraw`; peers delete the record from their cache on
+     receipt.
+   - **DHT** has no native DELETE, so we publish a **tombstone** — a record with a
+     fresh `ts` (so it *supersedes* the live copy in every merge) and a `tombstone`
+     flag, replicated to the K closest exactly like a store. Consumers drop the
+     provider on sight; the tombstone itself is TTL-pruned, so storage doesn't grow.
+
+The graceful path is **strictly additive**: it introduces no new required field or
+verb, and an ungraceful death still behaves identically to before. *Known bound:*
+all three steps are best-effort — an agent whose address the device never learned
+gets no notice (same limitation as `lease_expired`), and a DHT replica that is not
+among the key's current K-closest ages its copy out by TTL rather than by tombstone.
+
 ## Versioning & Compatibility
 
-**The wire format is `v1.3`** as of the event-layer work — `d2a.PROTOCOL_VERSION = "1.3"` (defined in `d2a/protocol.py`). v1.1 added the `sig` / `sig_key` / `ts` fields (Ed25519 trust); v1.2 **additively** added an optional `manifest` field to capability records; v1.3 **additively** adds the `subscribe_event` / `unsubscribe_event` / `event` / `task_status` verbs, an optional per-action `long_running` manifest key, and a small set of eventable live-frame reading fields to the built-in manifests (see *Event Layer* above). Records/messages without any of these remain valid. Records without a manifest remain valid. Every outbound message and every published capability record carries a top-level `"v"` field, injected at the serialization chokepoints (TCP `_tcp_send` / `_handle_tcp`, LAN UDP `_broadcast` / `_handle_udp`, Kademlia `_send` / `_handle`, and both `publish()` sites). It is a plain field, **not** an envelope, so handlers that read `msg["type"]` are unaffected.
+**The wire format is `v1.4`** as of the error-model unification — `d2a.PROTOCOL_VERSION = "1.4"` (defined in `d2a/protocol.py`). v1.1 added the `sig` / `sig_key` / `ts` fields (Ed25519 trust); v1.2 **additively** added an optional `manifest` field to capability records; v1.3 **additively** added the `subscribe_event` / `unsubscribe_event` / `event` / `task_status` verbs, an optional per-action `long_running` manifest key, and a small set of eventable live-frame reading fields to the built-in manifests (see *Event Layer* above). **v1.4 is the one *non-additive* bump so far** — it unifies every error/denial onto a single shape with a stable `code` from the [error registry](#error-model-v14). This is a **sanctioned pre-adoption break**: it renames wire fields (`reason` / `error` → `code`), so it is not additive, and it is done now precisely because there are no external consumers yet. See the *Error model* section for the migration and the full code registry. Records/messages without any of these remain valid. Records without a manifest remain valid. Every outbound message and every published capability record carries a top-level `"v"` field, injected at the serialization chokepoints (TCP `_tcp_send` / `_handle_tcp`, LAN UDP `_broadcast` / `_handle_udp`, Kademlia `_send` / `_handle`, and both `publish()` sites). It is a plain field, **not** an envelope, so handlers that read `msg["type"]` are unaffected.
 
 The compatibility contract:
 
 | Peer version | Rule |
 |---|---|
 | **Same major** (`1.x` ↔ `1.y`) | Compatible. Process normally. **Minor versions are additive-only; unknown fields are ignored** — a `1.0` node and a `1.1` node interoperate on the data path. *(One deliberate exception below.)* |
-| **Different major** (`1.x` ↔ `2.x`) | Incompatible (breaking). TCP requests get `{"type":"error","reason":"version_mismatch","peer_version":…}`; the agent raises a typed **`ProtocolVersionError`** naming both versions. Kademlia UDP messages from a different major are logged and **dropped with no reply** (no error-reply loops). |
+| **Different major** (`1.x` ↔ `2.x`) | Incompatible (breaking). TCP requests get `{"type":"error","code":"version_mismatch","peer_version":…}`; the agent raises a typed **`ProtocolVersionError`** naming both versions. Kademlia UDP messages from a different major are logged and **dropped with no reply** (no error-reply loops). |
 | **Missing `"v"`** (legacy `0.x`) | Accepted for now, with a one-time deprecation warning per peer. **Planned to be rejected in the next major.** |
 
-**Deliberate security exception to additive-only (v1.1).** The five trust operations must be Ed25519-signed. An **unsigned** `bind_request` / `renew_binding` / `release_binding` — e.g. from a v1.0 peer that predates signing — is **hard-rejected** with `{"reason":"unsigned_trust_op"}` (distinct from `version_mismatch`), even though the peers share a major. This narrowly breaks the additive-only promise **on purpose**: a half-trusted binding is worse than a failed one, so trust operations are not silently downgraded. **The data path is unaffected** — an unsigned `get_reading` / `subscribe` / `stream_frame` from a v1.0 peer still works, because those were never trust operations. So v1.0↔v1.1 interoperate for data, but v1.1 will not *establish* a binding for an unsigned peer.
+**Deliberate security exception to additive-only (v1.1).** The five trust operations must be Ed25519-signed. An **unsigned** `bind_request` / `renew_binding` / `release_binding` — e.g. from a v1.0 peer that predates signing — is **hard-rejected** — a `bind_response` / `lease_renewed` / `released` with `"status":"denied"` carrying `"code":"unsigned_trust_op"` (distinct from `version_mismatch`), even though the peers share a major. This narrowly breaks the additive-only promise **on purpose**: a half-trusted binding is worse than a failed one, so trust operations are not silently downgraded. **The data path is unaffected** — an unsigned `get_reading` / `subscribe` / `stream_frame` from a v1.0 peer still works, because those were never trust operations. So v1.0↔v1.1 interoperate for data, but v1.1 will not *establish* a binding for an unsigned peer.
 
 **Relay caveat (message-level vs record-level `v`).** A message's `"v"` gates only the *immediate peer*. But a capability record is data that can be *relayed*: a DHT node running the same major can legitimately serve you a record **authored by a different-major node** inside a perfectly valid same-major `VALUE`/`announce` message. Records therefore carry their **own** author `"v"`, and a foreign-major record is **ingested** (not dropped) with a `debug`-level log — record-level `v` is the eventual gate for author compatibility, message-level `v` gates the hop. Rejecting foreign-major records on ingest is deferred to the next major.
 
@@ -498,6 +599,8 @@ Each device probes itself at startup using `/proc/meminfo`, `/proc/loadavg`, `/s
 - **Conditional events (v1.3 Phase 1): manifest-validated conditions, edge-fire + re-arm, per-sub gapless sequence, per-binding + per-capability caps, device eval-hz clamp, unified lease teardown, VSO-reading conditions over both transports** — `agent.on_event(binding, condition, cb)`
 - **Async task lifecycle (v1.3 Phase 2): `long_running` manifest key, `action` returns `task_id` immediately, completion as `kind:"task"` event, `task_status` polling, binding-scoped lease-death cancellation (cooperative cancel vs honest orphan)** — `agent.call_action(..., on_complete=cb)`
 - **Device-local reflex (v1.3 Phase 2): condition → local action with no agent, via the Sense `safety_check` hook** — `device.wire_reflex_demo()`
+- **Unified error model (v1.4): every wire error/denial carries a stable `code` from the `d2a/errors.py` registry; a source-scan drift guard fails on a sixth shape** — see [Error model](#error-model-v14)
+- **Graceful departure (v1.4): `device.stop()` notifies bound agents (`device_shutdown`, distinct from a lapsed lease), tears bindings down through the one unified path (reason `shutdown`), and unpublishes records so discovery drops the device immediately on LAN + DHT — no TTL ghost; ungraceful death is unchanged (TTL aging + renew failure)**
 - Sense Layer Part 1: all 4 shapes, verdict + confidence, CPU burn load test; **verdict-transition `event_emitter` + `safety_check` hooks closed (Part 2)**
 - Full 10-stage Capability Composition: plan → atomic bind → runtime monitor + fallback → atomic release
 - Consent policy: safe defaults, sensitive = denied unless owner opts in

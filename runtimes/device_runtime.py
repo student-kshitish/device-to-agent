@@ -5,6 +5,7 @@ import time
 import uuid
 
 from d2a import conditions
+from d2a import errors
 from d2a import (
     Capability, BindToken,
     verify_bind_token, CapabilityBroker,
@@ -411,8 +412,75 @@ class DeviceRuntime:
         self._start_lease_sweeper()
 
     def stop_swarm(self) -> None:
+        """
+        Graceful departure. Before tearing down the transport we, best-effort:
+          1. tear down every active binding through the ONE unified path
+             (broker.teardown_all → reason "shutdown"), killing each binding's
+             streams / event subs / tasks via _cleanup_binding_stream;
+          2. push a `device_shutdown` notice (data-path class, like lease_expired)
+             to each affected agent so it can distinguish an ANNOUNCED departure
+             from a silent vanish;
+          3. unpublish our capability records so discover() drops us immediately
+             on both transports — no TTL ghost.
+        An ungraceful kill (process death, transport killed without this call) is
+        unchanged: no notice, no unpublish, peers TTL-age us exactly as before.
+        """
+        self._graceful_departure()
         self._sweeper_running = False
         self.swarm.stop()
+
+    # stop() is the natural name and the context-manager exit; both route through
+    # the same graceful path as stop_swarm().
+    def stop(self) -> None:
+        self.stop_swarm()
+
+    def __enter__(self) -> "DeviceRuntime":
+        return self
+
+    def __exit__(self, *exc) -> None:
+        self.stop_swarm()
+
+    def _graceful_departure(self) -> None:
+        if getattr(self, "_departed", False):
+            return
+        self._departed = True
+
+        # 1 + 2 — unified teardown, then a best-effort shutdown notice per agent.
+        try:
+            infos = self.broker.teardown_all("shutdown")
+        except Exception:
+            infos = []
+        for info in infos:
+            bid = info["binding_id"]
+            try:
+                self._cleanup_binding_stream(bid)
+            except Exception:
+                pass
+            try:
+                self.swarm.send(info["agent_id"], {
+                    "type":            "device_shutdown",
+                    "binding_id":      bid,
+                    "capability_name": info["capability_name"],
+                    "node_id":         self.node_id,
+                    "code":            errors.DEVICE_SHUTDOWN,
+                    "ts":              time.time(),
+                })
+            except Exception:
+                pass
+
+        # 3 — retract every record WE authored (real + virtual caps) so discovery
+        # drops us now. Snapshot keys under the lock, then unpublish outside it.
+        try:
+            with self.swarm._lock:
+                own = [(nid, name) for (nid, name) in list(self.swarm.records.keys())
+                       if nid == self.node_id]
+        except Exception:
+            own = []
+        for nid, name in own:
+            try:
+                self.swarm.unpublish({"node_id": nid, "name": name})
+            except Exception:
+                pass
 
     # ── lease expiry sweeper ────────────────────────────────────────────────────
 
@@ -455,7 +523,7 @@ class DeviceRuntime:
                     "binding_id":      binding_id,
                     "capability_name": info["capability_name"],
                     "node_id":         self.node_id,
-                    "reason":          "ttl_expired",
+                    "code":            errors.LEASE_EXPIRED,
                     "expired_at":      time.time(),
                 })
             except Exception:
@@ -472,22 +540,22 @@ class DeviceRuntime:
         so the sweeper cannot expire this binding between the check and the renew.
         The new expiry is computed from the DEVICE clock only.
         """
-        denied = lambda reason: self._sign({
+        denied = lambda code: self._sign({
             "type": "lease_renewed", "status": "denied",
-            "binding_id": binding_id, "reason": reason,
+            "binding_id": binding_id, "code": code,
         })
         with self.broker._lock:
             b = self.broker.get_binding(binding_id)
             if b is None:
-                return denied("unknown_binding")
+                return denied(errors.UNKNOWN_BINDING)
             if b.agent_id != agent_id:
-                return denied("not_owner")
+                return denied(errors.NOT_OWNER)
             if capability and b.capability_name != capability:
-                return denied("capability_mismatch")
+                return denied(errors.CAPABILITY_MISMATCH)
             # A lease that already lapsed (or lost its slot) cannot be renewed —
             # the agent must re-bind. Device clock is the sole authority here.
             if b.status != "active" or time.time() > b.token.expires_at:
-                return denied("expired")
+                return denied(errors.LEASE_EXPIRED)
 
             self.broker_renew(binding_id, self.lease_ttl)
             b = self.broker.get_binding(binding_id)
@@ -661,7 +729,7 @@ class DeviceRuntime:
                 "task_id":    task_id,
                 "status":     status,
                 "result":     result,
-                "error":      error,
+                "error_detail": error,   # free-text exception string, NOT a registry code
                 "ts":         time.time(),
             })
         except Exception:
@@ -720,8 +788,8 @@ class DeviceRuntime:
             if reason is not None:
                 print(f"[{self.name}] bind_request from {agent_id[:8]} REJECTED — {reason}")
                 return self._sign({"type": "bind_response", "status": "denied",
-                                   "reason": reason,
-                                   "message": f"trust check failed: {reason}"})
+                                   "code": reason,
+                                   "detail": f"trust check failed: {reason}"})
 
             cap_name = message.get("capability_name", "")
             needs    = message.get("needs", [])
@@ -740,13 +808,15 @@ class DeviceRuntime:
                 print(f"[{self.name}] bind_request from {agent_id[:8]} for '{cap_name}' "
                       f"→ denied (policy: blocked)")
                 return self._sign({"type": "bind_response", "status": "denied",
-                                   "message": "resource blocked by device policy"})
+                                   "code": errors.POLICY_BLOCKED,
+                                   "detail": "resource blocked by device policy"})
             if decision == "needs_approval":
                 if not self.policy.approve(cap_name, agent_id):
                     print(f"[{self.name}] bind_request from {agent_id[:8]} for '{cap_name}' "
                           f"→ denied (sensitive: approval required)")
                     return self._sign({"type": "bind_response", "status": "denied",
-                                       "message": "owner approval required for sensitive resource"})
+                                       "code": errors.APPROVAL_REQUIRED,
+                                       "detail": "owner approval required for sensitive resource"})
 
             result = self.broker_request(agent_id, cap_name, needs, priority)
             print(f"[{self.name}] bind_request from {agent_id[:8]} for '{cap_name}' "
@@ -768,8 +838,14 @@ class DeviceRuntime:
                     "device_class":         self.device_class,
                     "verified_by_provider": True,
                 })
-            return self._sign({"type": "bind_response", "status": result.get("status"),
-                               "message": result.get("message", "")})
+            # Non-grant broker outcome (queued, or an errors.* coded failure like
+            # capability_not_found): keep the bind_response type, pass any registry
+            # code through, and normalize the human text into `detail`.
+            denial = {"type": "bind_response", "status": result.get("status"),
+                      "detail": result.get("detail") or result.get("message", "")}
+            if result.get("code"):
+                denial["code"] = result["code"]
+            return self._sign(denial)
 
         # ── lease renewal (wire-level) ────────────────────────────────────────
         if mtype == "renew_binding":
@@ -779,7 +855,7 @@ class DeviceRuntime:
                 print(f"[{self.name}] renew_binding from {agent_id[:8]} REJECTED — {reason}")
                 return self._sign({"type": "lease_renewed", "status": "denied",
                                    "binding_id": message.get("binding_id", ""),
-                                   "reason": reason})
+                                   "code": reason})
             return self._handle_renew(
                 agent_id=agent_id,
                 binding_id=message.get("binding_id", ""),
@@ -797,11 +873,8 @@ class DeviceRuntime:
             binding_id = message.get("binding_id", "")
             capability = message.get("capability", "")
             if not self._verify_binding_scope(binding_id, capability):
-                return {
-                    "type":       "error",
-                    "binding_id": binding_id,
-                    "error":      "binding_invalid_or_out_of_scope",
-                }
+                return errors.error(errors.BINDING_INVALID_OR_OUT_OF_SCOPE,
+                                    binding_id=binding_id)
             # Virtual capabilities (VSO / emergent) serve their reading through
             # their own dispatcher; real capabilities go to the DataProvider.
             v = self._virtual.get(capability)
@@ -820,12 +893,12 @@ class DeviceRuntime:
             action     = message.get("action", "")
             params     = message.get("params", {}) or {}
             if not self._verify_binding_scope(binding_id, capability):
-                return {"type": "error", "binding_id": binding_id,
-                        "error": "binding_invalid_or_out_of_scope"}
+                return errors.error(errors.BINDING_INVALID_OR_OUT_OF_SCOPE,
+                                    binding_id=binding_id)
             v = self._virtual.get(capability)
             if v is None:
-                return {"type": "error", "binding_id": binding_id,
-                        "error": "not_an_action_capability"}
+                return errors.error(errors.NOT_AN_ACTION_CAPABILITY,
+                                    binding_id=binding_id)
 
             # Long-running action (manifest-declared) → async: return a task_id
             # immediately, deliver completion later as a kind:"task" event. This
@@ -871,7 +944,7 @@ class DeviceRuntime:
                             "binding_id": binding_id, "status": "unknown"}
                 return {"type": "task_status", "task_id": task_id,
                         "binding_id": binding_id, "status": t["status"],
-                        "result": t["result"], "error": t["error"]}
+                        "result": t["result"], "error_detail": t["error"]}
 
         # ── opt-in streaming: subscribe ───────────────────────────────────────
         if mtype == "subscribe":
@@ -885,11 +958,8 @@ class DeviceRuntime:
             agent_address = message.get("agent_address")
 
             if not self._verify_binding_scope(binding_id, capability):
-                return {
-                    "type":       "error",
-                    "binding_id": binding_id,
-                    "error":      "binding_invalid_or_out_of_scope",
-                }
+                return errors.error(errors.BINDING_INVALID_OR_OUT_OF_SCOPE,
+                                    binding_id=binding_id)
 
             if agent_address and len(agent_address) == 2:
                 self.swarm.add_known_peer(agent_node_id, agent_address[0], int(agent_address[1]))
@@ -926,32 +996,32 @@ class DeviceRuntime:
             req_hz        = float(message.get("eval_hz", 5.0))
 
             if not self._verify_binding_scope(binding_id, capability):
-                return {"type": "error", "binding_id": binding_id,
-                        "error": "binding_invalid_or_out_of_scope"}
+                return errors.error(errors.BINDING_INVALID_OR_OUT_OF_SCOPE,
+                                    binding_id=binding_id)
 
             manifest = self._manifest_for(capability)
             if manifest is None:
-                return {"type": "error", "binding_id": binding_id,
-                        "error": "no_manifest_for_conditions"}
+                return errors.error(errors.NO_MANIFEST_FOR_CONDITIONS,
+                                    binding_id=binding_id)
             try:
                 cond = conditions.validate_condition(condition, manifest)
             except conditions.ConditionError as e:
-                return {"type": "error", "binding_id": binding_id,
-                        "error": "invalid_condition", "detail": str(e)}
+                return errors.error(errors.INVALID_CONDITION, str(e),
+                                    binding_id=binding_id)
 
-            # Two guards, distinct reasons (per-binding is what the lease bought;
+            # Two guards, distinct codes (per-binding is what the lease bought;
             # per-capability is the device ceiling on the shared loop).
             per_binding = self._binding_event_subs.get(binding_id, {})
             if len(per_binding) >= self._event_subs_per_binding:
-                return {"type": "error", "binding_id": binding_id,
-                        "error": "event_cap_exceeded",
-                        "detail": f"per-binding limit {self._event_subs_per_binding} reached"}
+                return errors.error(errors.EVENT_CAP_EXCEEDED,
+                                    f"per-binding limit {self._event_subs_per_binding} reached",
+                                    binding_id=binding_id)
             cap_count = sum(1 for m in self._event_meta.values()
                             if m["capability"] == capability)
             if cap_count >= self._event_cap_ceiling:
-                return {"type": "error", "binding_id": binding_id,
-                        "error": "device_event_capacity",
-                        "detail": f"per-capability limit {self._event_cap_ceiling} reached"}
+                return errors.error(errors.DEVICE_EVENT_CAPACITY,
+                                    f"per-capability limit {self._event_cap_ceiling} reached",
+                                    binding_id=binding_id)
 
             eval_hz = max(0.1, min(req_hz, MAX_SAMPLE_HZ))
             if agent_address and len(agent_address) == 2:
@@ -1023,7 +1093,7 @@ class DeviceRuntime:
             reason = signing.verify_message(message, agent_id, self.pins)
             if reason is not None:
                 print(f"[{self.name}] release_binding from {agent_id[:8]} REJECTED — {reason}")
-                return self._sign({"type": "released", "status": "denied", "reason": reason})
+                return self._sign({"type": "released", "status": "denied", "code": reason})
             cap_name = message.get("capability_name", "")
             result   = self.broker_release(agent_id, cap_name)
             return self._sign({"type": "released", "status": result.get("status", "ok")})
@@ -1061,7 +1131,8 @@ class DeviceRuntime:
     def broker_rebind(self, binding_id: str, new_capability_name: str) -> dict:
         binding = self.broker.get_binding(binding_id)
         if binding is None:
-            return {"status": "error", "message": f"Binding {binding_id} not found"}
+            return {"status": "error", "code": errors.BINDING_NOT_FOUND,
+                    "detail": f"Binding {binding_id} not found"}
         rebind(binding, new_capability_name, self, self.private_key)
         return {
             "status":           "rebound",
@@ -1074,14 +1145,16 @@ class DeviceRuntime:
     def broker_renew(self, binding_id: str, ttl_seconds: int = 300) -> dict:
         binding = self.broker.get_binding(binding_id)
         if binding is None:
-            return {"status": "error", "message": f"Binding {binding_id} not found"}
+            return {"status": "error", "code": errors.BINDING_NOT_FOUND,
+                    "detail": f"Binding {binding_id} not found"}
         renew(binding, self, self.private_key, ttl_seconds)
         return {"status": "renewed", "binding_id": binding_id, "expires_at": binding.token.expires_at}
 
     def broker_get_binding(self, binding_id: str) -> dict:
         binding = self.broker.get_binding(binding_id)
         if binding is None:
-            return {"status": "error", "message": f"Binding {binding_id} not found"}
+            return {"status": "error", "code": errors.BINDING_NOT_FOUND,
+                    "detail": f"Binding {binding_id} not found"}
         return {
             "binding_id":      binding.binding_id,
             "agent_id":        binding.agent_id,

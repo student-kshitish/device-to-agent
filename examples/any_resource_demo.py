@@ -125,7 +125,7 @@ for res in present_sens:
         continue
     result = agent.bind_remote_to(provider_a.node_id, res)
     status = result.get("status", "?")
-    msg    = result.get("policy_message") or result.get("message", "")
+    msg    = result.get("policy_message") or result.get("detail", "")
     print(f"  {res}: status={status}  →  {msg}")
     if status == "denied":
         denied_count += 1

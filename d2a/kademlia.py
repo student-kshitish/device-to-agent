@@ -316,6 +316,27 @@ class KademliaNode:
             self._own_records[key] = record
         self._store(key, record)
 
+    def remove(self, key: str, provider_id: str, extra: dict | None = None) -> None:
+        """
+        Graceful unpublish of `provider_id`'s value under `key`. Kademlia has no
+        native DELETE, so we publish a short-lived TOMBSTONE: a record with a fresh
+        `ts` (so it SUPERSEDES the live record in every merge — merge keeps the
+        freshest ts) carrying a `tombstone` flag, and we stop refreshing the
+        original (pop from `_own_records`). It replicates to the K closest exactly
+        like a normal store. Consumers drop the provider the moment they see the
+        tombstone; the tombstone itself is TTL-pruned like any other record, so
+        storage does not grow. This is the honest removal primitive for a
+        store-and-forward DHT — a departed provider disappears from find_value
+        immediately instead of aging out over a full TTL.
+        """
+        with self._lock:
+            self._own_records.pop(key, None)
+        tomb = {"node_id": provider_id, "key": key, "tombstone": True,
+                "ts": time.time(), VERSION_FIELD: PROTOCOL_VERSION}
+        if extra:
+            tomb.update(extra)   # e.g. the capability name, so consumers can locate the cached record
+        self._store(key, tomb)
+
     def _store(self, key: str, record: dict) -> None:
         self._merge_record(key, record)
         target = hash_id(key)

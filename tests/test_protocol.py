@@ -29,6 +29,7 @@ import unittest
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
 from d2a import PROTOCOL_VERSION, ProtocolVersionError
+from d2a import errors
 from d2a.protocol import (
     major_of, versions_compatible, classify, stamp, VERSION_FIELD, _warned_legacy,
 )
@@ -182,7 +183,8 @@ class TestTCPVersionGate(unittest.TestCase):
     def test_major_mismatch_rejected(self):
         resp = self._raw_request({"type": "ping", "v": NEXT_MAJOR})
         self.assertEqual(resp.get("type"), "error")
-        self.assertEqual(resp.get("reason"), "version_mismatch")
+        # v1.4 error-model: version_mismatch code now rides `code` (was `reason`).
+        self.assertEqual(resp.get("code"), errors.VERSION_MISMATCH)
         self.assertEqual(resp.get("peer_version"), PROTOCOL_VERSION)
         self.assertEqual(len(self.captured), 0, "handler NOT run on mismatch")
 
@@ -331,13 +333,14 @@ class ProtoE2EMixin:
             if lost:
                 break
             time.sleep(0.1)
-        self.assertEqual(lost, "version_mismatch", "renew mismatch marks lease lost")
+        self.assertEqual(lost, errors.VERSION_MISMATCH, "renew mismatch marks lease lost")
         self.assertEqual(calls["count"], 1, "stopped after ONE renew — no retry storm")
         # The lease is now gone; using the binding surfaces LeaseLostError (whose
-        # reason names the version mismatch) — never a silent failure.
+        # .code names the version mismatch) — never a silent failure. (v1.4: .code
+        # is the field; .reason remains a value-identical alias.)
         with self.assertRaises(LeaseLostError) as ctx:
             a.request_data(r, "sensing")
-        self.assertEqual(ctx.exception.reason, "version_mismatch")
+        self.assertEqual(ctx.exception.code, errors.VERSION_MISMATCH)
 
 
 class TestProtoLAN(ProtoE2EMixin, unittest.TestCase):

@@ -164,8 +164,8 @@ time.sleep(0.05)
 
 result = agent.request_data(binding, capability="compute")
 print(f"  Response: {result}")
-if result.get("type") == "error" or result.get("error"):
-    print("  POST-UNBIND READING REJECTED ✓")
+if result.get("type") == "error" or result.get("code"):
+    print(f"  POST-UNBIND READING REJECTED ✓ (code={result.get('code')})")
 else:
     print(f"  WARNING: expected error, got: {result}")
 

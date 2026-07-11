@@ -21,6 +21,7 @@ from typing import Any
 
 from agents.remote_agent import RemoteAgent
 from d2a.composer import Composer, Composition
+from d2a import errors
 
 
 class ResourceHandle:
@@ -159,7 +160,8 @@ class Agent:
         def bind_fn(node_id, cap_name, p):
             rt = runtimes.get(node_id)
             if rt is None:
-                return {"status": "error", "message": f"no runtime for {node_id}"}
+                return {"status": "error", "code": errors.NO_PROVIDER,
+                        "detail": f"no runtime for {node_id}"}
             result = rt.broker_request(agent_id, cap_name, [], p)
             if result.get("status") == "queued":
                 # Cancel immediately: AtomicBinder uses fail-fast semantics.

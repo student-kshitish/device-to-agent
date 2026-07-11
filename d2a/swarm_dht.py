@@ -137,13 +137,36 @@ class DHTSwarm(LANSwarm):
                 and (capability_name is None or r.get("name") == capability_name)
             ]
 
+    def unpublish(self, record: dict) -> None:
+        """
+        Graceful departure: drop this record from the local cache and tombstone it
+        in the DHT (by capability key and by node key) so discover() stops returning
+        it immediately — no waiting a full TTL for it to age out. See
+        KademliaNode.remove for the tombstone mechanism.
+        """
+        nid = record.get("node_id", "")
+        name = record.get("name", "")
+        with self._lock:
+            self.records.pop((nid, name), None)
+        # Carry the capability name inside the tombstone so a receiving node can
+        # locate the record in its (node_id, name)-keyed cache and drop it.
+        if name:
+            self._dht.remove(f"cap:{name}", nid, {"name": name})
+        if nid:
+            self._dht.remove(f"node:{nid}", nid, {"name": name})
+
     def _absorb(self, records: list[dict]) -> None:
-        """Merge DHT-discovered records into the local records + peer tables."""
+        """Merge DHT-discovered records into the local records + peer tables. A
+        tombstone (graceful-departure marker) instead REMOVES the provider's cached
+        record, so a discover() that observes the tombstone drops the provider now."""
         with self._lock:
             for r in records:
                 nid = r.get("node_id", "")
                 name = r.get("name", "")
                 if not nid:
+                    continue
+                if r.get("tombstone"):
+                    self.records.pop((nid, name), None)
                     continue
                 self.records[(nid, name)] = dict(r)
                 if r.get("address"):

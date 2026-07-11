@@ -16,6 +16,7 @@ from d2a.protocol import (
     PROTOCOL_VERSION, VERSION_FIELD, stamp, classify, versions_compatible,
     warn_legacy_once, logger as _plog,
 )
+from d2a import errors
 
 TTL = 30  # seconds — records older than this are pruned from discover()
 
@@ -36,6 +37,14 @@ class SwarmTransport(abc.ABC):
     @abc.abstractmethod
     def publish(self, record: dict) -> None:
         """Announce a capability record to the network."""
+
+    def unpublish(self, record: dict) -> None:
+        """
+        Retract a previously-published record so peers drop it from discovery
+        immediately (graceful departure). Default no-op — a transport that cannot
+        retract simply lets the record TTL-age, i.e. behaves like ungraceful death.
+        Concrete LAN/DHT transports override this.
+        """
 
     @abc.abstractmethod
     def discover(self, capability_name: str = None) -> list[dict]:
@@ -182,6 +191,20 @@ class LANSwarm(SwarmTransport):
                 own = [r for r in self.records.values() if r.get("node_id") == self.node_id]
             for rec in own:
                 self._broadcast({"type": "announce", "record": rec})
+        elif mtype == "withdraw":
+            # Graceful departure: a node is retracting a record (or, if name is
+            # None, all of its records). Drop it from the cache NOW so discover()
+            # stops returning it immediately instead of aging it out over TTL.
+            nid = msg.get("node_id")
+            name = msg.get("name")
+            if not nid:
+                return
+            with self._lock:
+                if name is not None:
+                    self.records.pop((nid, name), None)
+                else:
+                    for k in [k for k in self.records if k[0] == nid]:
+                        self.records.pop(k, None)
 
     def _broadcast(self, msg: dict) -> None:
         try:
@@ -224,10 +247,9 @@ class LANSwarm(SwarmTransport):
             # ── protocol version gate (single inbound-request chokepoint) ──
             kind = classify(msg.get(VERSION_FIELD))
             if kind == "incompatible":
-                err = stamp({
-                    "type": "error", "reason": "version_mismatch",
-                    "peer_version": PROTOCOL_VERSION,
-                })
+                err = stamp(errors.error(
+                    errors.VERSION_MISMATCH, peer_version=PROTOCOL_VERSION,
+                ))
                 conn.sendall((json.dumps(err) + "\n").encode())
                 return
             if kind == "legacy":
@@ -255,6 +277,19 @@ class LANSwarm(SwarmTransport):
             if rec.get("node_id") and rec.get("address"):
                 self._peers[rec["node_id"]] = tuple(rec["address"])
         self._broadcast({"type": "announce", "record": rec})
+
+    def unpublish(self, record: dict) -> None:
+        """
+        Graceful departure: drop this record locally and broadcast a `withdraw` so
+        every peer removes it from discovery NOW rather than aging it out over TTL.
+        (Ungraceful death is unchanged — a node that just vanishes is still
+        TTL-aged by every peer, exactly as before.)
+        """
+        nid = record.get("node_id", "")
+        name = record.get("name", "")
+        with self._lock:
+            self.records.pop((nid, name), None)
+        self._broadcast({"type": "withdraw", "node_id": nid, "name": name})
 
     def discover(self, capability_name: str = None) -> list[dict]:
         if self._udp_bound:
@@ -331,7 +366,7 @@ class LANSwarm(SwarmTransport):
             if not line:
                 return []
             resp = json.loads(line.decode())
-            if classify(resp.get(VERSION_FIELD)) == "incompatible" or resp.get("reason") == "version_mismatch":
+            if classify(resp.get(VERSION_FIELD)) == "incompatible" or resp.get("code") == errors.VERSION_MISMATCH:
                 _plog.debug("probe_peer: incompatible peer %s:%s (v=%s) — no records",
                             ip, port, resp.get(VERSION_FIELD) or resp.get("peer_version"))
                 return []

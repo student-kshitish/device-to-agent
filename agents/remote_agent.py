@@ -4,6 +4,7 @@ import time
 
 from d2a import LANSwarm, SwarmTransport, PROTOCOL_VERSION, ProtocolVersionError, crypto
 from d2a import signing
+from d2a import errors
 
 TTL = 30
 
@@ -11,14 +12,22 @@ TTL = 30
 class LeaseLostError(Exception):
     """
     Raised when a binding's lease can no longer be kept alive — the device denied
-    a renewal, or the lease expired (renew never succeeded before the device-clock
-    deadline, or a lease_expired push arrived). Surfaced on the next use of the
-    binding (request_data / start_stream) so loss is never silent.
+    a renewal, the lease expired (renew never succeeded before the device-clock
+    deadline, or a lease_expired push arrived), or the device announced a graceful
+    shutdown. Surfaced on the next use of the binding (request_data / start_stream)
+    so loss is never silent.
+
+    `.code` is the registry code driving the loss (errors.LEASE_EXPIRED,
+    errors.DEVICE_SHUTDOWN, errors.VERSION_MISMATCH, a trust code, …). The harness
+    branches on it: DEVICE_SHUTDOWN = announced departure (don't retry soon);
+    LEASE_EXPIRED after a silent vanish = backoff rediscovery. `.reason` is kept as
+    an alias of `.code`.
     """
-    def __init__(self, binding_id: str, reason: str):
+    def __init__(self, binding_id: str, code: str):
         self.binding_id = binding_id
-        self.reason = reason
-        super().__init__(f"lease lost for binding {binding_id[:8]}: {reason}")
+        self.code = code
+        self.reason = code            # alias — same value, older name
+        super().__init__(f"lease lost for binding {binding_id[:8]}: {code}")
 
 
 class RemoteAgent:
@@ -125,24 +134,36 @@ class RemoteAgent:
                 except Exception:
                     pass
         elif mtype == "lease_expired":
-            # Best-effort device notification that our lease is gone. Stop renewing
-            # and mark it lost so the next use raises LeaseLostError.
-            bid = message.get("binding_id", "")
-            with self._leases_lock:
-                lease = self._leases.get(bid)
-            if lease is not None:
-                lease["stop"].set()
-                self._mark_lost(lease, message.get("reason", "ttl_expired"))
-            # drop any event + task handlers for the dead binding
-            self._event_handlers = {
-                k: v for k, v in self._event_handlers.items()
-                if v.get("binding_id") != bid
-            }
-            self._task_handlers = {
-                k: v for k, v in self._task_handlers.items()
-                if v.get("binding_id") != bid
-            }
+            # Best-effort device notification that our lease lapsed (silent-vanish
+            # class). Stop renewing and mark it lost so the next use raises.
+            self._on_binding_death(message.get("binding_id", ""),
+                                   message.get("code", errors.LEASE_EXPIRED))
+        elif mtype == "device_shutdown":
+            # The device ANNOUNCED a graceful departure — distinct from a lapsed
+            # lease. Same local teardown, but the loss code is device_shutdown so a
+            # harness can branch: announced shutdown = don't retry this device soon;
+            # a silent vanish (lease_expired / renew timeout) = backoff rediscovery.
+            self._on_binding_death(message.get("binding_id", ""),
+                                   message.get("code", errors.DEVICE_SHUTDOWN))
         return None  # no TCP reply needed for inbound pushes
+
+    def _on_binding_death(self, bid: str, code: str) -> None:
+        """Shared teardown for a device-pushed binding-death notice (lease_expired
+        or device_shutdown): stop renewing, mark the lease lost with `code`, and
+        drop the binding's event + task handlers."""
+        with self._leases_lock:
+            lease = self._leases.get(bid)
+        if lease is not None:
+            lease["stop"].set()
+            self._mark_lost(lease, code)
+        self._event_handlers = {
+            k: v for k, v in self._event_handlers.items()
+            if v.get("binding_id") != bid
+        }
+        self._task_handlers = {
+            k: v for k, v in self._task_handlers.items()
+            if v.get("binding_id") != bid
+        }
 
     def _check_version(self, response: dict) -> None:
         """
@@ -151,7 +172,7 @@ class RemoteAgent:
         surfaces as a clear typed exception naming both versions — never a silent
         failure or a confusing downstream error.
         """
-        if isinstance(response, dict) and response.get("reason") == "version_mismatch":
+        if isinstance(response, dict) and response.get("code") == errors.VERSION_MISMATCH:
             raise ProtocolVersionError(PROTOCOL_VERSION, response.get("peer_version"))
 
     # ── discovery / bind ──────────────────────────────────────────────────────
@@ -220,7 +241,8 @@ class RemoteAgent:
         if not response:
             return {
                 "status":           "error",
-                "message":          f"No response from {target_node_id[:8]}",
+                "code":             errors.NO_RESPONSE,
+                "detail":           f"No response from {target_node_id[:8]}",
                 "provider_node_id": target_node_id,
             }
         self._check_version(response)                     # raises on major mismatch
@@ -246,7 +268,7 @@ class RemoteAgent:
             response.setdefault("device_class", provider_record.get("device_class", "unknown"))
         # Surface policy denials clearly for agent authors — no silent failure
         if response.get("status") == "denied":
-            response["policy_message"] = response.get("message", "denied by device policy")
+            response["policy_message"] = response.get("detail", "denied by device policy")
         # A verified bind starts a lease we keep alive (unless auto_renew is off).
         if verified:
             self._start_lease(response)
@@ -309,7 +331,7 @@ class RemoteAgent:
                 if resp is None:
                     # transient — don't give up unless the lease has truly expired
                     if time.time() >= lease["lease_expires_at"]:
-                        self._mark_lost(lease, "ttl_expired")
+                        self._mark_lost(lease, errors.LEASE_EXPIRED)
                         return
                     retry = max(lease["lease_ttl"] / 10.0, 0.2) * (0.9 + random.uniform(0.0, 0.2))
                     if stop.wait(retry):
@@ -318,8 +340,8 @@ class RemoteAgent:
 
                 # A version mismatch is a hard, permanent failure — treat it like a
                 # denial (stop renewing, surface loss), NEVER as a retryable drop.
-                if resp.get("reason") == "version_mismatch":
-                    self._mark_lost(lease, "version_mismatch")
+                if resp.get("code") == errors.VERSION_MISMATCH:
+                    self._mark_lost(lease, errors.VERSION_MISMATCH)
                     return
 
                 # The lease_renewed must be authentically from the pinned device.
@@ -328,7 +350,7 @@ class RemoteAgent:
                 # a MITM stripping signatures can only let the lease lapse.
                 if signing.verify_message(resp, lease["provider_node_id"], self.pins) is not None:
                     if time.time() >= lease["lease_expires_at"]:
-                        self._mark_lost(lease, "ttl_expired")
+                        self._mark_lost(lease, errors.LEASE_EXPIRED)
                         return
                     retry = max(lease["lease_ttl"] / 10.0, 0.2) * (0.9 + random.uniform(0.0, 0.2))
                     if stop.wait(retry):
@@ -341,7 +363,7 @@ class RemoteAgent:
                     break                                 # renewed — back to half-TTL sleep
 
                 # explicit denial → lease is unrecoverable, surface immediately
-                self._mark_lost(lease, resp.get("reason", "denied"))
+                self._mark_lost(lease, resp.get("code", "denied"))
                 return
 
     def _mark_lost(self, lease: dict, reason: str) -> None:
@@ -390,7 +412,8 @@ class RemoteAgent:
         providers = [r for r in providers if r.get("node_id") != self.agent_id]
 
         if not providers:
-            return {"status": "error", "message": f"No provider for '{capability_name}' found on network"}
+            return {"status": "error", "code": errors.NO_PROVIDER,
+                    "detail": f"No provider for '{capability_name}' found on network"}
 
         return self.bind_remote_to(providers[0]["node_id"], capability_name, priority)
 
@@ -411,7 +434,7 @@ class RemoteAgent:
 
         Returns:
             {"type":"reading", "capability":..., "binding_id":..., "frame": {raw, derived, ts, seq}}
-            or {"type":"error", "error": reason} if rejected.
+            or the unified {"type":"error", "code": <errors.*>, ...} if rejected.
         """
         self._raise_if_lost(binding.get("binding_id", ""))
         cap    = capability or binding.get("capability_name", "")
@@ -424,11 +447,12 @@ class RemoteAgent:
         }
         response = self.swarm.send_and_recv(target, request, timeout=5.0)
         if not response:
-            return {"type": "error", "error": "no_response", "binding_id": binding.get("binding_id")}
+            return errors.error(errors.NO_RESPONSE, binding_id=binding.get("binding_id"))
         self._check_version(response)                     # raises on major mismatch
         # verify the response is for our binding
         if response.get("binding_id") != binding.get("binding_id"):
-            return {"type": "error", "error": "binding_id_mismatch"}
+            return errors.error(errors.BINDING_ID_MISMATCH,
+                                binding_id=binding.get("binding_id"))
         return response
 
     def call_action(self, binding: dict, action: str, params: dict = None,
@@ -458,7 +482,7 @@ class RemoteAgent:
         }
         response = self.swarm.send_and_recv(target, request, timeout=5.0)
         if not response:
-            return {"type": "error", "error": "no_response", "binding_id": bid}
+            return errors.error(errors.NO_RESPONSE, binding_id=bid)
         self._check_version(response)
         # register the completion callback if this returned a running task
         result = response.get("result") if isinstance(response, dict) else None
@@ -469,7 +493,7 @@ class RemoteAgent:
 
     def task_status(self, binding: dict, task_id: str) -> dict:
         """Poll a long-running task. Returns {"status": running|done|failed|
-        cancelled|unknown, "result"?, "error"?}. "unknown" once the task's
+        cancelled|unknown, "result"?, "error_detail"?}. "unknown" once the task's
         lease dies (record dropped) or the id is not this binding's."""
         target = binding.get("provider_node_id", "")
         response = self.swarm.send_and_recv(target, {
@@ -479,7 +503,7 @@ class RemoteAgent:
             "task_id":    task_id,
         }, timeout=5.0)
         if not response:
-            return {"type": "error", "error": "no_response", "task_id": task_id}
+            return errors.error(errors.NO_RESPONSE, task_id=task_id)
         self._check_version(response)
         return response
 
@@ -546,7 +570,8 @@ class RemoteAgent:
             {"field": <manifest field>, "op": gt|lt|ge|le|eq|ne|changed,
              "value": <scalar; omit for "changed">}
         Validated device-side against the capability manifest — an unknown field
-        or op/type mismatch comes back as {"error": "invalid_condition", ...}.
+        or op/type mismatch comes back as the unified error with
+        code == errors.INVALID_CONDITION.
 
         Events fire on EDGE (the crossing), not every sample above threshold, and
         re-arm when the condition becomes false again. callback(event) runs per
@@ -573,7 +598,7 @@ class RemoteAgent:
         }
         response = self.swarm.send_and_recv(target, request, timeout=5.0)
         if not response:
-            return {"type": "error", "error": "no_response", "binding_id": bid}
+            return errors.error(errors.NO_RESPONSE, binding_id=bid)
         self._check_version(response)
         if response.get("status") == "subscribed":
             esid = response.get("event_sub_id", "")

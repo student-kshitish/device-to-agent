@@ -4,6 +4,7 @@ from dataclasses import dataclass
 
 from d2a.schema import BindToken, Binding
 from d2a.verbs import make_bind_request, make_bind_token, make_binding
+from d2a import errors
 
 LEASE_TTL_DEFAULT = 300   # seconds — matches make_bind_token's default token TTL
 
@@ -79,7 +80,7 @@ class CapabilityBroker:
         """
         THE ONE teardown codepath. Removes `bind` from the active set and records
         `reason` on its Binding. Does NOT grant the waitqueue — callers decide.
-        reason ∈ {released, preempted, expired}.
+        reason ∈ {released, preempted, expired, shutdown}.
         """
         active = self.active_binds.get(capability_name, [])
         if bind in active:
@@ -111,7 +112,8 @@ class CapabilityBroker:
     def request_bind(self, agent_id: str, capability_name: str, needs: list[str], priority: int = 5) -> dict:
         with self._lock:
             if self.runtime.get_capability(capability_name) is None:
-                return {"status": "error", "message": f"Capability '{capability_name}' not found"}
+                return {"status": "error", "code": errors.CAPABILITY_NOT_FOUND,
+                        "detail": f"Capability '{capability_name}' not found"}
 
             quota = self.quotas.get(capability_name, 1)
             active = self.active_binds.setdefault(capability_name, [])
@@ -160,7 +162,8 @@ class CapabilityBroker:
             active = self.active_binds.get(capability_name, [])
             bind = next((b for b in active if b.agent_id == agent_id), None)
             if bind is None:
-                return {"status": "error", "message": f"No active bind for agent {agent_id} on {capability_name}"}
+                return {"status": "error", "code": errors.NO_ACTIVE_BIND,
+                        "detail": f"No active bind for agent {agent_id} on {capability_name}"}
 
             self._remove_active_bind(bind, capability_name, "released")
             grant = self._grant_from_waitqueue(capability_name)
@@ -212,6 +215,24 @@ class CapabilityBroker:
                 info = self.expire_binding(bid)
                 if info:
                     out.append({"binding_id": bid, **info})
+            return out
+
+    def teardown_all(self, reason: str = "shutdown") -> list[dict]:
+        """
+        Tear down EVERY active binding through the shared _remove_active_bind path
+        (graceful device departure). Unlike expiry it does NOT grant the waitqueue —
+        the device is going away, so a freed slot has nothing to hand it to. Returns
+        one info dict {binding_id, agent_id, capability_name} per torn-down binding,
+        so the runtime can push a shutdown notice to each affected agent.
+        """
+        with self._lock:
+            out = []
+            for cap in list(self.active_binds.keys()):
+                for bind in list(self.active_binds.get(cap, [])):
+                    out.append({"binding_id": bind.binding_id,
+                                "agent_id": bind.agent_id,
+                                "capability_name": cap})
+                    self._remove_active_bind(bind, cap, reason)
             return out
 
     def cancel_queue(self, agent_id: str, capability_name: str) -> bool:

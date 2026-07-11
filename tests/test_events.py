@@ -211,6 +211,10 @@ class EventTestsMixin:
         self.assertEqual([e["seq"] for e in events], [1, 2])
 
     # 4 — invalid conditions rejected
+    # NOTE (v1.4 error-model): device error responses now carry the code under
+    # `code` (was `error`); values unchanged. The async-task failure string moved
+    # from `error` to `error_detail` (a free-text exception string is NOT a
+    # registry code, so it gets a distinct field name).
     def test_invalid_conditions_rejected(self):
         d = self.make_device("baddev")
         self._add_sensor(d)
@@ -218,10 +222,10 @@ class EventTestsMixin:
         r = self.bind_sensor(a, d)
 
         unknown = a.on_event(r, {"field": "nope", "op": "gt", "value": 1}, lambda e: None)
-        self.assertEqual(unknown.get("error"), "invalid_condition")
+        self.assertEqual(unknown.get("code"), "invalid_condition")
 
         mism = a.on_event(r, {"field": "level", "op": "gt", "value": 1}, lambda e: None)
-        self.assertEqual(mism.get("error"), "invalid_condition")
+        self.assertEqual(mism.get("code"), "invalid_condition")
 
     # 5 & 6 — the two caps produce DISTINCT rejection reasons
     def test_per_binding_cap_reason(self):
@@ -238,7 +242,7 @@ class EventTestsMixin:
                                     lambda e: None, eval_hz=1).get("status"), "subscribed")
         over = a.on_event(r, {"field": "value", "op": "gt", "value": 30},
                           lambda e: None, eval_hz=1)
-        self.assertEqual(over.get("error"), "event_cap_exceeded")
+        self.assertEqual(over.get("code"), "event_cap_exceeded")
 
     def test_per_capability_ceiling_reason(self):
         d = self.make_device("ceildev")
@@ -251,7 +255,7 @@ class EventTestsMixin:
         a.on_event(r, {"field": "value", "op": "gt", "value": 10}, lambda e: None, eval_hz=1)
         a.on_event(r, {"field": "value", "op": "gt", "value": 20}, lambda e: None, eval_hz=1)
         over = a.on_event(r, {"field": "value", "op": "gt", "value": 30}, lambda e: None, eval_hz=1)
-        self.assertEqual(over.get("error"), "device_event_capacity",
+        self.assertEqual(over.get("code"), "device_event_capacity",
                          "device-wide ceiling is a DISTINCT reason from per-binding")
 
     # 7 — event carries the snapshot + gapless sequence
@@ -395,7 +399,7 @@ class EventTestsMixin:
         time.sleep(0.4)
         fstat = a.task_status(r, ftid)
         self.assertEqual(fstat["status"], "failed")
-        self.assertIn("boom", fstat.get("error", ""))
+        self.assertIn("boom", fstat.get("error_detail", ""))
 
     # 14 — task dies with lease: cancel token fires, completion suppressed, unknown
     def test_task_dies_with_lease(self):

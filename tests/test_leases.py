@@ -34,6 +34,7 @@ from d2a.kademlia import KademliaNode
 from runtimes.device_runtime import DeviceRuntime
 from agents.remote_agent import RemoteAgent, LeaseLostError
 from d2a import crypto
+from d2a import errors
 from tests._env import use_tmp_home, restore_home
 
 
@@ -225,15 +226,19 @@ class LeaseTestsMixin:
         a = self.make_agent("ag", auto_renew=False)
         r = self.bind(a, d, "sensing")
 
+        # v1.4 error-model: denial code carrier moved reason→code. The unknown
+        # case keeps its value; the expired case was COLLAPSED from "expired" to
+        # the single lease-death code "lease_expired" (shared with the death push,
+        # sibling of "device_shutdown").
         bogus = dict(r); bogus["binding_id"] = "does-not-exist"
         resp = self.renew_over_wire(a, bogus)
         self.assertEqual(resp.get("status"), "denied")
-        self.assertEqual(resp.get("reason"), "unknown_binding")
+        self.assertEqual(resp.get("code"), errors.UNKNOWN_BINDING)
 
         time.sleep(TTL + 0.8)                            # let the real lease expire
         resp2 = self.renew_over_wire(a, r)
         self.assertEqual(resp2.get("status"), "denied")
-        self.assertEqual(resp2.get("reason"), "expired")
+        self.assertEqual(resp2.get("code"), errors.LEASE_EXPIRED)
 
     # 6 — auto-renew keeps a long binding alive
     def test_autorenew_keeps_alive(self):

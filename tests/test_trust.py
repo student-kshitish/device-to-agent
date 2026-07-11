@@ -77,6 +77,12 @@ class TestTrustGateUnit(unittest.TestCase):
     def _bind(self, msg):
         return self.device._on_message(msg)
 
+    # NOTE (v1.4 error-model unification): every trust-denial below now reads the
+    # code under the unified `code` key (was `reason`). The VALUES are unchanged —
+    # signing.ERR_*/crypto.ERR_* are re-exported verbatim by d2a.errors — so only
+    # the carrier key moved. The denial type (bind_response/lease_renewed/released)
+    # and status:"denied" are unchanged.
+
     def test_happy_signed_bind_granted_and_response_signed(self):
         resp = self._bind(_sign_bind(self.node, self.priv, self.pub))
         self.assertIn(resp.get("status"), ("granted", "granted_by_preemption"))
@@ -89,19 +95,19 @@ class TestTrustGateUnit(unittest.TestCase):
         resp = self._bind({"type": "bind_request", "from_node": self.node,
                            "capability_name": "compute", "needs": [], "priority": 5})
         self.assertEqual(resp["status"], "denied")
-        self.assertEqual(resp["reason"], signing.ERR_UNSIGNED)
+        self.assertEqual(resp["code"], signing.ERR_UNSIGNED)
 
     def test_unsigned_renew_rejected(self):
         resp = self._bind({"type": "renew_binding", "from_node": self.node,
                            "binding_id": "whatever", "capability_name": "compute"})
         self.assertEqual(resp["type"], "lease_renewed")
-        self.assertEqual(resp["reason"], signing.ERR_UNSIGNED)
+        self.assertEqual(resp["code"], signing.ERR_UNSIGNED)
 
     def test_unsigned_release_rejected(self):
         resp = self._bind({"type": "release_binding", "from_node": self.node,
                            "capability_name": "compute"})
         self.assertEqual(resp["type"], "released")
-        self.assertEqual(resp["reason"], signing.ERR_UNSIGNED)
+        self.assertEqual(resp["code"], signing.ERR_UNSIGNED)
 
     def test_forged_signature_rejected(self):
         msg = _sign_bind(self.node, self.priv, self.pub)
@@ -110,27 +116,27 @@ class TestTrustGateUnit(unittest.TestCase):
         msg["sig"] = bytes(sig).hex()
         resp = self._bind(msg)
         self.assertEqual(resp["status"], "denied")
-        self.assertEqual(resp["reason"], signing.ERR_BAD_SIG)
+        self.assertEqual(resp["code"], signing.ERR_BAD_SIG)
 
     def test_tampered_agent_address_detected(self):
         msg = _sign_bind(self.node, self.priv, self.pub, agent_address=["10.0.0.1", 5000])
         msg["agent_address"] = ["6.6.6.6", 6666]     # attacker rewrites the return path
         resp = self._bind(msg)
         self.assertEqual(resp["status"], "denied")
-        self.assertEqual(resp["reason"], signing.ERR_BAD_SIG)
+        self.assertEqual(resp["code"], signing.ERR_BAD_SIG)
 
     def test_version_spoof_inside_payload_detected(self):
         msg = _sign_bind(self.node, self.priv, self.pub)
         msg["v"] = "1.5"                              # same major (transport would pass) but tampered
         resp = self._bind(msg)
         self.assertEqual(resp["status"], "denied")
-        self.assertEqual(resp["reason"], signing.ERR_BAD_SIG)
+        self.assertEqual(resp["code"], signing.ERR_BAD_SIG)
 
     def test_replayed_old_ts_rejected(self):
         old = time.time() - (signing.REPLAY_WINDOW_SECONDS + 60)
         resp = self._bind(_sign_bind(self.node, self.priv, self.pub, ts=old))
         self.assertEqual(resp["status"], "denied")
-        self.assertEqual(resp["reason"], signing.ERR_STALE)
+        self.assertEqual(resp["code"], signing.ERR_STALE)
 
     def test_tofu_pin_violation_rejected(self):
         # node_id was previously pinned to a DIFFERENT key on this device.
@@ -138,14 +144,14 @@ class TestTrustGateUnit(unittest.TestCase):
         self.device.pins._pins[self.node] = other_pub
         resp = self._bind(_sign_bind(self.node, self.priv, self.pub))
         self.assertEqual(resp["status"], "denied")
-        self.assertEqual(resp["reason"], crypto.ERR_PIN)
+        self.assertEqual(resp["code"], crypto.ERR_PIN)
 
     def test_identity_claim_forgery_rejected(self):
         # Attacker signs with its OWN key but claims a victim's node_id.
         victim = "deadbeefdeadbeef"
         resp = self._bind(_sign_bind(victim, self.priv, self.pub))
         self.assertEqual(resp["status"], "denied")
-        self.assertEqual(resp["reason"], crypto.ERR_DERIVATION)
+        self.assertEqual(resp["code"], crypto.ERR_DERIVATION)
 
     def test_data_path_unsigned_still_works(self):
         # get_reading is NOT a trust op — a 1.0-style unsigned message with a
@@ -210,7 +216,7 @@ class TrustWireMixin:
         resp = a.swarm.send_and_recv(d.node_id, forged, timeout=5.0)
         self.assertIsNotNone(resp, "no response from device")
         self.assertEqual(resp.get("status"), "denied")
-        self.assertEqual(resp.get("reason"), crypto.ERR_DERIVATION)
+        self.assertEqual(resp.get("code"), crypto.ERR_DERIVATION)
 
     def _signed_renew(self, agent, binding):
         msg = signing.sign_message({
