@@ -1,0 +1,8 @@
+[
+  {"input": "demo_odometry", "fields": {"pose.x_m": 0.0, "pose.y_m": 0.0}, "ts": 1.0, "seq": 1},
+  {"input": "demo_odometry", "fields": {"pose.x_m": 0.6, "pose.y_m": 0.1}, "ts": 2.0, "seq": 2},
+  {"input": "demo_odometry", "fields": {"pose.x_m": 1.2, "pose.y_m": 0.2}, "ts": 3.0, "seq": 3},
+  {"input": "demo_odometry", "fields": {"pose.x_m": 1.9, "pose.y_m": 0.9}, "ts": 4.0, "seq": 4},
+  {"input": "demo_odometry", "fields": {"pose.x_m": 2.4, "pose.y_m": 1.6}, "ts": 5.0, "seq": 5},
+  {"input": "demo_odometry", "fields": {"pose.x_m": 2.5, "pose.y_m": 2.2}, "ts": 6.0, "seq": 6}
+]

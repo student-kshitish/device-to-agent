@@ -555,6 +555,89 @@ all three steps are best-effort — an agent whose address the device never lear
 gets no notice (same limitation as `lease_expired`), and a DHT replica that is not
 among the key's current K-closest ages its copy out by TTL rather than by tombstone.
 
+## Capability Derivation (Phase 1 — application layer, no wire change)
+
+Every arc before this one made a *real* capability easier to find, trust, compose,
+or subscribe to. Derivation answers a different question: **what if the capability
+an agent needs does not exist on any device at all?** Instead of failing, the agent
+**synthesizes a functional substitute** from capabilities that *do* exist — e.g. an
+ambient-temperature *trend* proxied from a host's thermal-zone maxima, or a
+*free-space map* inferred from a device's motion trajectory — using a community-grade
+**recipe package**.
+
+This is a **pure application layer** in the top-level `d2a_derive/` package. It adds
+**no wire verbs and changes no protocol**: it drives an ordinary `RemoteAgent` and
+reuses `d2a.manifest`'s validator and `d2a.crypto`'s Ed25519 signing verbatim.
+Protocol gaps it exposes are **reported, not patched** (see below).
+
+**A recipe package** is a directory — `recipe.json` + `transform.py` +
+`test_frames.json` — designed to be signed and self-contained so recipes can one day
+be *contributed* (v1's registry is just a local folder, `~/.d2a/recipes/`, and the
+only author is KB). `recipe.json` declares what fields it `requires`, what capability
+it `provides` (a full manifest **plus** `derived`/`recipe`/`fidelity`/`cannot_detect`
+metadata), any allowed `unit_adaptations`, and a `cost_rank_hint`. `transform.py` is
+deterministic, stdlib-only Python exposing `init(ctx)`, `on_frame(input, frame, ctx)`,
+`reading(ctx)`.
+
+**Consent is structural and non-overridable.** The derived capability's effective
+tier is `max(all input tiers, the recipe's declared output tier)`. Mapping a space is
+**sensitive regardless of how open the positional inputs are**, so
+`trajectory_free_space_map` (open `demo_odometry` input → **sensitive** free-space
+map) is the consent-escalation demonstration — the planner's `max()` provably yields
+`sensitive`.
+
+### Trust v1 — authorship, not safety (read this)
+
+A recipe loads **only** if **(a)** its signature verifies against its embedded
+`author_pubkey` **and (b)** that pubkey is in the user's `~/.d2a/trusted_authors.json`
+(the explicit *review-then-trust* install step). No signature, or an untrusted author,
+is refused with a distinct code (`recipe_unsigned` / `recipe_bad_signature` /
+`recipe_untrusted_author`). **Loading `transform.py` IS executing it** — `importlib`
+runs the module's code, and every `on_frame` call runs recipe-author code in-process
+and **unsandboxed**. The signature therefore proves **AUTHORSHIP, not SAFETY**. The
+only structural safeguard is ordering: the **trust gate runs strictly before
+`importlib`**, so untrusted code is never imported — but a *trusted* author's bug or
+malice is out of scope for v1 and is documented, not silently mitigated. (The two
+shipped reference recipes are signed by a clearly-labelled **demonstration** key whose
+private seed is public in the repo — which is itself the point: a signature grants no
+safety, and you must still choose to trust the author.)
+
+### The ten components — v1 form vs. deferred
+
+| # | Component | v1 (Phase 1 unless noted) | Deferred / out of scope |
+|---|---|---|---|
+| 1 | **Recipe format** | Signed, self-contained dir (`recipe.json` + `transform.py` + `test_frames.json`); canonical-JSON Ed25519 signature | Versioning of the recipe *format* itself; richer type system than the manifest vocabulary |
+| 2 | **Trust** | Sig-verifies-vs-embedded-pubkey **and** pubkey ∈ `trusted_authors.json`; authorship only | PKI / revocation / rotation; **any** safety analysis of transform code; sandboxing |
+| 3 | **Registry** | Local folder scan; per-recipe admission; rejects recorded, never raised | Networked recipe distribution / discovery; recipe search |
+| 4 | **Validator** | Recipe schema + `provides` manifest (reuses `validate_manifest`) + `requires` contract-check (fields, types, units incl. declared adaptations, `min_hz`) | Cross-recipe type inference; conversions beyond the tiny declared-pair scale table |
+| 5 | **Planner** | `need()`: direct-first → recipe match → contract → cost-rank → dry-run gate → **plan** | NL goal interpretation; multi-hop chaining (recipe feeding recipe) |
+| 6 | **Dry-run** | Transform run against its own `test_frames.json`; output must validate; **run twice, must be identical** (determinism) | Property-based / fuzz fixtures; coverage requirements |
+| 7 | **Provenance** | Every plan carries `{recipe, version, author_pubkey, inputs[node/cap], effective_tier}` | Signed provenance chains; audit log persistence |
+| 8 | **Live executor** | **Phase 2** — bind inputs under leases, feed the transform via `on_event` | (Phase 2) |
+| 9 | **Self-healing** | **Phase 2** — lease-loss rebind; `degraded`/`failed` state machine; `_gap` resync | (Phase 2) |
+| 10 | **Runtime monitor** | **Phase 2** — per-input staleness → `degraded`; `.health()` snapshot | Cross-input correlation; predictive health |
+
+Signing helper (part of the format, not sugar): `python -m d2a_derive.sign <recipe_dir> <keyname>` produces a self-contained signed `recipe.json` in one command.
+
+### Protocol gaps this arc exposes (reported, not patched)
+
+1. **No per-field native cadence in manifests.** A manifest cannot say a field is a
+   1 Hz vs a 10 Hz signal, so the `min_hz` contract check degrades to
+   `min_hz ≤ MAX_SAMPLE_HZ` (the device cadence clamp, 10 Hz). **A per-field cadence
+   key is the first v1.5 manifest-key candidate.**
+2. **No positional capability ships.** `trajectory_free_space_map` binds a
+   **`demo_odometry`** source (a synthetic trajectory, stood up as Phase-2 demo
+   scaffolding) because no shipped capability exposes position. This is a
+   **capability-availability gap, not an engine limitation** — the engine binds the
+   real `sensing` capability for `thermal_ambient_proxy` today.
+3. **No wire vocabulary for derived provenance.** `derived` / `fidelity` /
+   `cannot_detect` are fine on a *local* object but have no manifest key, which is the
+   **named cost of a future publish-derived-on-wire arc** (explicitly out of scope
+   here: derived capabilities are never published in v1).
+
+Also out of scope, each by design: multi-hop chaining, NL goals, adapter synthesis
+beyond declared units, and malicious-logic detection.
+
 ## Versioning & Compatibility
 
 **The wire format is `v1.4`** as of the error-model unification — `d2a.PROTOCOL_VERSION = "1.4"` (defined in `d2a/protocol.py`). v1.1 added the `sig` / `sig_key` / `ts` fields (Ed25519 trust); v1.2 **additively** added an optional `manifest` field to capability records; v1.3 **additively** added the `subscribe_event` / `unsubscribe_event` / `event` / `task_status` verbs, an optional per-action `long_running` manifest key, and a small set of eventable live-frame reading fields to the built-in manifests (see *Event Layer* above). **v1.4 is the one *non-additive* bump so far** — it unifies every error/denial onto a single shape with a stable `code` from the [error registry](#error-model-v14). This is a **sanctioned pre-adoption break**: it renames wire fields (`reason` / `error` → `code`), so it is not additive, and it is done now precisely because there are no external consumers yet. See the *Error model* section for the migration and the full code registry. Records/messages without any of these remain valid. Records without a manifest remain valid. Every outbound message and every published capability record carries a top-level `"v"` field, injected at the serialization chokepoints (TCP `_tcp_send` / `_handle_tcp`, LAN UDP `_broadcast` / `_handle_udp`, Kademlia `_send` / `_handle`, and both `publish()` sites). It is a plain field, **not** an envelope, so handlers that read `msg["type"]` are unaffected.
@@ -601,6 +684,7 @@ Each device probes itself at startup using `/proc/meminfo`, `/proc/loadavg`, `/s
 - **Device-local reflex (v1.3 Phase 2): condition → local action with no agent, via the Sense `safety_check` hook** — `device.wire_reflex_demo()`
 - **Unified error model (v1.4): every wire error/denial carries a stable `code` from the `d2a/errors.py` registry; a source-scan drift guard fails on a sixth shape** — see [Error model](#error-model-v14)
 - **Graceful departure (v1.4): `device.stop()` notifies bound agents (`device_shutdown`, distinct from a lapsed lease), tears bindings down through the one unified path (reason `shutdown`), and unpublishes records so discovery drops the device immediately on LAN + DHT — no TTL ghost; ungraceful death is unchanged (TTL aging + renew failure)**
+- **Capability derivation (Phase 1, application layer — `d2a_derive/`): signed self-contained recipe packages, authorship-only trust gate (strictly before `importlib`), schema + `provides`-manifest + `requires` contract validation, local registry admission, `need()` planner (direct-first → match → contract → cost-rank → dry-run → plan), determinism-checked dry-run gate, structural consent escalation (open inputs → sensitive derived), full provenance; `python -m d2a_derive.sign`** — see [Capability Derivation](#capability-derivation-phase-1--application-layer-no-wire-change). *Live executor / self-healing / monitor are Phase 2.*
 - Sense Layer Part 1: all 4 shapes, verdict + confidence, CPU burn load test; **verdict-transition `event_emitter` + `safety_check` hooks closed (Part 2)**
 - Full 10-stage Capability Composition: plan → atomic bind → runtime monitor + fallback → atomic release
 - Consent policy: safe defaults, sensitive = denied unless owner opts in

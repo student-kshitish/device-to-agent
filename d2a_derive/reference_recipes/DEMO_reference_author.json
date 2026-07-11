@@ -1,0 +1,7 @@
+{
+  "_WARNING": "DEMONSTRATION KEY ONLY. Its private seed is intentionally public in this repo. It has NO security value. It exists so the two reference recipes ship pre-signed and so the sign/verify/trust flow is runnable out of the box. A signature proves AUTHORSHIP, not SAFETY: you must still explicitly add this pubkey to your trusted_authors.json for these recipes to load, and loading a transform IS executing it.",
+  "algo": "ed25519",
+  "name": "d2a-reference-author (DEMO)",
+  "private_key": "014de27de9b7208aa85ccf8c09341cd686415f137849f0dfa4d8488a58cea0dc",
+  "public_key": "c4f304457f75cf3df67551532e5414db21fcab67c82464620ef98243ebca8109"
+}

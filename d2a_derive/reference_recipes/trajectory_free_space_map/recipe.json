@@ -1,0 +1,59 @@
+{
+  "author_pubkey": "c4f304457f75cf3df67551532e5414db21fcab67c82464620ef98243ebca8109",
+  "cost_rank_hint": 10,
+  "name": "trajectory_free_space_map",
+  "provides": {
+    "cannot_detect": [
+      "obstacles",
+      "walls",
+      "unvisited free space",
+      "dynamic objects"
+    ],
+    "consent_tier": "sensitive",
+    "derived": true,
+    "description": "Free-space occupancy map inferred from a device's motion trajectory.",
+    "fidelity": "sparse: marks ONLY grid cells the device physically traversed as free; silent about unvisited cells \u2014 absence of a cell is absence of evidence, not an obstacle",
+    "name": "free_space_map",
+    "reading": {
+      "coverage_m2": {
+        "description": "traversed area",
+        "type": "number",
+        "unit": "m2"
+      },
+      "free_cells": {
+        "description": "count of grid cells observed traversable",
+        "type": "number"
+      },
+      "grid_res_m": {
+        "description": "grid cell size",
+        "type": "number",
+        "unit": "m"
+      }
+    },
+    "recipe": "trajectory_free_space_map",
+    "streaming": false
+  },
+  "requires": [
+    {
+      "capability_hint": "demo_odometry",
+      "fields": {
+        "pose.x_m": {
+          "min_hz": 1.0,
+          "type": "number",
+          "unit": "m"
+        },
+        "pose.y_m": {
+          "min_hz": 1.0,
+          "type": "number",
+          "unit": "m"
+        }
+      }
+    }
+  ],
+  "sig": "555e57983e59bae7a0b5d075fbfc68931112a477f757c91b7ffd5efd6cdd03ae86d133ea90b25a628015546da0f358e932ef61551783d93dfd253084dc357c00",
+  "unit_adaptations": {
+    "cm": "m",
+    "mm": "m"
+  },
+  "version": "1.0.0"
+}

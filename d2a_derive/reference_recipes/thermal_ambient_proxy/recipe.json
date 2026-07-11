@@ -1,0 +1,48 @@
+{
+  "author_pubkey": "c4f304457f75cf3df67551532e5414db21fcab67c82464620ef98243ebca8109",
+  "cost_rank_hint": 20,
+  "name": "thermal_ambient_proxy",
+  "provides": {
+    "cannot_detect": [
+      "absolute ambient temperature",
+      "external drafts faster than the smoothing window"
+    ],
+    "consent_tier": "open",
+    "derived": true,
+    "description": "Coarse ambient-temperature trend proxied from host thermal-zone maxima.",
+    "fidelity": "coarse: tracks the direction and rough magnitude of change in a smoothed internal-temperature signal; NOT a calibrated thermometer and cannot recover absolute ambient temperature (device heat is an unknown offset)",
+    "name": "ambient_temp",
+    "reading": {
+      "ambient_trend_c": {
+        "description": "smoothed proxy value (uncalibrated)",
+        "type": "number",
+        "unit": "C"
+      },
+      "confidence": {
+        "description": "always low \u2014 this is a derived proxy",
+        "type": "string"
+      },
+      "trend": {
+        "description": "rising | falling | steady",
+        "type": "string"
+      }
+    },
+    "recipe": "thermal_ambient_proxy",
+    "streaming": false
+  },
+  "requires": [
+    {
+      "capability_hint": "sensing",
+      "fields": {
+        "thermal.max_temp_c": {
+          "min_hz": 0.2,
+          "type": "number",
+          "unit": "C"
+        }
+      }
+    }
+  ],
+  "sig": "bd9a86195031daef9f68f771f0cbb41997d2b408f5d643d33ffe3395f62be1fe7822b0c8250a8d1e2a43f282249b801c169a7c993650d85c942f81e2028e4701",
+  "unit_adaptations": {},
+  "version": "1.0.0"
+}
