@@ -1,0 +1,482 @@
+"""
+d2a_derive/executor.py — Phase 2: turn a Phase-1 DerivationPlan into a LIVE
+DerivedCapability.
+
+The plan is the seam. Phase 1 stopped at "here is a bindable plan": which recipe,
+which provider satisfies each `requires` input, the effective consent tier, the
+provenance. Phase 2 makes it move:
+
+    plan  ──▶  DerivedCapability
+                 ├─ binds every required input via RemoteAgent under a REAL lease
+                 │    (auto-renewed; works over LAN or DHT — whatever swarm the
+                 │     agent holds, the executor never looks)
+                 ├─ feeds each input to the recipe's transform:
+                 │    subscribe (streaming providers) OR a bounded pull loop,
+                 │    per the provider manifest's `streaming` flag
+                 ├─ per input frame: RESOLVE the recipe's dotted fields out of the
+                 │    device frame's `raw` (the DataProvider flatten convention),
+                 │    APPLY the declared unit scale factor, hand transform.on_frame
+                 │    a normalized {"input", "fields", "ts", "seq"} frame
+                 └─ exposes the running transform output through .reading()
+
+reading() returns None until the transform first emits; after that it always
+returns the latest output, and health()["last_output_ts"] carries when.
+
+SELF-HEALING (healer.py) and STALENESS (monitor.py) are wired in here but live in
+their own modules: the executor owns the shared per-input state they read/write
+(the ONE lock discipline below), so a lease loss or a stale input flips
+DerivedCapability state without either module reaching into a network call.
+
+LOCK DISCIPLINE (load-bearing): `self._lock` guards ALL shared state — the
+transform ctx, the latest output, and every InputFeed's mutable fields. NETWORK
+calls (bind / subscribe / request_data / release) NEVER run under the lock, so the
+agent's renew thread firing on_lease_lost can always take the lock to dispatch a
+loss while a heal thread is mid-rebind on the network. Acquire the lock only to
+mutate state; drop it before touching the wire.
+"""
+
+import threading
+import time
+from dataclasses import dataclass, field
+
+from agents.remote_agent import LeaseLostError
+from d2a_derive import units
+from d2a_derive.validator import DERIVE_MAX_INPUT_HZ
+
+# DerivedCapability lifecycle states (overall). STARTING is transient during
+# start(); the steady states are the three the recipe's health contract cares
+# about, plus CLOSED after a clean shutdown.
+STARTING = "starting"
+ACTIVE   = "active"
+DEGRADED = "degraded"
+FAILED   = "failed"
+CLOSED   = "closed"
+
+# Per-input feed states. "gone" is terminal for that input (healer gave up);
+# whether it takes the whole capability to FAILED or only DEGRADED depends on
+# whether the recipe marked the input optional.
+IN_ACTIVE    = "active"
+IN_DEGRADED  = "degraded"     # stale, or rebinding — present but not healthy
+IN_REBINDING = "rebinding"
+IN_GONE      = "gone"
+
+# A recipe field's min_hz is a FLOOR, not a target — feeding the transform faster
+# than the minimum is always fine (these transforms are incremental) and makes the
+# derivation more responsive. We aim above the floor at a sensible default per feed
+# mode, then clamp to the device cadence ceiling (an agent can never receive frames
+# faster than the device reads).
+_DEFAULT_STREAM_HZ = 5.0
+_DEFAULT_PULL_HZ   = 2.0
+
+
+def _resolve_dotted(raw: dict, dotted: str):
+    """Resolve a dotted field name against a device frame's `raw` dict, exactly
+    the way DataProvider/Preprocessor flattens it (source.field → nested dict).
+    Returns the value, or None if any path segment is missing. Never raises."""
+    node = raw
+    for seg in dotted.split("."):
+        if not isinstance(node, dict) or seg not in node:
+            return None
+        node = node[seg]
+    return node
+
+
+@dataclass
+class InputFeed:
+    """One live input of a derived capability: a bound provider whose frames are
+    resolved, scaled, and pushed into the transform. Mutable fields are guarded by
+    the owning DerivedCapability's lock (see module lock discipline)."""
+    hint: str                       # the requires capability_hint (== the cap name)
+    provider: dict                  # discovered provider {node_id, name, manifest}
+    fields: list                    # recipe-declared dotted field names for this input
+    scales: dict                    # dotted field -> multiplicative unit scale factor
+    optional: bool                  # recipe marked this input optional?
+    streaming: bool                 # provider manifest streaming? (subscribe vs pull)
+    feed_hz: float                  # subscribe/pull cadence (clamped)
+    min_interval_s: float           # 1/feed_hz — the "expected" gap for staleness
+
+    binding: dict | None = None     # current lease binding dict
+    state: str = IN_ACTIVE
+    last_frame_ts: float = 0.0      # wall-clock of the last frame we ingested
+    last_seq: int = -1              # last provider frame seq (gap detection)
+    gap_count: int = 0
+    rebind_count: int = 0
+
+    # feed machinery
+    _stop: threading.Event = field(default_factory=threading.Event)
+    _pull_thread: object = None
+    _healing: bool = False          # a heal is in flight for this input
+
+
+class DerivedCapability:
+    """
+    A live, running derivation. Construct from a Phase-1 plan + a started
+    RemoteAgent, call start(), then read the derived output with reading(). Health
+    (state + per-input telemetry) is available any time via health(). close()
+    releases every input binding and leaves zero device-side residue.
+
+    on_state_change(old_state, new_state, reason) fires on every overall-state
+    transition (active/degraded/failed) so a caller can react to a required input
+    failing or a stale input recovering.
+    """
+
+    def __init__(self, plan, agent, *,
+                 staleness_factor: float = 3.0,
+                 heal_max_attempts: int = 4,
+                 heal_backoff_s: float = 0.2,
+                 heal_shutdown_backoff_s: float = 2.0,
+                 monitor_interval_s: float | None = None,
+                 on_state_change=None):
+        self.plan = plan
+        self.agent = agent
+        self.provided_name = plan.provided_name
+        self.recipe = plan.recipe
+        self.module = plan.recipe.module         # the loaded transform
+        self.effective_tier = plan.effective_tier
+        self.manifest = plan.manifest
+        self.provenance = plan.provenance
+        self.on_state_change = on_state_change
+
+        self._lock = threading.RLock()
+        self._ctx: dict = {}                     # the transform's single ctx
+        self._latest = None                      # latest transform output (or None)
+        self._last_output_ts = 0.0
+        self._state = STARTING
+        self._closed = False
+
+        self._feeds: list[InputFeed] = self._build_feeds()
+
+        # self-healing + staleness monitor — own modules, share our state + lock.
+        # Imported here (not at module top) to keep the import graph acyclic and
+        # obvious: executor owns them, they never import executor.
+        from d2a_derive.healer import SelfHealer
+        from d2a_derive.monitor import StalenessMonitor
+        self._healer = SelfHealer(
+            self,
+            max_attempts=heal_max_attempts,
+            backoff_s=heal_backoff_s,
+            shutdown_backoff_s=heal_shutdown_backoff_s,
+        )
+        self._monitor = StalenessMonitor(
+            self,
+            staleness_factor=staleness_factor,
+            interval_s=monitor_interval_s,
+        )
+
+    # ── construction ────────────────────────────────────────────────────────────
+
+    def _build_feeds(self) -> list[InputFeed]:
+        """Turn plan.inputs (+ the recipe's requires, for optional/unit info) into
+        InputFeed objects with resolved dotted fields and unit scale factors."""
+        # index the recipe's requires by hint so we can read optional + declared
+        # units without touching Phase-1's planner (which stays committed as-is).
+        req_by_hint: dict[str, dict] = {}
+        for req in self.recipe.requires:
+            req_by_hint.setdefault(req.get("capability_hint"), req)
+
+        feeds = []
+        for m in self.plan.inputs:
+            hint = m["hint"]
+            provider = m["provider"]
+            req = req_by_hint.get(hint, {})
+            req_fields = req.get("fields", {})
+            prov_reading = (provider.get("manifest", {}) or {}).get("reading", {})
+
+            dotted = sorted(req_fields)
+            scales = {}
+            min_hz = 0.0
+            for fname, spec in req_fields.items():
+                req_unit  = spec.get("unit")
+                prov_unit = (prov_reading.get(fname, {}) or {}).get("unit")
+                # identity when units match or none declared; else the declared
+                # multiplicative scale the contract already proved is supported.
+                scales[fname] = units.scale_factor(prov_unit or req_unit or "",
+                                                   req_unit or prov_unit or "") or 1.0
+                mh = spec.get("min_hz")
+                if isinstance(mh, (int, float)) and not isinstance(mh, bool):
+                    min_hz = max(min_hz, float(mh))
+
+            streaming = bool((provider.get("manifest", {}) or {}).get("streaming"))
+            target_hz = max(min_hz, _DEFAULT_STREAM_HZ if streaming else _DEFAULT_PULL_HZ)
+            feed_hz = min(max(target_hz, 0.1), DERIVE_MAX_INPUT_HZ)
+            feeds.append(InputFeed(
+                hint=hint, provider=provider, fields=dotted, scales=scales,
+                optional=bool(req.get("optional", False)),
+                streaming=streaming, feed_hz=feed_hz, min_interval_s=1.0 / feed_hz,
+            ))
+        return feeds
+
+    # ── lifecycle ───────────────────────────────────────────────────────────────
+
+    def start(self) -> "DerivedCapability":
+        """Bind every input under a lease, start its feed, and start the monitor.
+        A required input that will not bind raises RuntimeError (the plan promised
+        it was satisfiable — a bind failure here is a real, surfaced error); an
+        optional input that will not bind starts the capability DEGRADED."""
+        # chain onto the agent's lease-loss hook so we're told the moment any of
+        # our input leases dies (renew denied / lease_expired / device_shutdown).
+        self._install_lease_hook()
+        self.module.init(self._ctx)
+
+        for feed in self._feeds:
+            ok = self._bind_feed(feed)
+            if not ok:
+                if feed.optional:
+                    with self._lock:
+                        feed.state = IN_GONE
+                    continue
+                # a required input the plan said was satisfiable failed to bind —
+                # tear down what we started and surface it.
+                self.close()
+                raise RuntimeError(
+                    f"derived '{self.provided_name}': required input '{feed.hint}' "
+                    f"failed to bind")
+            self._start_feed(feed)
+
+        self._recompute_state("started")
+        self._monitor.start()
+        return self
+
+    def _bind_feed(self, feed: InputFeed) -> bool:
+        """Bind one input to its planned provider under a lease. NETWORK op — no
+        lock held. Returns True and records feed.binding on success."""
+        node_id = feed.provider.get("node_id")
+        resp = self.agent.bind_remote_to(node_id, feed.hint)
+        if not resp.get("verified"):
+            return False
+        with self._lock:
+            feed.binding = resp
+            feed.state = IN_ACTIVE
+            feed.last_frame_ts = time.time()
+            feed.last_seq = -1
+        return True
+
+    def _start_feed(self, feed: InputFeed) -> None:
+        """Begin delivering this input's frames to the transform: subscribe if the
+        provider streams, else a bounded pull loop at feed_hz."""
+        feed._stop.clear()
+        if feed.streaming:
+            self.agent.start_stream(feed.binding, self._make_frame_cb(feed), hz=feed.feed_hz)
+        else:
+            t = threading.Thread(target=self._pull_loop, args=(feed,), daemon=True,
+                                 name=f"derive-pull-{feed.hint}")
+            feed._pull_thread = t
+            t.start()
+
+    def _make_frame_cb(self, feed: InputFeed):
+        def _cb(inner_frame: dict) -> None:
+            self._ingest(feed, inner_frame)
+        return _cb
+
+    def _pull_loop(self, feed: InputFeed) -> None:
+        """Bounded pull feed for a non-streaming provider. Sleeps between reads
+        (never busy-spins); a lease loss surfaces as LeaseLostError and is routed
+        to the healer, then the loop exits (the heal thread restarts the feed)."""
+        while not feed._stop.is_set():
+            try:
+                resp = self.agent.request_data(feed.binding, feed.hint)
+            except LeaseLostError as e:
+                self._healer.on_loss(feed, e.code)
+                return
+            if isinstance(resp, dict) and resp.get("type") == "reading":
+                self._ingest(feed, resp.get("frame", {}))
+            if feed._stop.wait(feed.min_interval_s):
+                return
+
+    # ── the feed → transform path ───────────────────────────────────────────────
+
+    def _ingest(self, feed: InputFeed, inner_frame: dict, _resync: bool = False) -> None:
+        """Resolve the recipe's declared fields out of one device frame, apply the
+        declared unit scale, and drive transform.on_frame. Detects a provider seq
+        gap and triggers exactly one resync re-read (never silent)."""
+        if not isinstance(inner_frame, dict):
+            return
+        raw = inner_frame.get("raw", {})
+        seq = inner_frame.get("seq")
+
+        fields = {}
+        for dotted in feed.fields:
+            val = _resolve_dotted(raw, dotted)
+            if isinstance(val, (int, float)) and not isinstance(val, bool):
+                fields[dotted] = val * feed.scales.get(dotted, 1.0)
+
+        gap = 0
+        with self._lock:
+            if self._closed:
+                return
+            # gap detection: the device Preprocessor seq is monotonic per
+            # capability. A jump (or an explicit _gap from the event channel) means
+            # frames were missed. Only on a live (non-resync) frame.
+            if not _resync and isinstance(seq, int):
+                explicit = inner_frame.get("_gap")
+                if isinstance(explicit, int) and explicit > 0:
+                    gap = explicit
+                elif feed.last_seq >= 0 and seq > feed.last_seq + 1:
+                    gap = seq - feed.last_seq - 1
+                feed.last_seq = seq
+            feed.last_frame_ts = time.time()
+            # staleness recovery: a fresh frame on a degraded-by-staleness input
+            # flips it back to active (handled centrally in _recompute_state).
+            if feed.state == IN_DEGRADED and not feed._healing:
+                feed.state = IN_ACTIVE
+
+            if fields:
+                frame = {"input": feed.hint, "fields": fields,
+                         "ts": inner_frame.get("ts", time.time()), "seq": seq}
+                try:
+                    out = self.module.on_frame(feed.hint, frame, self._ctx)
+                except Exception:
+                    out = None
+                if isinstance(out, dict):
+                    self._latest = out
+                    self._last_output_ts = time.time()
+            self._recompute_state_locked("frame")
+
+        if gap > 0:
+            feed.gap_count += 1
+            print(f"[derive:{self.provided_name}] input '{feed.hint}' gap={gap} "
+                  f"(count={feed.gap_count}) → one resync re-read")
+            self._resync(feed)
+
+    def _resync(self, feed: InputFeed) -> None:
+        """Exactly one fresh get_reading to fill a detected gap. NETWORK op — no
+        lock. A lease loss during resync routes to the healer."""
+        try:
+            resp = self.agent.request_data(feed.binding, feed.hint)
+        except LeaseLostError as e:
+            self._healer.on_loss(feed, e.code)
+            return
+        if isinstance(resp, dict) and resp.get("type") == "reading":
+            self._ingest(feed, resp.get("frame", {}), _resync=True)
+
+    # ── reading + health ────────────────────────────────────────────────────────
+
+    def reading(self):
+        """The latest transform output, or None until the transform first emits."""
+        with self._lock:
+            return self._latest
+
+    @property
+    def state(self) -> str:
+        with self._lock:
+            return self._state
+
+    def health(self) -> dict:
+        """Snapshot: {state, per_input:{hint:{state, staleness_s, gap_count,
+        rebind_count}}, last_output_ts}."""
+        now = time.time()
+        with self._lock:
+            per_input = {}
+            for feed in self._feeds:
+                staleness = (now - feed.last_frame_ts) if feed.last_frame_ts else None
+                per_input[feed.hint] = {
+                    "state":        feed.state,
+                    "staleness_s":  round(staleness, 3) if staleness is not None else None,
+                    "gap_count":    feed.gap_count,
+                    "rebind_count": feed.rebind_count,
+                }
+            return {
+                "state":          self._state,
+                "per_input":      per_input,
+                "last_output_ts": self._last_output_ts or None,
+            }
+
+    # ── state machine ─────────────────────────────────────────────────────────────
+
+    def _recompute_state(self, reason: str) -> None:
+        with self._lock:
+            self._recompute_state_locked(reason)
+
+    def _recompute_state_locked(self, reason: str) -> None:
+        """Fold per-input states into the overall state (caller holds the lock):
+        a GONE required input → FAILED; a GONE optional input or any degraded/
+        rebinding input → DEGRADED; otherwise ACTIVE. Fires on_state_change on a
+        real transition."""
+        if self._closed:
+            return
+        new = ACTIVE
+        for feed in self._feeds:
+            if feed.state == IN_GONE:
+                if not feed.optional:
+                    new = FAILED
+                    break
+                new = DEGRADED
+            elif feed.state in (IN_DEGRADED, IN_REBINDING) and new != FAILED:
+                new = DEGRADED
+        self._transition_locked(new, reason)
+
+    def _transition_locked(self, new: str, reason: str) -> None:
+        old = self._state
+        if new == old:
+            return
+        self._state = new
+        cb = self.on_state_change
+        if cb is not None:
+            # fire outside the lock so a callback can't deadlock on our state
+            threading.Thread(target=self._fire_state_change, args=(cb, old, new, reason),
+                             daemon=True).start()
+
+    @staticmethod
+    def _fire_state_change(cb, old, new, reason):
+        try:
+            cb(old, new, reason)
+        except Exception:
+            pass
+
+    # ── lease-loss hook plumbing (feeds the healer) ──────────────────────────────
+
+    def _install_lease_hook(self) -> None:
+        """Chain onto agent.on_lease_lost so multiple DerivedCapabilities can share
+        one agent: dispatch a loss to the owning feed, else defer to whatever hook
+        was there before us."""
+        prev = self.agent.on_lease_lost
+
+        def _hook(binding_id, code, _prev=prev):
+            feed = self._feed_for_binding(binding_id)
+            if feed is not None:
+                self._healer.on_loss(feed, code)
+            elif callable(_prev):
+                _prev(binding_id, code)
+
+        self.agent.on_lease_lost = _hook
+
+    def _feed_for_binding(self, binding_id: str) -> InputFeed | None:
+        with self._lock:
+            for feed in self._feeds:
+                if feed.binding and feed.binding.get("binding_id") == binding_id:
+                    return feed
+        return None
+
+    # ── shutdown ─────────────────────────────────────────────────────────────────
+
+    def close(self) -> None:
+        """Release every input binding and stop all background work. Idempotent.
+        After this the device shows zero active binds/subs for our inputs."""
+        with self._lock:
+            if self._closed:
+                return
+            self._closed = True
+            self._state = CLOSED
+            feeds = list(self._feeds)
+
+        self._monitor.stop()
+        self._healer.stop()
+        for feed in feeds:
+            feed._stop.set()
+        for feed in feeds:
+            t = feed._pull_thread
+            if t is not None and t.is_alive() and t is not threading.current_thread():
+                t.join(timeout=2.0)
+        # release every binding (stops auto-renew, tears down device-side stream)
+        for feed in feeds:
+            if feed.binding is None:
+                continue
+            try:
+                if feed.streaming:
+                    self.agent.stop_stream(feed.binding)
+            except Exception:
+                pass
+            try:
+                self.agent.release_binding(feed.binding)
+            except Exception:
+                pass

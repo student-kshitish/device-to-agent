@@ -555,7 +555,7 @@ all three steps are best-effort — an agent whose address the device never lear
 gets no notice (same limitation as `lease_expired`), and a DHT replica that is not
 among the key's current K-closest ages its copy out by TTL rather than by tombstone.
 
-## Capability Derivation (Phase 1 — application layer, no wire change)
+## Capability Derivation (application layer, no wire change)
 
 Every arc before this one made a *real* capability easier to find, trust, compose,
 or subscribe to. Derivation answers a different question: **what if the capability
@@ -613,11 +613,22 @@ safety, and you must still choose to trust the author.)
 | 5 | **Planner** | `need()`: direct-first → recipe match → contract → cost-rank → dry-run gate → **plan** | NL goal interpretation; multi-hop chaining (recipe feeding recipe) |
 | 6 | **Dry-run** | Transform run against its own `test_frames.json`; output must validate; **run twice, must be identical** (determinism) | Property-based / fuzz fixtures; coverage requirements |
 | 7 | **Provenance** | Every plan carries `{recipe, version, author_pubkey, inputs[node/cap], effective_tier}` | Signed provenance chains; audit log persistence |
-| 8 | **Live executor** | **Phase 2** — bind inputs under leases, feed the transform via `on_event` | (Phase 2) |
-| 9 | **Self-healing** | **Phase 2** — lease-loss rebind; `degraded`/`failed` state machine; `_gap` resync | (Phase 2) |
-| 10 | **Runtime monitor** | **Phase 2** — per-input staleness → `degraded`; `.health()` snapshot | Cross-input correlation; predictive health |
+| 8 | **Live executor** (Phase 2) | `DerivedCapability`: binds each input under a real auto-renewed lease, feeds the transform (subscribe for streaming providers, else a bounded pull loop), resolves the recipe's dotted fields out of the device frame's `raw` and applies the declared unit scale; `reading()` / `health()` / `close()` | Multi-hop derived-feeds-derived; back-pressure / rate shaping |
+| 9 | **Self-healing** (Phase 2) | Lease-loss branches on `LeaseLostError.code`: `lease_expired` → bounded rebind + re-subscribe (backoff, capped attempts); `device_shutdown` → mark gone, slow rediscovery (no immediate retry). Required input gone → `failed`, optional → `degraded`; `on_state_change` fires; `_gap`/seq-jump → one resync re-read. No busy-spin | Predictive pre-emptive rebind; provider quality ranking on rebind |
+| 10 | **Runtime monitor** (Phase 2) | Per-input staleness (no frame within `N × expected interval`) → `degraded` (reason staleness), recovery → `active`; `health()` snapshot `{state, per_input:{staleness_s, gap_count, rebind_count}, last_output_ts}` | Cross-input correlation; predictive health |
 
 Signing helper (part of the format, not sugar): `python -m d2a_derive.sign <recipe_dir> <keyname>` produces a self-contained signed `recipe.json` in one command.
+
+### Phase 2 — the plan comes alive
+
+Phase 1 stopped at a *plan*. **`DerivedCapability(plan, agent).start()`** turns it into a running capability, driving an ordinary `RemoteAgent` over **whatever transport it holds — LAN or DHT** (the executor never looks; both are tested):
+
+- **Binds every input under a real lease** (auto-renewed), subscribes to streaming providers or runs a bounded pull loop otherwise, and per frame **resolves the recipe's declared dotted fields** (`pose.x_m`, `thermal.max_temp_c`) out of the device frame's `raw` using the same flatten convention `DataProvider` writes, then **applies the declared unit scale** (a `cm` provider feeds a `m`-expecting transform correctly) before calling `transform.on_frame`.
+- **`reading()`** returns `None` until the transform first emits, then always the latest output; `health()["last_output_ts"]` tracks when.
+- **Self-heals** on lease loss (see component 9): the free-space map keeps growing straight through a killed lease once the input rebinds. A *required* input that becomes permanently unrecoverable takes the capability to `failed`; an *optional* one only to `degraded`.
+- **`close()`** releases every input binding and tears down every stream — the device is left with **zero active binds or subscriptions** (asserted).
+
+Run it: **`python3 examples/derive_demo.py`** — an agent needs `free_space_map`, no device provides it, the planner synthesises it from a synthetic trajectory (open inputs → **sensitive** derived), the map grows live, a mid-run lease kill is self-healed and the map resumes, then a clean close; finally `thermal_ambient_proxy` is derived from this machine's **real** `sensing` capability.
 
 ### Protocol gaps this arc exposes (reported, not patched)
 
@@ -684,7 +695,8 @@ Each device probes itself at startup using `/proc/meminfo`, `/proc/loadavg`, `/s
 - **Device-local reflex (v1.3 Phase 2): condition → local action with no agent, via the Sense `safety_check` hook** — `device.wire_reflex_demo()`
 - **Unified error model (v1.4): every wire error/denial carries a stable `code` from the `d2a/errors.py` registry; a source-scan drift guard fails on a sixth shape** — see [Error model](#error-model-v14)
 - **Graceful departure (v1.4): `device.stop()` notifies bound agents (`device_shutdown`, distinct from a lapsed lease), tears bindings down through the one unified path (reason `shutdown`), and unpublishes records so discovery drops the device immediately on LAN + DHT — no TTL ghost; ungraceful death is unchanged (TTL aging + renew failure)**
-- **Capability derivation (Phase 1, application layer — `d2a_derive/`): signed self-contained recipe packages, authorship-only trust gate (strictly before `importlib`), schema + `provides`-manifest + `requires` contract validation, local registry admission, `need()` planner (direct-first → match → contract → cost-rank → dry-run → plan), determinism-checked dry-run gate, structural consent escalation (open inputs → sensitive derived), full provenance; `python -m d2a_derive.sign`** — see [Capability Derivation](#capability-derivation-phase-1--application-layer-no-wire-change). *Live executor / self-healing / monitor are Phase 2.*
+- **Capability derivation (application layer — `d2a_derive/`): signed self-contained recipe packages, authorship-only trust gate (strictly before `importlib`), schema + `provides`-manifest + `requires` contract validation, local registry admission, `need()` planner (direct-first → match → contract → cost-rank → dry-run → plan), determinism-checked dry-run gate, structural consent escalation (open inputs → sensitive derived), full provenance; `python -m d2a_derive.sign`** — see [Capability Derivation](#capability-derivation-application-layer-no-wire-change).
+- **Live derivation (Phase 2, `d2a_derive/executor.py` + `healer.py` + `monitor.py`): `DerivedCapability` binds each input under an auto-renewed lease over LAN *and* DHT, feeds the transform (subscribe or bounded pull) with dotted-field resolution + declared unit scaling, `reading()`/`health()`/`close()`; self-heals on lease loss (`lease_expired` → bounded rebind, `device_shutdown` → mark gone + slow rediscovery), required-gone → `failed` / optional-gone → `degraded` with `on_state_change`, gap resync, per-input staleness → `degraded` + recovery; clean close leaves zero device residue** — `python3 examples/derive_demo.py`.
 - Sense Layer Part 1: all 4 shapes, verdict + confidence, CPU burn load test; **verdict-transition `event_emitter` + `safety_check` hooks closed (Part 2)**
 - Full 10-stage Capability Composition: plan → atomic bind → runtime monitor + fallback → atomic release
 - Consent policy: safe defaults, sensitive = denied unless owner opts in

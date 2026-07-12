@@ -66,6 +66,9 @@ from d2a_derive.validator import (
 from d2a_derive.dryrun import dry_run, DryRunResult
 from d2a_derive.registry import Registry, LoadedRecipe, RecipeError
 from d2a_derive.planner import Planner, NeedResult, DerivationPlan, Provenance, effective_tier
+from d2a_derive.executor import DerivedCapability, InputFeed
+from d2a_derive.healer import SelfHealer
+from d2a_derive.monitor import StalenessMonitor
 
 __all__ = [
     "errors",
@@ -76,4 +79,6 @@ __all__ = [
     "dry_run", "DryRunResult",
     "Registry", "LoadedRecipe", "RecipeError",
     "Planner", "NeedResult", "DerivationPlan", "Provenance", "effective_tier",
+    # Phase 2 — live derivation
+    "DerivedCapability", "InputFeed", "SelfHealer", "StalenessMonitor",
 ]
