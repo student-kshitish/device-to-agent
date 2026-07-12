@@ -495,7 +495,7 @@ exactly one name):
 |---|---|
 | Transport / version | `version_mismatch` |
 | Trust / identity | `unsigned_trust_op`, `stale_signature`, `bad_signature`, `node_id_derivation_mismatch`, `tofu_key_mismatch` |
-| Lease / binding lifecycle | `unknown_binding`, `not_owner`, `capability_mismatch`, `lease_expired`, `device_shutdown` |
+| Lease / binding lifecycle | `unknown_binding`, `not_owner`, `capability_mismatch`, `lease_expired`, `device_shutdown`, `derived_input_failed` |
 | Policy | `policy_blocked`, `approval_required` |
 | Broker | `capability_not_found`, `no_active_bind`, `binding_not_found` |
 | Scope / action / event guards | `binding_invalid_or_out_of_scope`, `not_an_action_capability`, `no_manifest_for_conditions`, `invalid_condition`, `event_cap_exceeded`, `device_event_capacity` |
@@ -555,7 +555,7 @@ all three steps are best-effort — an agent whose address the device never lear
 gets no notice (same limitation as `lease_expired`), and a DHT replica that is not
 among the key's current K-closest ages its copy out by TTL rather than by tombstone.
 
-## Capability Derivation (application layer, no wire change)
+## Capability Derivation (application layer; v1.5 additive publish path)
 
 Every arc before this one made a *real* capability easier to find, trust, compose,
 or subscribe to. Derivation answers a different question: **what if the capability
@@ -565,10 +565,13 @@ ambient-temperature *trend* proxied from a host's thermal-zone maxima, or a
 *free-space map* inferred from a device's motion trajectory — using a community-grade
 **recipe package**.
 
-This is a **pure application layer** in the top-level `d2a_derive/` package. It adds
-**no wire verbs and changes no protocol**: it drives an ordinary `RemoteAgent` and
-reuses `d2a.manifest`'s validator and `d2a.crypto`'s Ed25519 signing verbatim.
-Protocol gaps it exposes are **reported, not patched** (see below).
+The **engine** (Phases 1–2) is a **pure application layer** in the top-level
+`d2a_derive/` package: it drives an ordinary `RemoteAgent`, reuses `d2a.manifest`'s
+validator and `d2a.crypto`'s Ed25519 signing verbatim, and adds no wire verbs.
+**Phase 3 (v1.5)** is the one **sanctioned, additive** protocol touch: the manifest
+vocabulary gains optional derived-provenance keys + per-field cadence so a derived
+capability can be *published* on-wire (closing the two protocol gaps this arc had
+reported). No verbs, no renames — same-major peers ignore the new keys.
 
 **A recipe package** is a directory — `recipe.json` + `transform.py` +
 `test_frames.json` — designed to be signed and self-contained so recipes can one day
@@ -610,7 +613,7 @@ safety, and you must still choose to trust the author.)
 | 2 | **Trust** | Sig-verifies-vs-embedded-pubkey **and** pubkey ∈ `trusted_authors.json`; authorship only | PKI / revocation / rotation; **any** safety analysis of transform code; sandboxing |
 | 3 | **Registry** | Local folder scan; per-recipe admission; rejects recorded, never raised | Networked recipe distribution / discovery; recipe search |
 | 4 | **Validator** | Recipe schema + `provides` manifest (reuses `validate_manifest`) + `requires` contract-check (fields, types, units incl. declared adaptations, `min_hz`) | Cross-recipe type inference; conversions beyond the tiny declared-pair scale table |
-| 5 | **Planner** | `need()`: direct-first → recipe match → contract → cost-rank → dry-run gate → **plan** | NL goal interpretation; multi-hop chaining (recipe feeding recipe) |
+| 5 | **Planner** | `need()`: direct-first → recipe match → contract → cost-rank → dry-run gate → **plan**; **multi-hop chaining** (Phase 4) with strict preference, depth rail, cycle guard, nested provenance | NL goal interpretation; chains deeper than `MAX_DERIVATION_DEPTH` |
 | 6 | **Dry-run** | Transform run against its own `test_frames.json`; output must validate; **run twice, must be identical** (determinism) | Property-based / fuzz fixtures; coverage requirements |
 | 7 | **Provenance** | Every plan carries `{recipe, version, author_pubkey, inputs[node/cap], effective_tier}` | Signed provenance chains; audit log persistence |
 | 8 | **Live executor** (Phase 2) | `DerivedCapability`: binds each input under a real auto-renewed lease, feeds the transform (subscribe for streaming providers, else a bounded pull loop), resolves the recipe's dotted fields out of the device frame's `raw` and applies the declared unit scale; `reading()` / `health()` / `close()` | Multi-hop derived-feeds-derived; back-pressure / rate shaping |
@@ -630,28 +633,66 @@ Phase 1 stopped at a *plan*. **`DerivedCapability(plan, agent).start()`** turns 
 
 Run it: **`python3 examples/derive_demo.py`** — an agent needs `free_space_map`, no device provides it, the planner synthesises it from a synthetic trajectory (open inputs → **sensitive** derived), the map grows live, a mid-run lease kill is self-healed and the map resumes, then a clean close; finally `thermal_ambient_proxy` is derived from this machine's **real** `sensing` capability.
 
-### Protocol gaps this arc exposes (reported, not patched)
+### Phase 3 — derived capabilities on the wire (v1.5)
 
-1. **No per-field native cadence in manifests.** A manifest cannot say a field is a
-   1 Hz vs a 10 Hz signal, so the `min_hz` contract check degrades to
-   `min_hz ≤ MAX_SAMPLE_HZ` (the device cadence clamp, 10 Hz). **A per-field cadence
-   key is the first v1.5 manifest-key candidate.**
-2. **No positional capability ships.** `trajectory_free_space_map` binds a
-   **`demo_odometry`** source (a synthetic trajectory, stood up as Phase-2 demo
-   scaffolding) because no shipped capability exposes position. This is a
-   **capability-availability gap, not an engine limitation** — the engine binds the
-   real `sensing` capability for `thermal_ambient_proxy` today.
-3. **No wire vocabulary for derived provenance.** `derived` / `fidelity` /
-   `cannot_detect` are fine on a *local* object but have no manifest key, which is the
-   **named cost of a future publish-derived-on-wire arc** (explicitly out of scope
-   here: derived capabilities are never published in v1).
+A capability synthesised on one node is only useful to that node until it can be *published*. Phase 3 makes any locally derived capability **discoverable, bindable, and subscribable by other agents, for any device class** — through the **exact same `_register_virtual` machinery** a Guardian VSO or emergent device already uses. **`DerivedCapability.publish(runtime)`** registers the running derivation on a `DeviceRuntime`: broker quota, a policy rule from the **effective** consent tier (sensitive → `require_approval`, **no bypass** — a sensitive derived capability on-wire gates exactly like real sensitive hardware), leases, condition-events, and the one unified teardown path. `reading()` routes to the live derivation via the pseudo-source registration, so a **remote** subscriber's condition on a derived reading field fires normally.
 
-Also out of scope, each by design: multi-hop chaining, NL goals, adapter synthesis
-beyond declared units, and malicious-logic detection.
+**Trust honesty (say it plainly): the publisher signs with its host key; consumers trust the publisher over data derived from sources they cannot see** — the same chokepoint honesty as emergent devices. A consumer verifies the publisher's signature and reads the derived manifest's provenance (`derived` / `recipe` / `fidelity` / `cannot_detect`), but the *input lineage* — which upstream providers fed the transform — stays publisher-local (publishing it would leak the members, exactly as an emergent device omits its parts). You are trusting the publisher's honesty about what it synthesised, not auditing its inputs.
+
+**Lifecycle coupling.** When the underlying derivation enters `failed` (a required input became permanently unrecoverable), the published capability is **unpublished and its consumer bindings are torn down with a distinct `derived_input_failed` code**, so a remote consumer gets a lease-loss it can branch on (not stale data). A `degraded` derivation **keeps serving**, with the live state exposed in the reading envelope's `derived_state` field. Publisher graceful shutdown follows the existing departure path (consumers get `device_shutdown`).
+
+This is the **manifest half** of the protocol change: two additive vocabulary additions (below) close derivation gaps 1 and 3. `PROTOCOL_VERSION → 1.5`, additive — same-major peers ignore the new keys.
+
+#### The universal recipe pack — one pattern, four device classes
+
+Derivation is not a mapping trick. The shipped pack proves the same engine substitutes a missing sensor across unrelated device classes; every recipe is stdlib-only, signed, dry-run-gated, and honest about its limits:
+
+| Recipe | Substitutes | Requires | Tier | Fidelity limit (what it CANNOT do) |
+|---|---|---|---|---|
+| `trajectory_free_space_map` | occupancy-map / camera | `demo_odometry` (`pose.x_m/y_m`) | **sensitive** (escalated) | marks only *visited* cells; blind to obstacles, walls, unvisited space, dynamic objects |
+| `thermal_ambient_proxy` | thermometer | `sensing` (`thermal.max_temp_c`) | open | uncalibrated trend only; cannot recover absolute ambient (device heat is an unknown offset) |
+| `presence_from_activity` | presence sensor | `compute` (`cpu.util_pct`, `memory.used_percent`) | **sensitive** (escalated) | infers *machine* in use, not a *person*; a background job reads identical to a human; no identity |
+| `load_trend_from_thermal` | power / load meter | `sensing` + `compute` (`thermal.max_temp_c`, `cpu.util_pct`) | open | crude band, not watts; confounded by ambient changes, fan curves, and other components' heat |
+
+The last two bind **real shipped capabilities** on any Linux host — no scaffolding. `presence_from_activity` is the **second consent-escalation demo**: open compute inputs, but presence inference is surveillance-adjacent, so it declares `sensitive` and the planner's structural `max()` keeps the derived capability sensitive.
+
+### Phase 4 — chaining derivations (multi-hop)
+
+A recipe's `requires` may be satisfied by a **derived** capability, so derivations **stack**: `compute → presence → activity_summary`. This is **pure application layer — no protocol change** (the v1.5 provenance vocabulary already carries the lineage through the hops). A published derived capability is an ordinary provider to discovery, so **chaining across the wire already works with zero planner changes** — agent B binding another agent's published `presence` and feeding its own `activity_summary` recipe is, from B's side, just a single-hop derivation onto a provider whose manifest happens to say `derived: true`. Phase 4 adds **local chaining** (the planner instantiates an inner recipe to satisfy an outer one), **provenance nesting**, and the **guards**.
+
+**Depth bound = 2 hops (`MAX_DERIVATION_DEPTH`), and why.** This counts derivations, not bindings: a recipe may be fed by *one* derived input, which is itself fed by real providers, but no deeper. It is a **deliberate safety rail, not a technical limit**. Each hop is a coarse proxy of a coarse proxy, so **confidence compounds downward**; each hop adds an author you must trust; and each hop multiplies the cost of debugging a top-level number that looks wrong. Raise it only with eyes open.
+
+**Strict preference order** (enforced and tested per tier): **real provider > single-hop derived > two-hop chain**. The planner never chains when a shorter path satisfies — a real provider of the goal wins outright; a recipe whose inputs are all satisfiable by *real* providers beats one that would need an inner derivation.
+
+**Provenance through hops.** The outer plan **nests** the inner's provenance (full lineage readable from the top); the **effective tier is the `max` across the whole chain**; `cannot_detect` is the **union** of all hops; and `fidelity` is concatenated hop-by-hop. If the chain is published, that chain-max tier and unioned `cannot_detect` ride in the published manifest. From `examples/chain_demo.py`:
+
+```
+LINEAGE:
+    activity_summary (author c4f304457f75…, tier sensitive)
+      ← presence [DERIVED]:
+        presence_from_activity (author c4f304457f75…, tier sensitive)
+          ← compute [real provider 0e4da1a5]
+```
+
+Here `activity_summary` *declares* `open`, but the chain-max rule keeps it **sensitive** (its `presence` input is sensitive), and its `cannot_detect` is the union of both recipes' blind spots — a chained consent-escalation.
+
+**Guards.** A recipe may not transitively require its own `provides` (a **cycle** → distinct `derivation_cycle` refusal); a chain deeper than the rail is refused (`derivation_depth_exceeded`). **Healing propagates across hops through the existing state machine:** an inner derivation that fails takes the outer input to *gone* (→ outer `failed` if required, `degraded` if optional); across the wire this is delivered for free by Phase 2's healer + Phase 3's lifecycle coupling (the inner publisher's `derived_input_failed` / `device_shutdown` push surfaces as an outer lease-loss).
+
+**Trust across a chain (say it plainly): you trust *every* publisher in the lineage** — the host serving the leaf capability, and the author of every recipe on the way up. The nested provenance is what makes that trust *auditable* rather than blind; the depth rail is what keeps the surface legible.
+
+Run it: **`python3 examples/chain_demo.py`** — builds `compute → presence → activity_summary` live (fully local), prints the lineage above, then shows the same chain across the wire (one agent publishes `presence`, a stranger consumes it).
+
+### Protocol gaps — status
+
+1. **Per-field native cadence — CLOSED (v1.5, 2026-07-12).** Manifest reading fields carry an optional `"hz"`; the derivation contract-checker compares `min_hz` against the provider's declared cadence when present, falling back to the `MAX_SAMPLE_HZ` clamp only when it is absent. *(Shipped hardware manifests do not yet self-report cadence, so they use the clamp fallback — populating real kernel cadences is follow-up, not a protocol gap.)*
+2. **No positional capability ships (open).** `trajectory_free_space_map` binds a **`demo_odometry`** source (a synthetic trajectory, Phase-2 scaffolding) because no shipped capability exposes position. This is a **capability-availability gap, not an engine limitation** — `presence_from_activity` / `load_trend_from_thermal` bind real `compute` / `sensing` today.
+3. **Derived provenance on-wire — CLOSED (v1.5, 2026-07-12).** The manifest gained four optional derived-provenance keys — `derived` (bool), `recipe`, `fidelity`, `cannot_detect` — validated conditionally (`derived: true` makes the other three required; a non-derived manifest must carry none). A discovering agent learns a capability is a *substitute* and its honest limits from the record alone.
+
+Still out of scope, each by design: chains deeper than `MAX_DERIVATION_DEPTH` (a rail, see *Phase 4*), NL goals, adapter synthesis beyond declared units, malicious-logic detection, and publishing the *input lineage* of a derived capability on-wire (a deliberate trust-chokepoint boundary; the lineage is carried in the local plan's nested provenance, not the published record).
 
 ## Versioning & Compatibility
 
-**The wire format is `v1.4`** as of the error-model unification — `d2a.PROTOCOL_VERSION = "1.4"` (defined in `d2a/protocol.py`). v1.1 added the `sig` / `sig_key` / `ts` fields (Ed25519 trust); v1.2 **additively** added an optional `manifest` field to capability records; v1.3 **additively** added the `subscribe_event` / `unsubscribe_event` / `event` / `task_status` verbs, an optional per-action `long_running` manifest key, and a small set of eventable live-frame reading fields to the built-in manifests (see *Event Layer* above). **v1.4 is the one *non-additive* bump so far** — it unifies every error/denial onto a single shape with a stable `code` from the [error registry](#error-model-v14). This is a **sanctioned pre-adoption break**: it renames wire fields (`reason` / `error` → `code`), so it is not additive, and it is done now precisely because there are no external consumers yet. See the *Error model* section for the migration and the full code registry. Records/messages without any of these remain valid. Records without a manifest remain valid. Every outbound message and every published capability record carries a top-level `"v"` field, injected at the serialization chokepoints (TCP `_tcp_send` / `_handle_tcp`, LAN UDP `_broadcast` / `_handle_udp`, Kademlia `_send` / `_handle`, and both `publish()` sites). It is a plain field, **not** an envelope, so handlers that read `msg["type"]` are unaffected.
+**The wire format is `v1.5`** as of the publish-derived arc — `d2a.PROTOCOL_VERSION = "1.5"` (defined in `d2a/protocol.py`). v1.1 added the `sig` / `sig_key` / `ts` fields (Ed25519 trust); v1.2 **additively** added an optional `manifest` field to capability records; v1.3 **additively** added the `subscribe_event` / `unsubscribe_event` / `event` / `task_status` verbs, an optional per-action `long_running` manifest key, and a small set of eventable live-frame reading fields to the built-in manifests (see *Event Layer* above). **v1.4 is the one *non-additive* bump so far** — it unifies every error/denial onto a single shape with a stable `code` from the [error registry](#error-model-v14). This is a **sanctioned pre-adoption break**: it renames wire fields (`reason` / `error` → `code`), so it is not additive, and it is done now precisely because there are no external consumers yet. **v1.5 is *additive*** — the manifest vocabulary gains four optional derived-provenance keys (`derived` / `recipe` / `fidelity` / `cannot_detect`) and an optional per-field `hz` cadence, so a locally derived capability publishes, discovers, and binds like any other (closing derivation protocol gaps 1 and 3, dated 2026-07-12). It adds a `derived_input_failed` code to the [error registry](#error-model-v14) for a published derivation whose required input died. No field renames, no verb changes; same-major peers ignore the new keys. See the *Error model* section for the migration and the full code registry. Records/messages without any of these remain valid. Records without a manifest remain valid. Every outbound message and every published capability record carries a top-level `"v"` field, injected at the serialization chokepoints (TCP `_tcp_send` / `_handle_tcp`, LAN UDP `_broadcast` / `_handle_udp`, Kademlia `_send` / `_handle`, and both `publish()` sites). It is a plain field, **not** an envelope, so handlers that read `msg["type"]` are unaffected.
 
 The compatibility contract:
 
@@ -695,8 +736,10 @@ Each device probes itself at startup using `/proc/meminfo`, `/proc/loadavg`, `/s
 - **Device-local reflex (v1.3 Phase 2): condition → local action with no agent, via the Sense `safety_check` hook** — `device.wire_reflex_demo()`
 - **Unified error model (v1.4): every wire error/denial carries a stable `code` from the `d2a/errors.py` registry; a source-scan drift guard fails on a sixth shape** — see [Error model](#error-model-v14)
 - **Graceful departure (v1.4): `device.stop()` notifies bound agents (`device_shutdown`, distinct from a lapsed lease), tears bindings down through the one unified path (reason `shutdown`), and unpublishes records so discovery drops the device immediately on LAN + DHT — no TTL ghost; ungraceful death is unchanged (TTL aging + renew failure)**
-- **Capability derivation (application layer — `d2a_derive/`): signed self-contained recipe packages, authorship-only trust gate (strictly before `importlib`), schema + `provides`-manifest + `requires` contract validation, local registry admission, `need()` planner (direct-first → match → contract → cost-rank → dry-run → plan), determinism-checked dry-run gate, structural consent escalation (open inputs → sensitive derived), full provenance; `python -m d2a_derive.sign`** — see [Capability Derivation](#capability-derivation-application-layer-no-wire-change).
+- **Capability derivation (application layer — `d2a_derive/`): signed self-contained recipe packages, authorship-only trust gate (strictly before `importlib`), schema + `provides`-manifest + `requires` contract validation, local registry admission, `need()` planner (direct-first → match → contract → cost-rank → dry-run → plan), determinism-checked dry-run gate, structural consent escalation (open inputs → sensitive derived), full provenance; `python -m d2a_derive.sign`** — see [Capability Derivation](#capability-derivation-application-layer-v15-additive-publish-path).
 - **Live derivation (Phase 2, `d2a_derive/executor.py` + `healer.py` + `monitor.py`): `DerivedCapability` binds each input under an auto-renewed lease over LAN *and* DHT, feeds the transform (subscribe or bounded pull) with dotted-field resolution + declared unit scaling, `reading()`/`health()`/`close()`; self-heals on lease loss (`lease_expired` → bounded rebind, `device_shutdown` → mark gone + slow rediscovery), required-gone → `failed` / optional-gone → `degraded` with `on_state_change`, gap resync, per-input staleness → `degraded` + recovery; clean close leaves zero device residue** — `python3 examples/derive_demo.py`.
+- **Published derived capabilities on-wire (Phase 3, v1.5): `DerivedCapability.publish(runtime)` registers a live derivation through the existing `_register_virtual` path so any agent can discover, bind, read, and subscribe to it over LAN + DHT — effective-tier policy (sensitive derived denies unapproved consumers, no bypass), signed derived-provenance manifest (`derived`/`recipe`/`fidelity`/`cannot_detect`), per-field `hz` cadence, `derived_state` in the reading envelope, and lifecycle coupling (required-input death → unpublish + `derived_input_failed`; publisher shutdown → `device_shutdown`). Four-recipe universal pack across four device classes** — closes derivation protocol gaps 1 + 3.
+- **Multi-hop derivation chaining (Phase 4, application layer — no protocol change): a recipe's `requires` may be met by a derived capability, so derivations stack (`compute → presence → activity_summary`) both fully-local (planner instantiates the inner recipe) and across-the-wire (consume another agent's published derived cap) on LAN + DHT; strict preference (real > single-hop > two-hop), `MAX_DERIVATION_DEPTH = 2` safety rail, cycle + depth guards (distinct refusal codes), nested provenance with chain-max tier + `cannot_detect` union + concatenated fidelity, and inner-failure propagation through the existing healer/lifecycle state machine** — `python3 examples/chain_demo.py`.
 - Sense Layer Part 1: all 4 shapes, verdict + confidence, CPU burn load test; **verdict-transition `event_emitter` + `safety_check` hooks closed (Part 2)**
 - Full 10-stage Capability Composition: plan → atomic bind → runtime monitor + fallback → atomic release
 - Consent policy: safe defaults, sensitive = denied unless owner opts in

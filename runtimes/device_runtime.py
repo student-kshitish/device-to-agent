@@ -1366,6 +1366,50 @@ class DeviceRuntime:
             reading_fn=reading_fn, action_fn=action_fn,
         )
 
+    def unpublish_derived(self, cap_name: str, code: str) -> list[dict]:
+        """
+        Retract a PUBLISHED derived capability that can no longer serve (its
+        underlying DerivedCapability entered `failed`). Tears down every consumer
+        binding through the unified path with a DISTINCT death code (so a consumer
+        branches on it apart from a plain lease lapse / device shutdown), stops
+        serving the capability, and unpublishes the record so discovery drops it
+        immediately. Idempotent. NOTE: reuses the `lease_expired` push *shape*
+        (silent-vanish class) but carries `code=derived_input_failed` — the code,
+        not the message type, is what the consumer branches on.
+        """
+        if cap_name not in self._virtual:
+            return []
+        infos = self.broker.teardown_capability(cap_name, "derived_failed")
+        for info in infos:
+            bid = info["binding_id"]
+            try:
+                self._cleanup_binding_stream(bid)
+            except Exception:
+                pass
+            try:
+                self.swarm.send(info["agent_id"], {
+                    "type":            "lease_expired",
+                    "binding_id":      bid,
+                    "capability_name": cap_name,
+                    "node_id":         self.node_id,
+                    "code":            code,
+                    "expired_at":      time.time(),
+                })
+            except Exception:
+                pass
+        # stop serving: drop the virtual dispatch + capability + quota, then retract
+        # the record (both transports) so no new bind/read/discovery can land.
+        self._virtual.pop(cap_name, None)
+        self.capabilities.pop(cap_name, None)
+        self.broker.quotas.pop(cap_name, None)
+        try:
+            self.swarm.unpublish({"node_id": self.node_id, "name": cap_name})
+        except Exception:
+            pass
+        print(f"[{self.name}] unpublish_derived name={cap_name} code={code} "
+              f"→ {len(infos)} consumer binding(s) torn down")
+        return infos
+
     @staticmethod
     def _emergent_action(handle, action, params) -> dict:
         """Dispatch a wire action to the EmergentDeviceHandle. Bytes params are hex."""

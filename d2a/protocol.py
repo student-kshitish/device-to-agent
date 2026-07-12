@@ -23,7 +23,11 @@ wire dumps/logs and unambiguous in JSON. Major is int(v.split(".")[0]).
 
 import logging
 
-PROTOCOL_VERSION = "1.4"
+# v1.5 (additive): manifest vocabulary gained the optional derived-provenance keys
+# (derived/recipe/fidelity/cannot_detect) and an optional per-field "hz" cadence,
+# so locally derived capabilities publish, discover, and bind like any other. No
+# field renames, no verb changes — same-major peers ignore the new keys.
+PROTOCOL_VERSION = "1.5"
 VERSION_FIELD = "v"
 
 logger = logging.getLogger("d2a.protocol")

@@ -67,8 +67,10 @@ class StalenessMonitor:
                 return
             for feed in dc._feeds:
                 # only an ACTIVE input can go stale here; rebinding/gone belong to
-                # the healer, and a not-yet-fed input has no baseline to judge.
-                if feed.state != _ex.IN_ACTIVE or not feed.last_frame_ts:
+                # the healer, and a not-yet-fed input has no baseline to judge. A
+                # CHAINED (inner) feed's health is owned by the inner derivation's
+                # own monitor + the outward mirror — skip it here.
+                if feed.is_inner or feed.state != _ex.IN_ACTIVE or not feed.last_frame_ts:
                     continue
                 threshold = self.staleness_factor * feed.min_interval_s
                 if now - feed.last_frame_ts > threshold:

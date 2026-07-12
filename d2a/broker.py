@@ -235,6 +235,25 @@ class CapabilityBroker:
                     self._remove_active_bind(bind, cap, reason)
             return out
 
+    def teardown_capability(self, capability_name: str, reason: str = "shutdown") -> list[dict]:
+        """
+        Tear down every active binding for ONE capability through the shared
+        _remove_active_bind path — used when a single published capability must
+        stop serving (e.g. a derived capability whose required input died) while
+        the rest of the device keeps running. Like teardown_all it does NOT grant
+        the waitqueue (the capability is going away). Returns one info dict per
+        torn-down binding so the runtime can push a death notice to each consumer.
+        """
+        with self._lock:
+            out = []
+            for bind in list(self.active_binds.get(capability_name, [])):
+                out.append({"binding_id": bind.binding_id,
+                            "agent_id": bind.agent_id,
+                            "capability_name": capability_name})
+                self._remove_active_bind(bind, capability_name, reason)
+            self.waitqueue.pop(capability_name, None)
+            return out
+
     def cancel_queue(self, agent_id: str, capability_name: str) -> bool:
         """
         Remove agent_id from the waitqueue for capability_name.

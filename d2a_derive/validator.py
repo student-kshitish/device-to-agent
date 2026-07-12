@@ -12,22 +12,21 @@ Three jobs, each returning distinct, informative failures:
      declared adaptations, and min_hz vs the known cadence clamp).
 
 MANIFEST REUSE (the key design point). A recipe's `provides` is a normal manifest
-PLUS five non-vocabulary metadata keys (name, derived, recipe, fidelity,
-cannot_detect). d2a.manifest.validate_manifest rejects unknown top-level keys, so
-we POP the five metadata keys first, then hand the remainder to validate_manifest
-with expected_consent_tier == the manifest's OWN consent_tier (self-consistent by
-construction: derived capabilities have no RESOURCE_SENSITIVITY entry, so the SSOT
-check is tautological and only the vocabulary + 4 KB size checks do real work).
+PLUS a `name` (the capability's identity). As of v1.5 the derivation-provenance
+keys (derived/recipe/fidelity/cannot_detect) are MANIFEST VOCABULARY, validated by
+d2a.manifest.validate_manifest itself — so we pop ONLY `name` (a manifest has no
+name field) and hand the rest to validate_manifest with expected_consent_tier ==
+the manifest's OWN consent_tier. The Phase-1 workaround that popped all five
+metadata keys (because the validator rejected unknown top-level keys) is REMOVED.
 The real consent decision — effective = max(input tiers, declared output tier) —
 is applied later by the planner, NOT here.
 
-min_hz / PROTOCOL GAP (reported, not patched): manifests carry no per-field native
-sample rate, so we cannot compare min_hz against a provider's actual cadence. The
-only cadence fact known statically is the device-side clamp
-DERIVE_MAX_INPUT_HZ, mirroring runtimes.device_runtime.MAX_SAMPLE_HZ (10.0 Hz) —
-an agent can never receive frames faster than the device streams them. So the
-check is coarse: min_hz that exceeds the clamp is unsatisfiable. Per-field native
-cadence is the first v1.5 manifest-key candidate (see README deferred table).
+min_hz / CADENCE (v1.5 — protocol gap 1 CLOSED): manifests may now declare a
+per-field native `hz`. When a provider field declares it, the contract check
+compares min_hz against that real cadence; when it is absent, we fall back to the
+device-side clamp DERIVE_MAX_INPUT_HZ (mirroring runtimes.device_runtime.
+MAX_SAMPLE_HZ, 10.0 Hz) — an agent can never receive frames faster than the device
+streams them. See check_input_against_provider.
 """
 
 from d2a import manifest as _manifest
@@ -39,8 +38,10 @@ from d2a_derive import units
 # must not pull in the device runtime); duplicated as a known protocol constant.
 DERIVE_MAX_INPUT_HZ = 10.0
 
-# The five non-manifest-vocabulary keys carried inside `provides`. Popped before
-# the remainder is handed to d2a.manifest.validate_manifest.
+# The derivation-metadata field names carried inside `provides`. As of v1.5 four of
+# them (derived/recipe/fidelity/cannot_detect) are MANIFEST VOCABULARY validated by
+# d2a.manifest.validate_manifest; only `name` is non-manifest and popped before
+# validation (see validate_provides). Kept for reference / back-compat export.
 DERIVE_META_KEYS = frozenset({"name", "derived", "recipe", "fidelity", "cannot_detect"})
 
 # Recipe.json required top-level envelope keys.
@@ -137,34 +138,44 @@ def validate_provides(provides: dict) -> tuple[dict, dict]:
     if not isinstance(provides, dict):
         raise _fail("'provides' must be an object")
 
-    meta = {k: provides[k] for k in DERIVE_META_KEYS if k in provides}
-    manifest_part = {k: v for k, v in provides.items() if k not in DERIVE_META_KEYS}
-
-    # metadata well-formedness
-    if not isinstance(meta.get("name"), str) or not meta.get("name"):
+    # v1.5: the derived-provenance keys (derived/recipe/fidelity/cannot_detect) are
+    # now MANIFEST VOCABULARY, validated by d2a.manifest.validate_manifest itself.
+    # Phase 1 POPPED all five metadata keys before validation because the manifest
+    # validator rejected unknown top-level keys; that workaround is REMOVED here —
+    # only 'name' (the capability's identity, not manifest content) is still
+    # separated out, because a manifest has no 'name' field.
+    name = provides.get("name")
+    if not isinstance(name, str) or not name:
         raise _fail("provides.name is required and must be a non-empty string")
-    if meta.get("derived") is not True:
+
+    manifest_part = {k: v for k, v in provides.items() if k != "name"}
+
+    # A recipe always PROVIDES a derived capability. Enforce it at the derive layer
+    # so a recipe that forgot 'derived' fails with a derive-level message (the
+    # manifest validator would merely allow a non-derived manifest through).
+    if manifest_part.get("derived") is not True:
         raise _fail("provides.derived must be true for a recipe's output")
-    if not isinstance(meta.get("recipe"), str) or not meta.get("recipe"):
-        raise _fail("provides.recipe is required and must be a non-empty string")
-    if not isinstance(meta.get("fidelity"), str) or not meta.get("fidelity"):
-        raise _fail("provides.fidelity is required and must be a non-empty string "
-                    "(state honestly what the derived output can and cannot do)")
-    cd = meta.get("cannot_detect")
-    if not isinstance(cd, list) or not all(isinstance(x, str) for x in cd):
-        raise _fail("provides.cannot_detect must be a list of strings")
 
     tier = manifest_part.get("consent_tier")
     if tier not in ("open", "sensitive"):
         raise _fail(f"provides.consent_tier must be 'open' or 'sensitive', got {tier!r}")
 
-    # REUSE d2a's manifest validator verbatim; expected tier == the manifest's own
-    # (self-consistent — the real consent escalation is the planner's max()).
+    # REUSE d2a's manifest validator verbatim; it now enforces the derived-key
+    # contract (recipe/fidelity/cannot_detect required, well-formed). expected tier
+    # == the manifest's own (self-consistent — the real consent escalation is the
+    # planner's max()).
     try:
         validated = _manifest.validate_manifest(manifest_part, expected_consent_tier=tier)
     except ManifestError as exc:
         raise _fail(f"provides manifest invalid: {exc}") from exc
 
+    meta = {
+        "name":          name,
+        "derived":       validated["derived"],
+        "recipe":        validated["recipe"],
+        "fidelity":      validated["fidelity"],
+        "cannot_detect": validated["cannot_detect"],
+    }
     return validated, meta
 
 
@@ -205,8 +216,20 @@ def check_input_against_provider(req_input: dict, provider_manifest: dict,
                                    f"(no declared+supported adaptation)")
 
         min_hz = spec.get("min_hz")
-        if min_hz is not None and min_hz > DERIVE_MAX_INPUT_HZ:
-            return False, (f"field '{fname}' needs min_hz={min_hz}, but the device "
-                           f"cadence clamp is {DERIVE_MAX_INPUT_HZ} Hz (unsatisfiable)")
+        if min_hz is not None:
+            # v1.5: if the provider declares its native per-field cadence (hz), the
+            # contract check uses THAT — the real cadence fact. Only when hz is
+            # absent do we fall back to the coarse device MAX_SAMPLE_HZ clamp (the
+            # Phase-1 behaviour, which is all we could do before the manifest carried
+            # cadence). This closes derivation protocol gap 1.
+            prov_hz = pf.get("hz")
+            if isinstance(prov_hz, (int, float)) and not isinstance(prov_hz, bool):
+                if min_hz > prov_hz:
+                    return False, (f"field '{fname}' needs min_hz={min_hz}, but the "
+                                   f"provider declares native hz={prov_hz} (too slow)")
+            elif min_hz > DERIVE_MAX_INPUT_HZ:
+                return False, (f"field '{fname}' needs min_hz={min_hz}, provider "
+                               f"declares no hz, and the device cadence clamp is "
+                               f"{DERIVE_MAX_INPUT_HZ} Hz (unsatisfiable)")
 
     return True, "ok"

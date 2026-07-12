@@ -33,10 +33,14 @@ DRYRUN_FAILED          = "dryrun_failed"             # transform failed / non-de
 # ── plan-time refusals ───────────────────────────────────────────────────────
 NO_RECIPE            = "no_recipe"                    # no recipe provides the needed capability
 CONTRACT_UNSATISFIED = "contract_unsatisfied"        # recipe(s) matched by name, but no provider satisfies requires
+# ── plan-time refusals specific to MULTI-HOP CHAINING (Phase 4) ───────────────
+DERIVATION_CYCLE     = "derivation_cycle"             # a recipe transitively requires its own provides
+DEPTH_EXCEEDED       = "derivation_depth_exceeded"    # satisfying the need would exceed MAX_DERIVATION_DEPTH
 
 ALL_DERIVE_CODES = frozenset({
     RECIPE_MALFORMED, RECIPE_UNSIGNED, RECIPE_BAD_SIG, RECIPE_UNTRUSTED_AUTHOR,
     RECIPE_INVALID, DRYRUN_FAILED, NO_RECIPE, CONTRACT_UNSATISFIED,
+    DERIVATION_CYCLE, DEPTH_EXCEEDED,
 })
 
 

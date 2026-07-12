@@ -1,0 +1,5 @@
+[
+  {"input": "compute", "fields": {"cpu.util_pct": 3.0, "memory.used_percent": 40.0}, "ts": 1.0, "seq": 1},
+  {"input": "compute", "fields": {"cpu.util_pct": 22.0, "memory.used_percent": 42.0}, "ts": 2.0, "seq": 2},
+  {"input": "compute", "fields": {"cpu.util_pct": 35.0, "memory.used_percent": 45.0}, "ts": 3.0, "seq": 3}
+]

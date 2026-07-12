@@ -1,0 +1,59 @@
+{
+  "author_pubkey": "c4f304457f75cf3df67551532e5414db21fcab67c82464620ef98243ebca8109",
+  "cost_rank_hint": 15,
+  "name": "load_trend_from_thermal",
+  "provides": {
+    "cannot_detect": [
+      "actual watts",
+      "load on GPU/disk/other components",
+      "whether heat is from compute or ambient"
+    ],
+    "consent_tier": "open",
+    "derived": true,
+    "description": "Crude sustained-load trend from host thermals + CPU utilization.",
+    "fidelity": "crude: correlates rising thermals under CPU load into a low/moderate/high band; NOT a calibrated power meter and CONFOUNDED by ambient temperature changes, fan curves, and heat from other components",
+    "name": "load_trend",
+    "reading": {
+      "smoothed_temp_c": {
+        "description": "smoothed hottest zone",
+        "type": "number",
+        "unit": "C"
+      },
+      "sustained_load": {
+        "description": "low | moderate | high",
+        "type": "string"
+      },
+      "trend": {
+        "description": "rising | falling | steady",
+        "type": "string"
+      }
+    },
+    "recipe": "load_trend_from_thermal",
+    "streaming": false
+  },
+  "requires": [
+    {
+      "capability_hint": "sensing",
+      "fields": {
+        "thermal.max_temp_c": {
+          "min_hz": 0.2,
+          "type": "number",
+          "unit": "C"
+        }
+      }
+    },
+    {
+      "capability_hint": "compute",
+      "fields": {
+        "cpu.util_pct": {
+          "min_hz": 0.5,
+          "type": "number",
+          "unit": "%"
+        }
+      }
+    }
+  ],
+  "sig": "8621b39da9216754df1e2f5087a1c28c27d1fb36a2d65756f81b134013dd4dea2b05909e0aa690ea9428f8b1bc90523bb6908cf706ed0504e3c808ce0f1a900c",
+  "unit_adaptations": {},
+  "version": "1.0.0"
+}

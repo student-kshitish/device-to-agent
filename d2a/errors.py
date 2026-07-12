@@ -50,6 +50,10 @@ NOT_OWNER           = "not_owner"
 CAPABILITY_MISMATCH = "capability_mismatch"
 LEASE_EXPIRED       = "lease_expired"    # renew denial AND the death push (was "expired"/"ttl_expired")
 DEVICE_SHUTDOWN     = "device_shutdown"  # graceful departure (Part 2) — sibling of LEASE_EXPIRED
+DERIVED_INPUT_FAILED = "derived_input_failed"  # v1.5: a PUBLISHED derived capability lost a
+                                               # required input and can no longer serve — the death
+                                               # push carries this so a consumer branches on it
+                                               # distinctly from a plain lease lapse / device shutdown
 
 # ── policy (were human-message-only before v1.4) ─────────────────────────────
 POLICY_BLOCKED    = "policy_blocked"
@@ -80,6 +84,7 @@ ALL_CODES = frozenset({
     UNSIGNED_TRUST_OP, STALE_SIGNATURE, BAD_SIGNATURE,
     NODE_ID_DERIVATION_MISMATCH, TOFU_KEY_MISMATCH,
     UNKNOWN_BINDING, NOT_OWNER, CAPABILITY_MISMATCH, LEASE_EXPIRED, DEVICE_SHUTDOWN,
+    DERIVED_INPUT_FAILED,
     POLICY_BLOCKED, APPROVAL_REQUIRED,
     CAPABILITY_NOT_FOUND, NO_ACTIVE_BIND, BINDING_NOT_FOUND,
     BINDING_INVALID_OR_OUT_OF_SCOPE, NOT_AN_ACTION_CAPABILITY,

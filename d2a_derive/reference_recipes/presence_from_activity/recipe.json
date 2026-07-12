@@ -1,0 +1,54 @@
+{
+  "author_pubkey": "c4f304457f75cf3df67551532e5414db21fcab67c82464620ef98243ebca8109",
+  "cost_rank_hint": 15,
+  "name": "presence_from_activity",
+  "provides": {
+    "cannot_detect": [
+      "human presence vs background load",
+      "who is present",
+      "presence while the machine is idle"
+    ],
+    "consent_tier": "sensitive",
+    "derived": true,
+    "description": "Coarse machine-in-use presence inferred from host compute load.",
+    "fidelity": "coarse: infers that the MACHINE is in use from CPU/memory load; cannot tell a person at the keyboard from a background job, carries no identity, and reads an idle-but-occupied machine as absent",
+    "name": "presence",
+    "reading": {
+      "activity_level": {
+        "description": "idle | light | active",
+        "type": "string"
+      },
+      "in_use": {
+        "description": "machine appears in use",
+        "type": "boolean"
+      },
+      "score": {
+        "description": "smoothed CPU utilization",
+        "type": "number",
+        "unit": "%"
+      }
+    },
+    "recipe": "presence_from_activity",
+    "streaming": false
+  },
+  "requires": [
+    {
+      "capability_hint": "compute",
+      "fields": {
+        "cpu.util_pct": {
+          "min_hz": 0.5,
+          "type": "number",
+          "unit": "%"
+        },
+        "memory.used_percent": {
+          "min_hz": 0.5,
+          "type": "number",
+          "unit": "%"
+        }
+      }
+    }
+  ],
+  "sig": "156a781299e758a93b7a7c315213930aebd0fd2e22d7daf0f3dc0f6d5d9d5a7932aa70a87c84d8e23b2b63298e96ffd47cd8c71cd7ae1556b3695602c8065a0b",
+  "unit_adaptations": {},
+  "version": "1.0.0"
+}

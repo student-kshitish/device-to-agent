@@ -18,7 +18,14 @@ mechanically. The whole grammar:
     "actions":  { <name>: {"description": <str>,
                            "params": { <param>: <paramspec> }} },   (optional)
     "consent_tier": "open" | "sensitive",       # MUST equal the policy SSOT (required)
-    "streaming": <bool>                          # does subscribe() apply (default False)
+    "streaming": <bool>,                         # does subscribe() apply (default False)
+    # derived-provenance (v1.5, optional): present iff this capability is
+    # SYNTHESISED by a recipe rather than read from hardware. "derived": true makes
+    # the other three REQUIRED; "derived" absent/false FORBIDS them.
+    "derived": <bool>,
+    "recipe": <str>,                             # recipe name that produced it
+    "fidelity": <str>,                           # honest statement of what it can/can't do
+    "cannot_detect": [<str>, ...]                # explicit blind spots
   }
 
   fieldspec / paramspec = {
@@ -27,6 +34,8 @@ mechanically. The whole grammar:
                                                      forbidden otherwise; NO nested arrays)
     "unit": <str>,          (optional)
     "description": <str>,   (optional)
+    "hz": <number>,         (optional; the provider's native sample cadence for this
+                             field — v1.5. Absent = unknown → clamp fallback.)
     "format": "hex",        (optional; ONLY on type=="string" — declares hex-encoded bytes)
     "required": <bool>      (paramspec only)
   }
@@ -52,11 +61,19 @@ from d2a.guardian.device_kinds import KIND_SENSITIVITY, KIND_PRIMITIVES
 
 MANIFEST_MAX_BYTES = 4096          # publish rejects a manifest larger than this
 
-_TOP_LEVEL_KEYS = {"description", "reading", "actions", "consent_tier", "streaming"}
+# v1.5 added four OPTIONAL derived-provenance keys (see _DERIVED_KEYS below) — a
+# capability that is SYNTHESISED by a recipe rather than read from hardware says so
+# on-wire, so a discovering agent learns it is a substitute and its honest limits
+# with no demo code. This is the manifest half of closing derivation protocol gap 3.
+_DERIVED_KEYS = {"derived", "recipe", "fidelity", "cannot_detect"}
+_TOP_LEVEL_KEYS = {"description", "reading", "actions", "consent_tier", "streaming"} | _DERIVED_KEYS
 _SCALAR_TYPES = {"number", "string", "boolean", "object"}
 _ALL_TYPES = _SCALAR_TYPES | {"array"}
 _CONSENT_TIERS = {"open", "sensitive"}
-_FIELD_KEYS = {"type", "unit", "description", "items", "format"}
+# v1.5 added optional per-field "hz": the provider's native sample cadence for a
+# reading field (closing derivation protocol gap 1). Absent means "unknown" and the
+# derive contract-checker falls back to the device MAX_SAMPLE_HZ clamp.
+_FIELD_KEYS = {"type", "unit", "description", "items", "format", "hz"}
 _PARAM_KEYS = _FIELD_KEYS | {"required"}
 _ACTION_KEYS = {"description", "params", "long_running"}
 
@@ -113,6 +130,10 @@ def _validate_spec(spec: dict, where: str, *, allow_required: bool) -> None:
     for k in ("unit", "description"):
         if k in spec and not isinstance(spec[k], str):
             raise ManifestError(f"{where}: '{k}' must be a string")
+    if "hz" in spec:
+        hz = spec["hz"]
+        if isinstance(hz, bool) or not isinstance(hz, (int, float)) or hz <= 0:
+            raise ManifestError(f"{where}: 'hz' must be a positive number")
     if allow_required and "required" in spec and not isinstance(spec["required"], bool):
         raise ManifestError(f"{where}: 'required' must be a boolean")
 
@@ -176,6 +197,29 @@ def validate_manifest(manifest: dict, expected_consent_tier: str,
     streaming = manifest.get("streaming", False)
     if not isinstance(streaming, bool):
         raise ManifestError("'streaming' must be a boolean")
+
+    # ── derived-provenance keys (v1.5) ────────────────────────────────────────
+    # A derived capability MUST carry all three provenance strings; a real
+    # (non-derived) capability MUST NOT carry any of them (so "derived" is an
+    # honest, non-forgeable-by-omission signal, not decoration).
+    if "derived" in manifest and not isinstance(manifest["derived"], bool):
+        raise ManifestError("'derived' must be a boolean")
+    is_derived = bool(manifest.get("derived", False))
+    if is_derived:
+        for k in ("recipe", "fidelity"):
+            if not isinstance(manifest.get(k), str) or not manifest.get(k):
+                raise ManifestError(
+                    f"a derived manifest requires a non-empty string '{k}'")
+        cd = manifest.get("cannot_detect")
+        if not isinstance(cd, list) or not all(isinstance(x, str) for x in cd):
+            raise ManifestError(
+                "a derived manifest requires 'cannot_detect' as a list of strings")
+    else:
+        present = sorted(k for k in ("recipe", "fidelity", "cannot_detect") if k in manifest)
+        if present:
+            raise ManifestError(
+                f"a non-derived manifest must not carry derived-provenance keys "
+                f"{present} (set 'derived': true, or remove them)")
 
     out = {**manifest, "streaming": streaming}
 

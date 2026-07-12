@@ -22,6 +22,13 @@ provenance. Phase 2 makes it move:
 reading() returns None until the transform first emits; after that it always
 returns the latest output, and health()["last_output_ts"] carries when.
 
+PHASE 3 (v1.5): publish() registers a live DerivedCapability on a DeviceRuntime so
+OTHER agents can discover/bind/read/subscribe to it — through the same
+_register_virtual path a Guardian VSO uses. Consent gates on the effective tier
+(no bypass); a `failed` derivation unpublishes + tears down consumer bindings with
+a distinct `derived_input_failed` code; a `degraded` one keeps serving with its
+state in the reading envelope. See DerivedCapability.publish.
+
 SELF-HEALING (healer.py) and STALENESS (monitor.py) are wired in here but live in
 their own modules: the executor owns the shared per-input state they read/write
 (the ONE lock discipline below), so a lease loss or a stale input flips
@@ -40,6 +47,8 @@ import time
 from dataclasses import dataclass, field
 
 from agents.remote_agent import LeaseLostError
+from d2a import errors as _wire_errors
+from d2a import manifest as _manifest
 from d2a_derive import units
 from d2a_derive.validator import DERIVE_MAX_INPUT_HZ
 
@@ -102,10 +111,19 @@ class InputFeed:
     gap_count: int = 0
     rebind_count: int = 0
 
+    # CHAINED input (local multi-hop): this input is produced by an inner
+    # DerivedCapability instantiated locally, not bound from the wire. When
+    # is_inner is True, `inner_plan`/`inner` are set and `provider`/`binding` are not
+    # used — the feed reads inner.reading() and mirrors the inner's health outward.
+    is_inner: bool = False
+    inner_plan: object = None
+    inner: object = None            # the live inner DerivedCapability
+
     # feed machinery
     _stop: threading.Event = field(default_factory=threading.Event)
     _pull_thread: object = None
     _healing: bool = False          # a heal is in flight for this input
+    _inner_seq: int = 0             # monotonic seq for locally generated inner frames
 
 
 class DerivedCapability:
@@ -146,6 +164,10 @@ class DerivedCapability:
 
         self._feeds: list[InputFeed] = self._build_feeds()
 
+        # set when this derived capability is published on-wire (publish()).
+        self._publisher = None
+        self._published_name = None
+
         # self-healing + staleness monitor — own modules, share our state + lock.
         # Imported here (not at module top) to keep the import graph acyclic and
         # obvious: executor owns them, they never import executor.
@@ -177,17 +199,22 @@ class DerivedCapability:
         feeds = []
         for m in self.plan.inputs:
             hint = m["hint"]
-            provider = m["provider"]
+            inner_plan = m.get("inner_plan")            # chained input (local hop)?
+            provider = m.get("provider") or {}
+            # the manifest that describes THIS input's fields+units: the discovered
+            # provider's, or (chained) the inner plan's own provides manifest.
+            src_manifest = inner_plan.manifest if inner_plan is not None \
+                else (provider.get("manifest", {}) or {})
             req = req_by_hint.get(hint, {})
             req_fields = req.get("fields", {})
-            prov_reading = (provider.get("manifest", {}) or {}).get("reading", {})
+            src_reading = src_manifest.get("reading", {})
 
             dotted = sorted(req_fields)
             scales = {}
             min_hz = 0.0
             for fname, spec in req_fields.items():
                 req_unit  = spec.get("unit")
-                prov_unit = (prov_reading.get(fname, {}) or {}).get("unit")
+                prov_unit = (src_reading.get(fname, {}) or {}).get("unit")
                 # identity when units match or none declared; else the declared
                 # multiplicative scale the contract already proved is supported.
                 scales[fname] = units.scale_factor(prov_unit or req_unit or "",
@@ -196,13 +223,14 @@ class DerivedCapability:
                 if isinstance(mh, (int, float)) and not isinstance(mh, bool):
                     min_hz = max(min_hz, float(mh))
 
-            streaming = bool((provider.get("manifest", {}) or {}).get("streaming"))
+            streaming = bool(src_manifest.get("streaming"))
             target_hz = max(min_hz, _DEFAULT_STREAM_HZ if streaming else _DEFAULT_PULL_HZ)
             feed_hz = min(max(target_hz, 0.1), DERIVE_MAX_INPUT_HZ)
             feeds.append(InputFeed(
                 hint=hint, provider=provider, fields=dotted, scales=scales,
                 optional=bool(req.get("optional", False)),
                 streaming=streaming, feed_hz=feed_hz, min_interval_s=1.0 / feed_hz,
+                is_inner=inner_plan is not None, inner_plan=inner_plan,
             ))
         return feeds
 
@@ -219,23 +247,82 @@ class DerivedCapability:
         self.module.init(self._ctx)
 
         for feed in self._feeds:
-            ok = self._bind_feed(feed)
+            if feed.is_inner:
+                ok = self._start_inner(feed)          # local chained hop
+            else:
+                ok = self._bind_feed(feed)            # bind a real/published provider
+                if ok:
+                    self._start_feed(feed)
             if not ok:
                 if feed.optional:
                     with self._lock:
                         feed.state = IN_GONE
                     continue
-                # a required input the plan said was satisfiable failed to bind —
+                # a required input the plan said was satisfiable failed to come up —
                 # tear down what we started and surface it.
                 self.close()
                 raise RuntimeError(
                     f"derived '{self.provided_name}': required input '{feed.hint}' "
-                    f"failed to bind")
-            self._start_feed(feed)
+                    f"failed to start")
 
         self._recompute_state("started")
         self._monitor.start()
         return self
+
+    # ── chained inputs (local multi-hop) ─────────────────────────────────────────
+
+    def _start_inner(self, feed: InputFeed) -> bool:
+        """Instantiate + start the inner DerivedCapability that produces a CHAINED
+        input, wire its health outward, and begin feeding its readings to our
+        transform. The inner runs its OWN executor (binds its own inputs, self-heals,
+        monitors) — we only mirror its overall state onto this feed."""
+        feed.inner = DerivedCapability(
+            feed.inner_plan, self.agent,
+            on_state_change=self._make_inner_mirror(feed),
+        )
+        try:
+            feed.inner.start()
+        except Exception:
+            return False
+        with self._lock:
+            feed.state = IN_ACTIVE
+            feed.last_frame_ts = time.time()
+        feed._stop.clear()
+        t = threading.Thread(target=self._inner_feed_loop, args=(feed,), daemon=True,
+                             name=f"derive-inner-{feed.hint}")
+        feed._pull_thread = t
+        t.start()
+        return True
+
+    def _make_inner_mirror(self, feed: InputFeed):
+        """Mirror the inner derivation's overall state onto this outer feed, so
+        inner failure/degradation propagates outward through the SAME state machine:
+        inner failed → outer input gone (→ outer failed/degraded per required/
+        optional); inner degraded → outer feed degraded; inner active → active."""
+        def _mirror(old, new, reason):
+            with self._lock:
+                if self._closed:
+                    return
+                if new == FAILED:
+                    feed.state = IN_GONE
+                elif new == DEGRADED:
+                    feed.state = IN_DEGRADED
+                elif new == ACTIVE:
+                    feed.state = IN_ACTIVE
+                self._recompute_state_locked(f"inner:{feed.hint}:{new}")
+        return _mirror
+
+    def _inner_feed_loop(self, feed: InputFeed) -> None:
+        """Poll the inner derivation's reading() and feed it to our transform. The
+        inner reading is a flat dict whose keys are the recipe's seam fields."""
+        while not feed._stop.is_set():
+            out = feed.inner.reading() if feed.inner is not None else None
+            if isinstance(out, dict):
+                feed._inner_seq += 1
+                self._ingest(feed, {"raw": dict(out), "ts": time.time(),
+                                    "seq": feed._inner_seq})
+            if feed._stop.wait(feed.min_interval_s):
+                return
 
     def _bind_feed(self, feed: InputFeed) -> bool:
         """Bind one input to its planned provider under a lease. NETWORK op — no
@@ -291,14 +378,27 @@ class DerivedCapability:
         gap and triggers exactly one resync re-read (never silent)."""
         if not isinstance(inner_frame, dict):
             return
-        raw = inner_frame.get("raw", {})
+        # Two frame shapes reach here: a hardware DataProvider frame
+        # {"raw": {...}, "derived": {...}, "seq": ...}, and a VIRTUAL capability's
+        # flat reading dict {field: value} (a published derived / VSO / emergent
+        # provider serves this — get_reading returns reading_fn() directly, with no
+        # "raw" wrapper). Resolve dotted fields against whichever we got.
+        raw = inner_frame.get("raw") if "raw" in inner_frame else inner_frame
         seq = inner_frame.get("seq")
 
         fields = {}
         for dotted in feed.fields:
             val = _resolve_dotted(raw, dotted)
-            if isinstance(val, (int, float)) and not isinstance(val, bool):
+            # numeric fields are unit-scaled; boolean/string fields pass through
+            # unchanged (a CHAINED input's seam fields — e.g. presence.in_use, a
+            # trend string — are not numbers, and dropping them would starve the
+            # outer transform). None (absent this frame) and dict/list are skipped.
+            if isinstance(val, bool):
+                fields[dotted] = val
+            elif isinstance(val, (int, float)):
                 fields[dotted] = val * feed.scales.get(dotted, 1.0)
+            elif isinstance(val, str):
+                fields[dotted] = val
 
         gap = 0
         with self._lock:
@@ -317,7 +417,11 @@ class DerivedCapability:
             feed.last_frame_ts = time.time()
             # staleness recovery: a fresh frame on a degraded-by-staleness input
             # flips it back to active (handled centrally in _recompute_state).
-            if feed.state == IN_DEGRADED and not feed._healing:
+            # staleness recovery flips a degraded DIRECT feed back to active on a
+            # fresh frame. An INNER (chained) feed's state is owned by the mirror of
+            # the inner derivation — never auto-recover it here, or a stale inner
+            # reading would falsely promote it.
+            if feed.state == IN_DEGRADED and not feed._healing and not feed.is_inner:
                 feed.state = IN_ACTIVE
 
             if fields:
@@ -369,12 +473,17 @@ class DerivedCapability:
             per_input = {}
             for feed in self._feeds:
                 staleness = (now - feed.last_frame_ts) if feed.last_frame_ts else None
-                per_input[feed.hint] = {
+                entry = {
                     "state":        feed.state,
                     "staleness_s":  round(staleness, 3) if staleness is not None else None,
                     "gap_count":    feed.gap_count,
                     "rebind_count": feed.rebind_count,
                 }
+                # a chained input nests the inner derivation's own health, so the
+                # full multi-hop health tree is readable from the top.
+                if feed.is_inner and feed.inner is not None:
+                    entry["inner"] = feed.inner.health()
+                per_input[feed.hint] = entry
             return {
                 "state":          self._state,
                 "per_input":      per_input,
@@ -447,6 +556,68 @@ class DerivedCapability:
                     return feed
         return None
 
+    # ── publish on-wire (v1.5) ────────────────────────────────────────────────────
+
+    def publish(self, runtime, name: str | None = None) -> dict:
+        """
+        Publish this live derived capability on `runtime` (a DeviceRuntime) so OTHER
+        agents can discover, bind, read, and subscribe to it — through the EXACT
+        same machinery a Guardian VSO / emergent device uses (`_register_virtual`):
+        broker quota, a policy rule from the EFFECTIVE consent tier (sensitive →
+        require_approval, no bypass), leases, condition-events, unified teardown.
+
+        The published record carries the v1.5 derived-provenance manifest (derived/
+        recipe/fidelity/cannot_detect), signed with the runtime's HOST key. reading()
+        routes to THIS live DerivedCapability via the pseudo-source registration, so
+        a remote subscriber's condition on a derived reading field works.
+
+        LIFECYCLE COUPLING: if the underlying derivation later enters `failed`, the
+        published capability is retracted and its consumer bindings are torn down
+        with a distinct `derived_input_failed` death code (wired here onto
+        on_state_change). A `degraded` derivation keeps serving, with the live state
+        exposed in the reading envelope's `derived_state` field.
+        """
+        name = name or self.provided_name
+        man = {**self.manifest, "consent_tier": self.effective_tier}
+        # defensive: the published manifest must be a valid v1.5 derived manifest.
+        man = _manifest.validate_manifest(man, self.effective_tier)
+
+        self._publisher = runtime
+        self._published_name = name
+
+        # chain the failure→retract hook onto whatever on_state_change was set.
+        prev = self.on_state_change
+
+        def _coupling(old, new, why, _prev=prev, _rt=runtime, _nm=name):
+            if new == FAILED:
+                try:
+                    _rt.unpublish_derived(_nm, _wire_errors.DERIVED_INPUT_FAILED)
+                except Exception:
+                    pass
+            if callable(_prev):
+                _prev(old, new, why)
+
+        self.on_state_change = _coupling
+
+        return runtime._register_virtual(
+            name, "derived", self.effective_tier, man,
+            tags=[name, "derived_capability", self.effective_tier],
+            live_state={"derived": True, "recipe": self.recipe.recipe_name,
+                        "state": self.state},
+            reading_fn=self._published_reading,
+            action_fn=lambda action, params: {"error": "derived_capability_has_no_actions"},
+        )
+
+    def _published_reading(self):
+        """The reading a remote consumer receives: the latest transform output with
+        the live `derived_state` folded into the envelope (so a `degraded`
+        derivation is honestly labelled while it keeps serving). None until the
+        transform first emits."""
+        out = self.reading()
+        if out is None:
+            return None
+        return {**out, "derived_state": self.state}
+
     # ── shutdown ─────────────────────────────────────────────────────────────────
 
     def close(self) -> None:
@@ -458,6 +629,16 @@ class DerivedCapability:
             self._closed = True
             self._state = CLOSED
             feeds = list(self._feeds)
+            publisher, pub_name = self._publisher, self._published_name
+
+        # if we were published on-wire, retract the record + tear down consumer
+        # bindings gracefully (device_shutdown class — the service is intentionally
+        # stopping, distinct from the failure code).
+        if publisher is not None and pub_name is not None:
+            try:
+                publisher.unpublish_derived(pub_name, _wire_errors.DEVICE_SHUTDOWN)
+            except Exception:
+                pass
 
         self._monitor.stop()
         self._healer.stop()
@@ -467,7 +648,14 @@ class DerivedCapability:
             t = feed._pull_thread
             if t is not None and t.is_alive() and t is not threading.current_thread():
                 t.join(timeout=2.0)
-        # release every binding (stops auto-renew, tears down device-side stream)
+        # tear down chained inner derivations (each releases ITS own inputs).
+        for feed in feeds:
+            if feed.inner is not None:
+                try:
+                    feed.inner.close()
+                except Exception:
+                    pass
+        # release every direct binding (stops auto-renew, tears down device-side stream)
         for feed in feeds:
             if feed.binding is None:
                 continue

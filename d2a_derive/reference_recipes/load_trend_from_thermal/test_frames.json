@@ -1,0 +1,6 @@
+[
+  {"input": "sensing", "fields": {"thermal.max_temp_c": 45.0}, "ts": 1.0, "seq": 1},
+  {"input": "compute", "fields": {"cpu.util_pct": 20.0}, "ts": 2.0, "seq": 2},
+  {"input": "sensing", "fields": {"thermal.max_temp_c": 48.0}, "ts": 3.0, "seq": 3},
+  {"input": "compute", "fields": {"cpu.util_pct": 30.0}, "ts": 4.0, "seq": 4}
+]

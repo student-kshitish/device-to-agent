@@ -1,0 +1,47 @@
+{
+  "author_pubkey": "c4f304457f75cf3df67551532e5414db21fcab67c82464620ef98243ebca8109",
+  "cost_rank_hint": 15,
+  "name": "activity_summary",
+  "provides": {
+    "cannot_detect": [
+      "who is present",
+      "timing within a sample window",
+      "presence changes faster than the sampling rate"
+    ],
+    "consent_tier": "open",
+    "derived": true,
+    "description": "Coarse duty-cycle / occupancy-pattern summary over a presence signal.",
+    "fidelity": "coarse duty cycle over sampled presence; INHERITS all presence limits (machine activity, not a person) and adds sampling-window coarseness",
+    "name": "activity_summary",
+    "reading": {
+      "duty_cycle": {
+        "description": "fraction of samples in use",
+        "type": "number"
+      },
+      "pattern": {
+        "description": "steady | intermittent | idle",
+        "type": "string"
+      },
+      "samples": {
+        "description": "sample count",
+        "type": "number"
+      }
+    },
+    "recipe": "activity_summary",
+    "streaming": false
+  },
+  "requires": [
+    {
+      "capability_hint": "presence",
+      "fields": {
+        "in_use": {
+          "min_hz": 0.5,
+          "type": "boolean"
+        }
+      }
+    }
+  ],
+  "sig": "da08ce078a64c26475f696d78d55d81182fce34793c12361ad9b9323d4d0da1f730ef8258dd179b4fb084b0f341df8da2c977cfea30265aeec918482df4a6608",
+  "unit_adaptations": {},
+  "version": "1.0.0"
+}

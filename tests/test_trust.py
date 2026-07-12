@@ -127,7 +127,10 @@ class TestTrustGateUnit(unittest.TestCase):
 
     def test_version_spoof_inside_payload_detected(self):
         msg = _sign_bind(self.node, self.priv, self.pub)
-        msg["v"] = "1.5"                              # same major (transport would pass) but tampered
+        # tamper `v` to a value that differs from what was SIGNED (which is the
+        # current PROTOCOL_VERSION). Same major so the transport gate would pass,
+        # but the signature covers `v`, so verification must fail.
+        msg["v"] = "1.99"
         resp = self._bind(msg)
         self.assertEqual(resp["status"], "denied")
         self.assertEqual(resp["code"], signing.ERR_BAD_SIG)
