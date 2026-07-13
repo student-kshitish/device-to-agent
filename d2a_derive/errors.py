@@ -30,6 +30,13 @@ RECIPE_UNTRUSTED_AUTHOR = "recipe_untrusted_author"  # valid sig, author not in 
 RECIPE_INVALID         = "recipe_invalid"            # schema / provides-manifest vocabulary failure
 DRYRUN_FAILED          = "dryrun_failed"             # transform failed / non-deterministic on its own frames
 
+# ── distribution refusals (Phase 5: remote source / install) ─────────────────
+RECIPE_FETCH_FAILED    = "recipe_fetch_failed"       # remote source could not deliver the package
+RECIPE_DUPLICATE       = "recipe_duplicate"          # name+version already installed (a new version is new code)
+
+# ── quality-gate refusal (Phase 6: observed-cost / quarantine) ────────────────
+RECIPE_QUARANTINED     = "recipe_quarantined"        # recipe flagged by failure rate / conformance; needs explicit opt-in
+
 # ── plan-time refusals ───────────────────────────────────────────────────────
 NO_RECIPE            = "no_recipe"                    # no recipe provides the needed capability
 CONTRACT_UNSATISFIED = "contract_unsatisfied"        # recipe(s) matched by name, but no provider satisfies requires
@@ -39,8 +46,9 @@ DEPTH_EXCEEDED       = "derivation_depth_exceeded"    # satisfying the need woul
 
 ALL_DERIVE_CODES = frozenset({
     RECIPE_MALFORMED, RECIPE_UNSIGNED, RECIPE_BAD_SIG, RECIPE_UNTRUSTED_AUTHOR,
-    RECIPE_INVALID, DRYRUN_FAILED, NO_RECIPE, CONTRACT_UNSATISFIED,
-    DERIVATION_CYCLE, DEPTH_EXCEEDED,
+    RECIPE_INVALID, DRYRUN_FAILED, RECIPE_FETCH_FAILED, RECIPE_DUPLICATE,
+    RECIPE_QUARANTINED,
+    NO_RECIPE, CONTRACT_UNSATISFIED, DERIVATION_CYCLE, DEPTH_EXCEEDED,
 })
 
 

@@ -50,6 +50,7 @@ from agents.remote_agent import LeaseLostError
 from d2a import errors as _wire_errors
 from d2a import manifest as _manifest
 from d2a_derive import units
+from d2a_derive.metrics import MetricsStore
 from d2a_derive.validator import DERIVE_MAX_INPUT_HZ
 
 # DerivedCapability lifecycle states (overall). STARTING is transient during
@@ -144,7 +145,8 @@ class DerivedCapability:
                  heal_backoff_s: float = 0.2,
                  heal_shutdown_backoff_s: float = 2.0,
                  monitor_interval_s: float | None = None,
-                 on_state_change=None):
+                 on_state_change=None,
+                 metrics: MetricsStore | None = None):
         self.plan = plan
         self.agent = agent
         self.provided_name = plan.provided_name
@@ -161,6 +163,15 @@ class DerivedCapability:
         self._last_output_ts = 0.0
         self._state = STARTING
         self._closed = False
+
+        # Phase 6 metrics: in-memory accumulators updated at transitions (heal count
+        # is read from feed.rebind_count at flush; staleness is sampled by the monitor
+        # into these sums). Persisted to disk ONCE per run — no per-frame writes.
+        self._metrics = metrics if metrics is not None else MetricsStore()
+        self._start_ts = 0.0
+        self._staleness_sum = 0.0                # Σ per-tick max input staleness
+        self._staleness_n = 0                    # tick count (for the run's mean)
+        self._metrics_recorded = False           # guard: record the run exactly once
 
         self._feeds: list[InputFeed] = self._build_feeds()
 
@@ -244,6 +255,7 @@ class DerivedCapability:
         # chain onto the agent's lease-loss hook so we're told the moment any of
         # our input leases dies (renew denied / lease_expired / device_shutdown).
         self._install_lease_hook()
+        self._start_ts = time.time()
         self.module.init(self._ctx)
 
         for feed in self._feeds:
@@ -488,7 +500,20 @@ class DerivedCapability:
                 "state":          self._state,
                 "per_input":      per_input,
                 "last_output_ts": self._last_output_ts or None,
+                # Phase 6: the recipe's lifetime metrics on THIS machine (rolling over
+                # all prior runs, not just this one) — the same record the planner
+                # ranks by and explain() prints. Advisory; measures local history.
+                "lifetime":       self._metrics.get(self.recipe.recipe_name).summary(),
             }
+
+    def _note_staleness_locked(self, sample: float) -> None:
+        """Fold one staleness observation into this run's accumulators (caller holds
+        the lock). Called by the monitor each tick — in memory only, never touches
+        disk, so the no-per-frame-write bound holds."""
+        if self._closed:
+            return
+        self._staleness_sum += max(0.0, float(sample))
+        self._staleness_n += 1
 
     # ── state machine ─────────────────────────────────────────────────────────────
 
@@ -519,6 +544,13 @@ class DerivedCapability:
         if new == old:
             return
         self._state = new
+        # Phase 6: FAILED is effectively terminal (it comes from a required input
+        # marked gone), so persist the run's metrics AT the transition — durability
+        # for the failed_count even if close() is never called. Off the lock (the
+        # store does disk IO); the once-guard dedupes against a later close().
+        if new == FAILED:
+            threading.Thread(target=self._record_run_once, args=(FAILED,),
+                             daemon=True).start()
         cb = self.on_state_change
         if cb is not None:
             # fire outside the lock so a callback can't deadlock on our state
@@ -530,6 +562,30 @@ class DerivedCapability:
         try:
             cb(old, new, reason)
         except Exception:
+            pass
+
+    # ── metrics flush (once per run) ──────────────────────────────────────────────
+
+    def _record_run_once(self, final_state: str) -> None:
+        """Persist this run's contribution to the recipe's rolling metrics — EXACTLY
+        once per DerivedCapability lifetime (guarded), at the FAILED transition or at
+        close(), whichever fires first. heal_count is read from the feeds' rebind
+        counters; mean staleness is this run's mean of the monitor's per-tick samples.
+        The disk write happens here (off any per-frame path)."""
+        with self._lock:
+            if self._metrics_recorded or self._start_ts == 0.0:
+                return                       # never started, or already recorded
+            self._metrics_recorded = True
+            uptime = max(0.0, time.time() - self._start_ts)
+            heals = sum(f.rebind_count for f in self._feeds)
+            mean_staleness = (self._staleness_sum / self._staleness_n) \
+                if self._staleness_n else 0.0
+            failed = (final_state == FAILED)
+            recipe_name = self.recipe.recipe_name
+        try:
+            self._metrics.record_run(recipe_name, uptime=uptime, heal_count=heals,
+                                     failed=failed, staleness=mean_staleness)
+        except Exception:                    # advisory — a metrics write must not raise
             pass
 
     # ── lease-loss hook plumbing (feeds the healer) ──────────────────────────────
@@ -626,6 +682,7 @@ class DerivedCapability:
         with self._lock:
             if self._closed:
                 return
+            prev_state = self._state             # the run's final state, for metrics
             self._closed = True
             self._state = CLOSED
             feeds = list(self._feeds)
@@ -668,3 +725,8 @@ class DerivedCapability:
                 self.agent.release_binding(feed.binding)
             except Exception:
                 pass
+
+        # Phase 6: record this run's metrics (once-guarded — a FAILED transition may
+        # already have flushed it). Uses prev_state so a run that closed while FAILED
+        # still counts as a failure; a clean close counts as a non-failed run.
+        self._record_run_once(prev_state)

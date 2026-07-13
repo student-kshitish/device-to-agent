@@ -42,7 +42,10 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 _HOME = tempfile.mkdtemp(prefix="d2a-derive-demo-")
 os.environ["D2A_HOME"] = _HOME
 
-from d2a_derive import Registry, Planner, TrustStore, DerivedCapability
+from d2a_derive import (
+    Registry, Planner, TrustStore, DerivedCapability, MetricsStore,
+    explain, format_explanation,
+)
 from d2a_derive.demo_scaffolding import register_demo_odometry, OdometrySource
 from runtimes.device_runtime import DeviceRuntime
 from agents.remote_agent import RemoteAgent
@@ -196,7 +199,15 @@ def demo_thermal_real():
     agent.start()
     seed(agent, dev)
 
-    pl = Planner(trusted_registry(), discover=discover_fn(agent))
+    # Phase 6: a shared metrics store — the live run below folds its history into it,
+    # and the explain() in section 7 ranks by exactly that observed record.
+    demo = json.loads((_REF / "DEMO_reference_author.json").read_text())
+    trust = TrustStore(path=Path(_HOME) / "trusted_authors.json")
+    trust.add(demo["public_key"], demo["name"])
+    reg = Registry(recipes_dir=_REF, trust=trust)
+    metrics = MetricsStore()
+
+    pl = Planner(reg, discover=discover_fn(agent), metrics=metrics)
     res = pl.need("ambient_temp")
     if res.outcome != "derived":
         print(f"  refused: {res.code} — {res.detail} "
@@ -205,11 +216,20 @@ def demo_thermal_real():
     print_plan(res)
     print("  → binding the REAL sensing capability (thermal.max_temp_c), live:")
 
-    dc = DerivedCapability(res.plan, agent).start()
+    dc = DerivedCapability(res.plan, agent, metrics=metrics).start()
     for _ in range(6):
         time.sleep(0.6)
         print(f"    ambient proxy: {dc.reading()}")
-    dc.close()
+    print(f"    lifetime metrics (this recipe, this machine): "
+          f"{dc.health()['lifetime']}")
+    dc.close()                          # records this run into the shared metrics store
+    time.sleep(0.2)
+
+    hr("7) Explain — WHY the planner would pick this recipe for its chain")
+    exp = explain("ambient_temp", recipes_dir=_REF, trust=trust, metrics=metrics,
+                  discover=discover_fn(agent))
+    print(format_explanation(exp))
+
     agent.stop()
     dev.stop_swarm()
 

@@ -33,6 +33,7 @@ from pathlib import Path
 
 from d2a import crypto
 from d2a_derive import errors
+from d2a_derive.metrics import MetricsStore
 from d2a_derive.recipe import RecipePackage, verify_recipe_sig, is_signed, RecipeFormatError
 from d2a_derive.trust import TrustStore
 from d2a_derive.validator import validate_recipe_schema, validate_provides
@@ -193,3 +194,154 @@ def _dep_importable(dep: str) -> bool:
         return True
     except Exception:                            # noqa: BLE001
         return False
+
+
+# ── registry hygiene: list / show (Phase 5) ──────────────────────────────────
+
+def _fingerprint(pubkey: str) -> str:
+    """Short author fingerprint (first 16 hex + ellipsis) — the width the gate
+    messages already use, so an author is recognisable across the whole toolchain."""
+    return (pubkey[:16] + "…") if pubkey else "(none)"
+
+
+def _raw_summary(child: Path, trust: TrustStore) -> dict:
+    """A hygiene summary of one package DIR read raw (parsed, not admitted, never
+    executed) so a rejected/untrusted package still shows up in `list`/`show`."""
+    try:
+        pkg = RecipePackage.load(child)
+    except RecipeFormatError as exc:
+        return {"dir": child.name, "malformed": str(exc), "name": child.name}
+    r = pkg.recipe
+    provides = r.get("provides") if isinstance(r.get("provides"), dict) else {}
+    return {
+        "dir":         child.name,
+        "name":        r.get("name", ""),
+        "version":     r.get("version", ""),
+        "provides":    provides.get("name", ""),
+        "author":      pkg.author_pubkey,
+        "fingerprint": _fingerprint(pkg.author_pubkey),
+        "trusted":     trust.is_trusted(pkg.author_pubkey),
+        "tier":        provides.get("consent_tier", ""),
+        "requires":    [req.get("capability_hint") for req in (r.get("requires") or [])
+                        if isinstance(req, dict)],
+        "fidelity":    provides.get("fidelity", ""),
+        "cannot_detect": provides.get("cannot_detect", []),
+    }
+
+
+def summarize(recipes_dir, trust: TrustStore | None = None,
+              metrics: MetricsStore | None = None) -> list[dict]:
+    """Summarize every package in `recipes_dir`, annotated with admission status
+    (admitted, or rejected + code) from a real Registry load, and — Phase 6 — the
+    recipe's observed-runtime QUARANTINE flag + lifetime metrics from `metrics`.
+    Returns one dict per package dir, sorted by name."""
+    recipes_dir = Path(recipes_dir)
+    trust = trust if trust is not None else TrustStore()
+    metrics = metrics if metrics is not None else MetricsStore()
+    reg = Registry(recipes_dir=recipes_dir, trust=trust)   # runs the full pipeline
+    admitted = {lr.recipe_name for lr in reg.loaded}
+    rejected = {Path(re.dir).name: re.code for re in reg.rejected}
+
+    out = []
+    if recipes_dir.is_dir():
+        for child in sorted(recipes_dir.iterdir()):
+            if not child.is_dir():
+                continue
+            s = _raw_summary(child, trust)
+            if s.get("name") in admitted and "malformed" not in s:
+                s["status"] = "admitted"
+            else:
+                s["status"] = "rejected"
+                s["reject_code"] = rejected.get(child.name, "unknown")
+            # metrics are keyed by recipe_name (== recipe.json "name"). Never silent:
+            # a quarantined recipe is flagged here and requires an explicit opt-in to
+            # be planned (see planner + explain).
+            rname = s.get("name") or ""
+            s["quarantined"] = metrics.is_quarantined(rname)
+            s["metrics"] = metrics.get(rname).summary()
+            out.append(s)
+    return out
+
+
+def _cmd_list(recipes_dir, trust, metrics=None) -> int:
+    rows = summarize(recipes_dir, trust, metrics)
+    if not rows:
+        print(f"(no recipe packages in {Path(recipes_dir)})")
+        return 0
+    print(f"{'NAME':<26} {'VERSION':<9} {'TIER':<10} {'TRUST':<8} "
+          f"{'STATUS':<10} {'QUAR':<6} {'AUTHOR':<18} REQUIRES")
+    for s in rows:
+        if "malformed" in s:
+            print(f"{s['dir']:<26} {'-':<9} {'-':<10} {'-':<8} {'malformed':<10} "
+                  f"{'-':<6} {'-':<18} {s['malformed']}")
+            continue
+        trust_s = "trusted" if s["trusted"] else "UNTRUSTED"
+        status = s["status"] if s["status"] == "admitted" else f"× {s.get('reject_code','')}"
+        quar = "QUAR" if s.get("quarantined") else "-"
+        print(f"{s['name']:<26} {s['version']:<9} {s['tier']:<10} {trust_s:<8} "
+              f"{status:<10} {quar:<6} {s['fingerprint']:<18} {', '.join(s['requires'])}")
+    return 0
+
+
+def _cmd_show(recipes_dir, trust, name: str, metrics=None) -> int:
+    recipes_dir = Path(recipes_dir)
+    child = recipes_dir / name
+    if not child.is_dir():
+        print(f"no such recipe package: {name} (in {recipes_dir})")
+        return 1
+    rows = {s["dir"]: s for s in summarize(recipes_dir, trust, metrics)}
+    s = rows.get(name) or _raw_summary(child, trust)
+    if "malformed" in s:
+        print(f"{name}: MALFORMED — {s['malformed']}")
+        return 1
+    print(f"recipe package : {s['name']}  (dir {s['dir']})")
+    print(f"  version      : {s['version']}")
+    print(f"  provides     : {s['provides']}")
+    print(f"  author       : {s['author']}")
+    print(f"  fingerprint  : {s['fingerprint']}")
+    print(f"  trusted      : {'yes' if s['trusted'] else 'NO'}")
+    print(f"  consent tier : {s['tier']}")
+    print(f"  requires     : {', '.join(s['requires']) or '(none)'}")
+    print(f"  status       : {s.get('status', '?')}"
+          + (f"  ({s['reject_code']})" if s.get("status") == "rejected" else ""))
+    print(f"  fidelity     : {s['fidelity']}")
+    print(f"  cannot_detect: {len(s['cannot_detect'])} blind spot(s)")
+    for c in s["cannot_detect"]:
+        print(f"    · {c}")
+    # Phase 6: observed-runtime record on THIS machine (advisory — informs planning).
+    m = s.get("metrics") or {}
+    print(f"  quarantined  : {'YES — needs --include-quarantined / re-run conformance to clear' if s.get('quarantined') else 'no'}")
+    print(f"  observed     : runs={m.get('runs', 0)} "
+          f"failure_rate={m.get('failure_rate', 0.0)} heal_rate={m.get('heal_rate', 0.0)} "
+          f"mean_staleness_s={m.get('mean_staleness_s', 0.0)}")
+    lc = m.get("last_conformance")
+    print(f"  conformance  : {('passed' if lc.get('passed') else 'FAILED') if lc else '(never run)'}")
+    return 0
+
+
+def main(argv=None) -> int:
+    import argparse
+    from d2a import crypto
+
+    ap = argparse.ArgumentParser(
+        prog="python -m d2a_derive.registry",
+        description="Inspect the local recipe registry (hygiene).")
+    ap.add_argument("--recipes-dir", default=None,
+                    help="registry dir (default <d2a_home>/recipes)")
+    sub = ap.add_subparsers(dest="cmd", required=True)
+    sub.add_parser("list", help="list every installed package with trust + status")
+    sp = sub.add_parser("show", help="show one package in detail")
+    sp.add_argument("name")
+    args = ap.parse_args(argv)
+
+    recipes_dir = args.recipes_dir if args.recipes_dir is not None \
+        else (crypto.d2a_home() / "recipes")
+    trust = TrustStore()
+    metrics = MetricsStore()
+    if args.cmd == "list":
+        return _cmd_list(recipes_dir, trust, metrics)
+    return _cmd_show(recipes_dir, trust, args.name, metrics)
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

@@ -64,11 +64,20 @@ from d2a_derive.validator import (
     DERIVE_MAX_INPUT_HZ, DERIVE_META_KEYS,
 )
 from d2a_derive.dryrun import dry_run, DryRunResult
-from d2a_derive.registry import Registry, LoadedRecipe, RecipeError
+from d2a_derive.registry import Registry, LoadedRecipe, RecipeError, summarize
 from d2a_derive.planner import Planner, NeedResult, DerivationPlan, Provenance, effective_tier
 from d2a_derive.executor import DerivedCapability, InputFeed
 from d2a_derive.healer import SelfHealer
 from d2a_derive.monitor import StalenessMonitor
+# Phase 5 — community distribution (application layer, stdlib only)
+from d2a_derive.remote import (
+    open_source, RemoteSource, DirectorySource, UrlSource, RemoteSourceError,
+)
+from d2a_derive.install import run_install, InstallResult
+from d2a_derive.conformance import run_conformance
+# Phase 6 — observed-cost ranking, quarantine, and the explanation of the decision
+from d2a_derive.metrics import MetricsStore, RecipeMetrics
+from d2a_derive.explain import explain, format_explanation
 
 __all__ = [
     "errors",
@@ -81,4 +90,9 @@ __all__ = [
     "Planner", "NeedResult", "DerivationPlan", "Provenance", "effective_tier",
     # Phase 2 — live derivation
     "DerivedCapability", "InputFeed", "SelfHealer", "StalenessMonitor",
+    # Phase 5 — community distribution
+    "open_source", "RemoteSource", "DirectorySource", "UrlSource", "RemoteSourceError",
+    "run_install", "InstallResult", "run_conformance",
+    # Phase 6 — observed-cost ranking + quarantine + explanation
+    "MetricsStore", "RecipeMetrics", "explain", "format_explanation",
 ]

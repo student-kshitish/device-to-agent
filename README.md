@@ -682,6 +682,162 @@ Here `activity_summary` *declares* `open`, but the chain-max rule keeps it **sen
 
 Run it: **`python3 examples/chain_demo.py`** — builds `compute → presence → activity_summary` live (fully local), prints the lineage above, then shows the same chain across the wire (one agent publishes `presence`, a stranger consumes it).
 
+### Phase 5 — the registry as community infrastructure
+
+Phases 1–4 made a recipe *runnable*; Phase 5 makes it *distributable*. The recipe
+registry stops being "a local folder only KB writes to" and becomes **community
+infrastructure**: recipes travel from an author to a stranger through an explicit,
+mechanical **review-then-trust** flow, and a conformance runner produces the artifact
+a future community PR review would attach. This is **still pure application layer — no
+protocol change, stdlib only.** Distribution is a matter of *reading files and
+verifying signatures*, not new wire verbs.
+
+**The lifecycle — author → sign → publish → review → install → conformance:**
+
+1. **author** — `python -m d2a_derive.new <name>` scaffolds a package
+   (`recipe.json` + `transform.py` + `test_frames.json`) with **every mandatory
+   honesty field present but empty** (`fidelity: ""`, `cannot_detect: []`). The
+   format's constitution is enforced *at authoring time*: the file physically cannot
+   omit the fields, only leave them unfilled.
+2. **sign** — `python -m d2a_derive.sign <dir> <keyname>` now runs a **self-check gate
+   before it will write a signature**: it refuses a package whose `fidelity` /
+   `cannot_detect` are empty, and refuses one that **fails its own dry-run**. *You
+   cannot sign a recipe that fails itself, or that won't state its blind spots.*
+3. **publish** — copy the signed package into a directory of packages (`<base>/<name>/…`)
+   and share it: commit it to a git repo, drop it on a static file host, mount a USB
+   stick. There is **no server and no API** — a "registry" is just a directory laid
+   out `<base>/<name>/{recipe.json,transform.py,test_frames.json}`.
+4. **review + install** — `python -m d2a_derive.install <source> <name>` fetches the
+   package (from a **local directory** — including a git repo *you* cloned; we never
+   shell out to git — or a **raw http(s) URL**) into a throwaway staging dir, verifies
+   the signature against the **embedded** author key, then **prints the whole review to
+   your terminal**: author fingerprint, requires/provides, effective-tier implications,
+   `fidelity`, `cannot_detect`, **and the full `transform.py`**. It then requires a
+   **typed confirmation** — a *new* (untrusted) author demands the stronger
+   `author-trust` (installing extends trust to that key for *all* their future
+   recipes, and you must say so); an already-trusted author accepts `yes`. Only then is
+   the package copied into `~/.d2a/recipes/` and the author added to
+   `trusted_authors.json`. A duplicate `name+version` is refused (`recipe_duplicate`);
+   a **new version is new code and re-runs the entire review** (`--yes-i-reviewed` is
+   the deliberately un-typo-able non-interactive escape hatch).
+5. **conformance** — `python -m d2a_derive.conformance <name>` emits a machine-readable
+   `{recipe, version, dry_run, live, environment, passed}` report. It runs the dry-run
+   gate **twice from fresh module state** (catching nondeterminism that survives a
+   single in-process gate — e.g. an import-time seed), plus, *when the recipe's inputs
+   are satisfiable by live local capabilities*, a **bounded live run** against a real
+   `DeviceRuntime` + `RemoteAgent` asserting outputs validate against `provides`, no
+   exception escapes, the capability stays `active`, and staleness stays in bound. A
+   recipe whose inputs can't be produced locally reports `live.ran = false` — not a
+   failure. This report is the artifact a maintainer would attach to a merge review.
+
+`python -m d2a_derive.registry list` / `show <name>` round out registry hygiene:
+name, version, author fingerprint, trusted?, tier, requires, and admission status —
+so a *rejected* or *untrusted* package still shows up (read raw, never executed).
+
+**Trust v1 — restated verbatim, because Phase 5 changes none of it.** A recipe loads
+**only** if **(a)** its signature verifies against its embedded `author_pubkey` **and
+(b)** that pubkey is in the user's `~/.d2a/trusted_authors.json` (the explicit
+*review-then-trust* install step). **Loading `transform.py` IS executing it** —
+`importlib` runs the module's code, and every `on_frame` call runs recipe-author code
+in-process and **unsandboxed**. The signature therefore proves **AUTHORSHIP, not
+SAFETY**. The only structural safeguard is ordering: the **trust gate runs strictly
+before `importlib`**, so untrusted code is never imported — but a *trusted* author's
+bug or malice is out of scope for v1 and is documented, not silently mitigated.
+
+**Say it plainly: this is review-then-trust, and there is no sandbox.** The install
+flow makes the review *mechanical and unavoidable* — it prints the transform to your
+screen and will not proceed without a typed acknowledgement — but **the review IS the
+security model**. Nothing here inspects the transform for malice; loading it later
+will execute it with your privileges. A community registry built on this is curated
+exactly the way **early Homebrew** was: a maintainer *curates by refusing merges* —
+reading each recipe, checking the conformance report, vouching for the author — and
+consumers trust that human judgement plus their own review at install time. There is
+no automated gate that makes a malicious recipe safe; there is a chain of humans who
+each looked. Phase 5 makes that chain *legible* (signed authorship, a mechanical
+review, a reproducible conformance artifact) — it does not replace it with a machine.
+
+**Written deferrals, with reasons:**
+
+- **Natural-language goal interpretation** — *deferred.* `install`/`conformance`
+  operate on an explicit recipe **name**, and the planner still satisfies an explicit
+  capability name, not a phrase like "figure out if someone's home." Mapping fuzzy
+  intent to a capability (and to the *honest* substitute for it) is a research problem
+  whose failure mode is silently binding the *wrong* proxy — worse than an honest "no
+  recipe." It stays out until it can be done without eroding the consent/fidelity
+  guarantees the rest of the arc is built on.
+- **Automatic malicious-logic detection** — *deferred, and deliberately so.* Nothing in
+  the sign/install/conformance path analyses `transform.py` for hostile behaviour;
+  the self-check proves a recipe is *honest about its outputs and passes its own
+  frames*, not that it is *safe*. Static/dynamic malice detection on arbitrary Python is
+  undecidable in general and a false sense of security in practice — a partial detector
+  that says "looks clean" is more dangerous than no detector, because it undermines the
+  review the security model actually depends on. v1 is explicit that the human review
+  is the boundary; a real answer here is sandboxing (seccomp/subprocess/WASM), tracked
+  as its own future arc, not a bolt-on classifier.
+
+### Phase 6 — observed-cost ranking & quarantine
+
+The ten-component table always listed a **cost optimizer** as deferred:
+`cost_rank_hint` is an *author's guess*. Phase 6 makes it real — not with ML, but
+with the data the system now **generates on its own**: the health snapshots, heal
+counts, staleness, and conformance reports Phases 2–5 already produce. A small,
+per-recipe record (`d2a_derive/metrics.py`, persisted at
+`~/.d2a/derive_metrics.json`) turns that stream into something the planner ranks by
+and can **explain**. Still pure application layer — no protocol change, stdlib only.
+
+**What is measured.** Per recipe, rolling over every live run on this machine:
+`runs`, `total_uptime`, `heal_count` (successful input rebinds — a proxy for input
+flakiness), `failed_count` (runs that ended with a required input dead),
+`mean_staleness`, and the last conformance verdict. The executor / healer / monitor
+update *in-memory* accumulators at state transitions; the store is written to disk
+**once per run** (at the `failed` transition or at `close()`, whichever comes first)
+and once per conformance result — **there are no per-frame writes** (a run emitting
+hundreds of frames writes its metrics exactly once; a test asserts the bound).
+
+**The ranking formula (deterministic, documented).** Within a preference tier the
+planner orders candidates lowest-first by a plain lexicographic key:
+
+```
+(observed_score)  →  (cost_rank_hint)  →  (num_inputs)
+observed_score = (failure_rate, heal_rate, mean_staleness)
+```
+
+We only ever **penalise** observed badness: a flawless record scores the same
+`(0,0,0)` as *no* record, so measured history can demote a demonstrably-flaky recipe
+but never *promote* one over an untested peer on optimism alone. A no-history recipe
+scores `(0,0,0)` and falls through to the author's `cost_rank_hint` — **cold start
+honest: no data beats no data.**
+
+**The strict invariant — metrics NEVER override the preference tiers.** A real
+provider is chosen in *step 1* of `need()`, before any recipe or metric is consulted;
+a two-hop chain is only considered in a separate pass after single-hop fails. So a
+*flaky real provider still beats a perfect derived one*, and a *reliable two-hop chain
+never beats a shakier single hop*. **Fidelity honesty outranks measured reliability,
+always** — a derivation is a coarse proxy, and no amount of local uptime changes what
+it structurally cannot see. Metrics only ever re-order recipes *within* one tier.
+
+**The explanation is the feature.** `python -m d2a_derive.explain <capability>`
+prints *why* the planner would pick what it picks: every recipe that provides the name
+with its lifetime metrics and its exact ranking key, the pick, and the **single
+deciding factor** between the pick and the runner-up (which component of the key broke
+the tie). It imports the planner's own `ranking_key`, so the explanation can never
+drift from the decision. `derive_demo.py` prints an `explain()` for its live chain.
+
+**Quality gate — quarantine.** A recipe whose `failed_count/runs` exceeds a documented
+threshold (`> 0.5` over `≥ 3` runs — one unlucky failure never quarantines) is flagged
+**quarantined**; a failed conformance run sets the same flag directly, regardless of
+run count. A quarantined recipe is **never silently skipped and never silently used**:
+`registry list`/`show` surface it, and the planner **refuses to plan it** (code
+`recipe_quarantined`, naming the excluded recipe) unless you pass `include_quarantined`
+explicitly. The flag **clears only on a passing conformance run** — re-verify to
+reinstate.
+
+**The honest limit (say it plainly).** These metrics measure **THIS machine's history
+with a recipe** — its providers, its network, its load — **not the recipe's quality in
+the abstract.** A recipe that heals constantly here may be flawless on a stabler LAN.
+They **inform** the planner's tie-breaking; they do **not certify** a recipe, and they
+never touch the consent rule or the preference tiers. They inform; they do not certify.
+
 ### Protocol gaps — status
 
 1. **Per-field native cadence — CLOSED (v1.5, 2026-07-12).** Manifest reading fields carry an optional `"hz"`; the derivation contract-checker compares `min_hz` against the provider's declared cadence when present, falling back to the `MAX_SAMPLE_HZ` clamp only when it is absent. *(Shipped hardware manifests do not yet self-report cadence, so they use the clamp fallback — populating real kernel cadences is follow-up, not a protocol gap.)*
@@ -740,6 +896,8 @@ Each device probes itself at startup using `/proc/meminfo`, `/proc/loadavg`, `/s
 - **Live derivation (Phase 2, `d2a_derive/executor.py` + `healer.py` + `monitor.py`): `DerivedCapability` binds each input under an auto-renewed lease over LAN *and* DHT, feeds the transform (subscribe or bounded pull) with dotted-field resolution + declared unit scaling, `reading()`/`health()`/`close()`; self-heals on lease loss (`lease_expired` → bounded rebind, `device_shutdown` → mark gone + slow rediscovery), required-gone → `failed` / optional-gone → `degraded` with `on_state_change`, gap resync, per-input staleness → `degraded` + recovery; clean close leaves zero device residue** — `python3 examples/derive_demo.py`.
 - **Published derived capabilities on-wire (Phase 3, v1.5): `DerivedCapability.publish(runtime)` registers a live derivation through the existing `_register_virtual` path so any agent can discover, bind, read, and subscribe to it over LAN + DHT — effective-tier policy (sensitive derived denies unapproved consumers, no bypass), signed derived-provenance manifest (`derived`/`recipe`/`fidelity`/`cannot_detect`), per-field `hz` cadence, `derived_state` in the reading envelope, and lifecycle coupling (required-input death → unpublish + `derived_input_failed`; publisher shutdown → `device_shutdown`). Four-recipe universal pack across four device classes** — closes derivation protocol gaps 1 + 3.
 - **Multi-hop derivation chaining (Phase 4, application layer — no protocol change): a recipe's `requires` may be met by a derived capability, so derivations stack (`compute → presence → activity_summary`) both fully-local (planner instantiates the inner recipe) and across-the-wire (consume another agent's published derived cap) on LAN + DHT; strict preference (real > single-hop > two-hop), `MAX_DERIVATION_DEPTH = 2` safety rail, cycle + depth guards (distinct refusal codes), nested provenance with chain-max tier + `cannot_detect` union + concatenated fidelity, and inner-failure propagation through the existing healer/lifecycle state machine** — `python3 examples/chain_demo.py`.
+- **Recipe distribution as community infrastructure (Phase 5, application layer — no protocol change, stdlib only): fetch a signed package from a local directory (a git repo you cloned — no shelling out) or a raw http(s) URL; a mechanical review-then-trust `install` (verify sig → print author fingerprint + requires/provides + effective tier + `fidelity`/`cannot_detect` + the full `transform.py` → typed confirmation, stronger `author-trust` for a new author) that lands the package + trust entry, refuses bad-sig / duplicate-version, and re-reviews a bumped version as new code; a `sign` self-check gate that refuses missing honesty fields or a failing dry-run; `new` scaffolding with the honesty fields present-but-empty; a `conformance` runner emitting a machine-readable `{dry_run, live, environment, passed}` report (dry-run twice across reloads + bounded live run); `registry list`/`show` hygiene** — see [Phase 5](#phase-5--the-registry-as-community-infrastructure).
+- **Observed-cost ranking & quarantine (Phase 6, application layer — no protocol change, stdlib only): the deferred cost optimizer made real from the data the system already generates. A bounded, persistent per-recipe metrics store (`derive_metrics.json`: runs, uptime, heal/failed counts, mean staleness, last conformance — one disk write per run, no per-frame IO) feeds a deterministic within-tier ranking `(observed_score → cost_rank_hint → num_inputs)` where `observed_score = (failure_rate, heal_rate, mean_staleness)`; the strict invariant holds structurally (real > single-hop > two-hop is never overridden — fidelity honesty outranks measured reliability); cold-start recipes rank by hint alone; `python -m d2a_derive.explain <cap>` prints WHY the planner picks what it picks (naming the deciding factor, off the planner's own ranking key); a quarantine quality-gate (failure-rate threshold or a failed conformance run) that `registry list`/`show` surface and the planner refuses to plan without `include_quarantined`, cleared only by a passing conformance run** — see [Phase 6](#phase-6--observed-cost-ranking--quarantine).
 - Sense Layer Part 1: all 4 shapes, verdict + confidence, CPU burn load test; **verdict-transition `event_emitter` + `safety_check` hooks closed (Part 2)**
 - Full 10-stage Capability Composition: plan → atomic bind → runtime monitor + fallback → atomic release
 - Consent policy: safe defaults, sensitive = denied unless owner opts in
@@ -806,6 +964,27 @@ d2a/composition/
 ├── atomic_binder.py       All-or-nothing bind with reverse rollback
 ├── runtime_monitor.py     On-demand health check + optional daemon loop
 └── release_manager.py     Idempotent release of all bindings
+
+d2a_derive/                Capability derivation (application layer — no protocol change, stdlib only)
+├── recipe.py              Recipe-package on-disk format + canonical Ed25519 signing
+├── trust.py               Explicit author trust store (trusted_authors.json)
+├── validator.py           Recipe schema + provides-manifest + requires contract-check
+├── loader.py              transform.py import (loading IS executing — trust-gated)
+├── dryrun.py              Dry-run admission gate (validates output; runs twice = determinism)
+├── registry.py            Local registry: admission pipeline + list/show hygiene (Phase 5)
+├── planner.py             need(): direct → match → contract → cost-rank → dry-run → plan; multi-hop
+├── executor.py            DerivedCapability: live bind/feed/heal + publish() on-wire (Phase 2–3)
+├── healer.py              Lease-loss self-healing state machine (Phase 2)
+├── monitor.py             Per-input staleness monitor (Phase 2)
+├── remote.py              Fetch a package from a directory OR raw http(s) URL (Phase 5)
+├── install.py             Mechanical review-then-trust install flow (Phase 5)
+├── conformance.py         Dry-run-twice + bounded live run → machine-readable report (Phase 5)
+├── metrics.py             Per-recipe observed-runtime record + quarantine policy (Phase 6)
+├── explain.py             `python -m d2a_derive.explain <cap>` — why the planner picks it (Phase 6)
+├── new.py                 Scaffold a package with honesty fields present-but-empty (Phase 5)
+├── sign.py                One-command signing with a self-check gate (Phase 5)
+├── demo_scaffolding.py    Synthetic demo_odometry source (the one capability nothing ships)
+└── reference_recipes/     The shipped signed pack (4 recipes, 4 device classes)
 
 runtimes/
 └── device_runtime.py      Full device node: probes + broker + swarm + sense + composition

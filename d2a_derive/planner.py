@@ -35,6 +35,7 @@ standing up devices.
 from dataclasses import dataclass, field
 
 from d2a_derive import errors
+from d2a_derive.metrics import MetricsStore
 from d2a_derive.registry import Registry, LoadedRecipe
 from d2a_derive.validator import check_input_against_provider
 
@@ -50,6 +51,19 @@ _ORDER_TIER = {v: k for k, v in _TIER_ORDER.items()}
 # the trust surface (you now trust every author in the lineage), and multiplies the
 # debugging cost when the top-level number looks wrong. Raise it only with eyes open.
 MAX_DERIVATION_DEPTH = 2
+
+
+def ranking_key(metrics: MetricsStore, lr: LoadedRecipe) -> tuple:
+    """The planner's within-tier ordering key — lowest-first, lexicographic:
+
+        (observed_score)  →  (cost_rank_hint)  →  (num_inputs)
+
+    where observed_score = (failure_rate, heal_rate, mean_staleness) from the metrics
+    store. Exposed as a MODULE FUNCTION so `_pick` (the decision) and explain.py (the
+    explanation of the decision) rank by the EXACT same key — the explanation can
+    never drift from what the planner actually does. A no-history recipe scores
+    (0,0,0) and falls through to the author's cost_rank_hint (cold start honest)."""
+    return (metrics.observed_score(lr.recipe_name), lr.cost_rank_hint, len(lr.requires))
 
 
 def effective_tier(tiers) -> str:
@@ -135,10 +149,20 @@ def _provider_ok(p: dict) -> bool:
 
 
 class Planner:
-    def __init__(self, registry: Registry, discover):
-        """discover(capability_name) -> list[ProviderInfo{node_id, name, manifest}]."""
+    def __init__(self, registry: Registry, discover, *,
+                 metrics: MetricsStore | None = None,
+                 include_quarantined: bool = False):
+        """discover(capability_name) -> list[ProviderInfo{node_id, name, manifest}].
+
+        Phase 6: `metrics` is the observed-runtime store used to (a) rank recipes
+        within a preference tier by observed cost and (b) EXCLUDE quarantined recipes
+        from candidacy unless `include_quarantined` is set. An empty store (the cold
+        default, and every fresh test home) leaves ranking identical to Phase 1 — a
+        no-history recipe scores (0,0,0) and falls through to cost_rank_hint."""
         self.registry = registry
         self.discover = discover
+        self.metrics = metrics if metrics is not None else MetricsStore()
+        self.include_quarantined = include_quarantined
 
     def need(self, name: str, constraints: dict | None = None) -> NeedResult:
         """Public entry: the top of a chain is derivation level 1."""
@@ -168,6 +192,25 @@ class Planner:
             return NeedResult(outcome="refused", code=errors.NO_RECIPE,
                               detail=f"no recipe provides '{name}' and no direct provider exists")
 
+        # QUALITY GATE (Phase 6) — exclude QUARANTINED recipes from candidacy unless
+        # the caller opted in. A recipe is quarantined by a failure rate over the
+        # documented threshold or by a failed conformance run (metrics.py). This is
+        # NEVER silent: excluded names are surfaced in the refusal reason, and a
+        # recipe is never silently USED either (opt-in is explicit).
+        quarantined_names: list[str] = []
+        if not self.include_quarantined:
+            kept = [lr for lr in recipes
+                    if not self.metrics.is_quarantined(lr.recipe_name)]
+            quarantined_names = [lr.recipe_name for lr in recipes
+                                 if self.metrics.is_quarantined(lr.recipe_name)]
+            recipes = kept
+        if not recipes:
+            return NeedResult(
+                outcome="refused", code=errors.RECIPE_QUARANTINED,
+                detail=f"all recipe(s) providing '{name}' are quarantined "
+                       f"({', '.join(quarantined_names)}) — re-run conformance to clear, "
+                       f"or plan with include_quarantined")
+
         # DEPTH RAIL — a real provider (handled above) is fine at any depth, but a
         # DERIVATION at this level must stay within the rail. This belts the PASS-2
         # gate below: even a level>MAX derivation fed entirely by real leaves is
@@ -178,7 +221,9 @@ class Planner:
                                      f"{MAX_DERIVATION_DEPTH}")
 
         chain_here = _chain + (name,)
-        reasons: list[str] = []
+        # seed the reason trail with any quarantine exclusions so a later refusal
+        # still names them (never silently skipped).
+        reasons: list[str] = [f"{n}: quarantined (excluded)" for n in quarantined_names]
 
         # 3a. SINGLE-HOP PASS — every input satisfied by a REAL discovered provider.
         singles = []
@@ -226,8 +271,19 @@ class Planner:
                           detail="; ".join(reasons))
 
     def _pick(self, candidates: list, level: int) -> NeedResult:
-        """Cost-rank (lowest cost_rank_hint, then fewest inputs), dry-run gate, plan."""
-        candidates.sort(key=lambda c: (c[0].cost_rank_hint, len(c[0].requires)))
+        """Rank within this preference tier, dry-run gate, plan.
+
+        RANKING KEY (Phase 6), lowest-first, lexicographic:
+            (observed score)  →  (cost_rank_hint)  →  (fewest inputs)
+        where observed score = (failure_rate, heal_rate, mean_staleness) from the
+        metrics store. All candidates here are the SAME preference tier (this method
+        is only reached inside one pass — single-hop OR chained), so observed cost
+        only ever re-orders *within* a tier. The STRICT INVARIANT holds structurally:
+        metrics can never lift a derived recipe over a real provider (chosen in step
+        1) nor a two-hop chain over a single hop (separate passes) — fidelity honesty
+        outranks measured reliability. A no-history recipe scores (0,0,0) and falls
+        through to the author's cost_rank_hint (cold start honest)."""
+        candidates.sort(key=lambda c: ranking_key(self.metrics, c[0]))
         lr, mapping = candidates[0]
         if not lr.dry_run.ok:
             return NeedResult(outcome="refused", code=errors.DRYRUN_FAILED,

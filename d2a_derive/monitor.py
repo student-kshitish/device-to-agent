@@ -65,6 +65,13 @@ class StalenessMonitor:
         with dc._lock:
             if dc._closed:
                 return
+            # Phase 6: sample the worst current input staleness for the recipe's
+            # lifetime metrics. In-memory only (dc folds it into this run's mean);
+            # bounded to the monitor's own cadence, never a per-frame write.
+            samples = [now - f.last_frame_ts for f in dc._feeds
+                       if f.last_frame_ts and not f.is_inner]
+            if samples:
+                dc._note_staleness_locked(max(samples))
             for feed in dc._feeds:
                 # only an ACTIVE input can go stale here; rebinding/gone belong to
                 # the healer, and a not-yet-fed input has no baseline to judge. A
