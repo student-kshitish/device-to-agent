@@ -79,6 +79,11 @@ class ResourcePolicy:
         """
         if not is_remote:
             return "allow"
+        # Guard: a malformed request may carry a non-string (unhashable) capability
+        # name; treat anything that isn't a known string rule as needs_approval
+        # (safe default) instead of raising on the dict lookup.
+        if not isinstance(resource_name, str):
+            return "needs_approval"
         return self._rules.get(resource_name, "needs_approval")
 
     def approve(self, resource_name: str, agent_id: str) -> bool:

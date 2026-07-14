@@ -189,6 +189,22 @@ def _truth(op: str, current, value) -> bool:
     return False
 
 
+def satisfied(condition: dict, reading) -> bool:
+    """
+    One-shot (NON-edge) truth of a validated comparison condition against a single
+    reading. Used by the Phase 8 intervention VERIFY: "does the declared condition
+    hold NOW, after the mutation?" — distinct from EdgeEvaluator's False→True
+    crossing semantics (a verify is a definite predicate on the current state, not
+    an edge). An absent field is never true. op == "changed" has no one-shot
+    meaning and is rejected at plan-validation time; here it returns False.
+    """
+    op = condition.get("op")
+    if op == "changed":
+        return False
+    current = extract(reading, condition.get("field"))
+    return _truth(op, current, condition.get("value"))
+
+
 class EdgeEvaluator:
     """
     Per-subscription edge/re-arm state machine for ONE validated condition.

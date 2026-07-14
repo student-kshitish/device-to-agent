@@ -506,3 +506,279 @@ class NetworkMetaSource(SignalSource):
         except Exception:
             _warn_once("network", "NetworkMetaSource: read failed")
             return None
+
+
+# ── DIAGNOSTIC SOURCES (Phase 7) — read-only subsystem self-inspection ─────────
+# A diagnostic lets an agent SEE a subsystem's failure state BEFORE any fix is
+# attempted. Every diagnostic is READ-ONLY (reads /proc, /sys, or a read-only
+# query to a standard tool) and NEVER mutates state. All are Linux-specific;
+# each degrades gracefully where its source is absent (observable=False + reason,
+# NEVER an unhandled FileNotFoundError), so a diagnostic on a machine without the
+# subsystem answers honestly instead of crashing.
+#
+# READING CONTRACT (shared): every diagnostic reading carries
+#   observable : bool  — could the primary signal actually be inspected here?
+#   reason     : str   — "" when fully observable; else why it degraded.
+# plus a boolean "state" field (present / loaded / active / …) that is the
+# condition-subscribable field. "unknown" is modelled as the boolean's safe
+# default (e.g. present=False) WITH observable=False + reason — this keeps the
+# field a real boolean so an eq-on-bool condition validates & evaluates cleanly,
+# rather than overloading it with a string sentinel.
+
+class _DiagnosticSource(SignalSource):
+    """Base for a read-only diagnostic. Subclasses implement _observe() and must
+    never raise; read() is the never-raise firewall that turns any unexpected
+    failure into an honest observable=False reading (not a crash)."""
+
+    family: str = "diagnostic"
+
+    def _base(self) -> dict:
+        return {"observable": False, "reason": ""}
+
+    def _observe(self) -> dict:
+        raise NotImplementedError
+
+    def read(self) -> dict | None:
+        try:
+            return self._observe()
+        except Exception as e:
+            _warn_once(self.family, f"{self.family}: read failed")
+            out = self._base()
+            out["reason"] = f"unexpected error: {type(e).__name__}"
+            return out
+
+
+def _fd_holders(target_real: str, limit: int = 16) -> list[int]:
+    """PIDs holding an open fd on `target_real`, via a read-only /proc/*/fd scan.
+    Best-effort: fds owned by other users are invisible without privilege; those
+    processes are silently skipped (a permission error is not a failure here)."""
+    holders: list[int] = []
+    if not os.path.isdir("/proc"):
+        return holders
+    for pid_dir in glob.glob("/proc/[0-9]*/fd"):
+        try:
+            pid = int(os.path.basename(os.path.dirname(pid_dir)))
+        except ValueError:
+            continue
+        try:
+            for fd in os.listdir(pid_dir):
+                try:
+                    if os.path.realpath(os.path.join(pid_dir, fd)) == target_real:
+                        holders.append(pid)
+                        break
+                except OSError:
+                    continue
+        except OSError:
+            # /proc/<pid>/fd unreadable (other user, or process gone) — skip.
+            continue
+        if len(holders) >= limit:
+            break
+    return sorted(holders)
+
+
+class DeviceNodeHealthSource(_DiagnosticSource):
+    """Existence + permissions of a device node (e.g. /dev/video0) and which PIDs
+    hold it open. Reads the filesystem + /proc only; NEVER opens the device."""
+
+    family = "device_node_health"
+    name   = "device_node_health"
+
+    def __init__(self, path: str) -> None:
+        self.path = path
+
+    def _observe(self) -> dict:
+        out = self._base()
+        out["path"] = self.path
+        # The filesystem always answers existence/permissions on any POSIX host,
+        # so the primary signal is observable everywhere; only the holder scan can
+        # degrade (no /proc), which we note without failing the whole reading.
+        out["observable"] = True
+        present  = os.path.exists(self.path)
+        out["present"]  = present
+        out["readable"] = bool(present and os.access(self.path, os.R_OK))
+        if present:
+            target_real = os.path.realpath(self.path)
+            out["holder_pids"] = _fd_holders(target_real)
+            if not os.path.isdir("/proc"):
+                out["reason"] = "/proc absent — holder PIDs not scannable"
+        else:
+            out["holder_pids"] = []
+        # Scalar mirror of holder_pids so a condition (and the Phase 8 intervention
+        # VERIFY) can check "the node has been released" as holder_count == 0.
+        out["holder_count"] = len(out["holder_pids"])
+        return out
+
+
+class KernelModuleHealthSource(_DiagnosticSource):
+    """Whether a named kernel module is loaded (/proc/modules) plus dmesg tail
+    lines mentioning it. dmesg often needs privilege (kernel.dmesg_restrict): we
+    degrade its lines honestly (dmesg_available=False) but keep `loaded`
+    observable from /proc/modules regardless. Read-only throughout."""
+
+    family = "kernel_module_health"
+    name   = "kernel_module_health"
+
+    def __init__(self, module: str, dmesg_tail: int = 5) -> None:
+        self.module     = module
+        self.dmesg_tail = dmesg_tail
+
+    def _observe(self) -> dict:
+        out = self._base()
+        out["module"]          = self.module
+        out["dmesg_available"] = False
+        out["dmesg_lines"]     = []
+
+        mods_path = "/proc/modules"
+        if not os.path.exists(mods_path):
+            # Source absent (non-Linux / no procfs): loaded is UNKNOWN — safe
+            # default False, flagged by observable=False so False≠"confirmed off".
+            out["loaded"]   = False
+            out["reason"]   = "/proc/modules absent — module state unknown"
+            return out
+
+        out["observable"] = True
+        norm = self.module.replace("-", "_")
+        loaded = False
+        try:
+            with open(mods_path) as f:
+                for line in f:
+                    first = line.split(" ", 1)[0]
+                    if first == self.module or first.replace("-", "_") == norm:
+                        loaded = True
+                        break
+        except OSError:
+            out["loaded"] = False
+            out["reason"] = "/proc/modules unreadable — module state unknown"
+            return out
+        out["loaded"] = loaded
+
+        # dmesg is a read-only query; capture the tail lines mentioning the module.
+        if shutil.which("dmesg"):
+            try:
+                r = subprocess.run(["dmesg", "--notime"], capture_output=True,
+                                   text=True, timeout=5)
+                if r.returncode == 0:
+                    out["dmesg_available"] = True
+                    hits = [ln for ln in r.stdout.splitlines()
+                            if norm in ln.replace("-", "_")]
+                    out["dmesg_lines"] = hits[-self.dmesg_tail:]
+                else:
+                    out["reason"] = "dmesg requires privilege (kernel.dmesg_restrict)"
+            except Exception:
+                out["reason"] = "dmesg unavailable"
+        else:
+            out["reason"] = "dmesg not installed"
+        return out
+
+
+class ServiceHealthSource(_DiagnosticSource):
+    """A systemd unit's active-state via `systemctl is-active` / `show` (read-only
+    queries). Supports --user units. Degrades to observable=False where systemctl
+    is absent (non-systemd host)."""
+
+    family = "service_health"
+    name   = "service_health"
+
+    def __init__(self, service: str, user: bool = False) -> None:
+        self.service = service
+        self.user    = user
+
+    def _observe(self) -> dict:
+        out = self._base()
+        out["service"] = self.service
+        out["scope"]   = "user" if self.user else "system"
+        out["active_state"] = "unknown"
+        out["sub_state"]    = "unknown"
+
+        if not shutil.which("systemctl"):
+            out["active"] = False
+            out["reason"] = "systemctl absent — not a systemd host"
+            return out
+
+        out["observable"] = True
+        scope = ["--user"] if self.user else []
+        try:
+            r = subprocess.run(["systemctl", *scope, "show", self.service,
+                                "-p", "ActiveState", "-p", "SubState"],
+                               capture_output=True, text=True, timeout=5)
+            props: dict[str, str] = {}
+            for line in r.stdout.splitlines():
+                if "=" in line:
+                    k, v = line.split("=", 1)
+                    props[k] = v
+            out["active_state"] = props.get("ActiveState", "unknown") or "unknown"
+            out["sub_state"]    = props.get("SubState", "unknown") or "unknown"
+            out["active"]       = (out["active_state"] == "active")
+            if out["active_state"] == "unknown":
+                out["reason"] = "unit not found or state unavailable"
+        except Exception:
+            out["active"] = False
+            out["reason"] = "systemctl query failed"
+        return out
+
+
+class UsbPowerHealthSource(_DiagnosticSource):
+    """Autosuspend / runtime power state of a USB device from sysfs
+    (/sys/bus/usb/devices/<dev>/power/*). Read-only sysfs reads only — writing
+    control here would CHANGE power policy, which we never do. `dev` is a bus id
+    like '3-2' or an absolute sysfs device path."""
+
+    family = "usb_power_health"
+    name   = "usb_power_health"
+
+    def __init__(self, dev: str) -> None:
+        # Accept either a bus id ('3-2') or a full sysfs device path.
+        if os.path.isabs(dev):
+            self.dev_path = dev
+        else:
+            self.dev_path = os.path.join("/sys/bus/usb/devices", dev)
+        self.dev = dev
+
+    def _read_attr(self, name: str) -> str | None:
+        p = os.path.join(self.dev_path, "power", name)
+        try:
+            return open(p).read().strip()
+        except OSError:
+            return None
+
+    def _observe(self) -> dict:
+        out = self._base()
+        out["path"] = self.dev_path
+        out["control"]              = "unknown"
+        out["runtime_status"]       = "unknown"
+        out["autosuspend_delay_ms"] = -1
+
+        if not os.path.isdir(os.path.join(self.dev_path, "power")):
+            out["present"]     = False
+            out["autosuspend"] = False
+            out["reason"]      = "USB device power sysfs absent"
+            return out
+
+        out["observable"] = True
+        out["present"]    = True
+        control = self._read_attr("control")
+        if control is not None:
+            out["control"]     = control
+            out["autosuspend"] = (control == "auto")
+        else:
+            out["autosuspend"] = False
+        status = self._read_attr("runtime_status")
+        if status is not None:
+            out["runtime_status"] = status
+        delay = self._read_attr("autosuspend_delay_ms")
+        if delay is not None:
+            try:
+                out["autosuspend_delay_ms"] = int(delay)
+            except ValueError:
+                pass
+        return out
+
+
+# family → SignalSource class + which __init__ kwarg names the target. The device
+# runtime's attach_diagnostic uses this to build a diagnostic from a family name.
+DIAGNOSTIC_SOURCES: dict[str, type] = {
+    "device_node_health":   DeviceNodeHealthSource,
+    "kernel_module_health": KernelModuleHealthSource,
+    "service_health":       ServiceHealthSource,
+    "usb_power_health":     UsbPowerHealthSource,
+}

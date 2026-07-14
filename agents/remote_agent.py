@@ -491,6 +491,41 @@ class RemoteAgent:
                 self._task_handlers[result["task_id"]] = {"cb": on_complete, "binding_id": bid}
         return response
 
+    def propose_intervention(self, binding: dict, plan: dict,
+                             capability: str = None) -> dict:
+        """
+        Propose a MUTATING intervention plan (Phase 8). The device runs a DOUBLE
+        GATE — this binding already needed owner approval to exist (the right to
+        PROPOSE), and now this specific plan needs its own per-plan owner approval
+        before anything executes. On approval the DEVICE executes the fix and runs
+        the plan's declared VERIFY itself (a diagnostic condition that must hold
+        after) — the verify result is never trusted from the agent.
+
+        `plan` is an InterventionPlan: {action, params, evidence, expected,
+        verify:{diagnostic, condition}, reversible, reversible_how|reversible_ack}.
+
+        Returns {"type":"intervention_result", "status": executed|denied|
+        failed_verify|refused_preflight|error, "approved", "executed", "verify",
+        "reversible", "reversible_how", "plan_hash", "audit_seq", ...} or the
+        unified error shape. NOTE: a fix that ran but whose verify failed comes back
+        status=="failed_verify" (never a silent success).
+        """
+        self._raise_if_lost(binding.get("binding_id", ""))
+        cap    = capability or binding.get("capability_name", "")
+        target = binding.get("provider_node_id", "")
+        bid    = binding.get("binding_id", "")
+        response = self.swarm.send_and_recv(target, {
+            "type":       "propose_intervention",
+            "from_node":  self.agent_id,
+            "binding_id": bid,
+            "capability": cap,
+            "plan":       plan,
+        }, timeout=30.0)   # allows for the mutating subprocess + verify read
+        if not response:
+            return errors.error(errors.NO_RESPONSE, binding_id=bid)
+        self._check_version(response)
+        return response
+
     def task_status(self, binding: dict, task_id: str) -> dict:
         """Poll a long-running task. Returns {"status": running|done|failed|
         cancelled|unknown, "result"?, "error_detail"?}. "unknown" once the task's

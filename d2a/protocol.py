@@ -25,9 +25,15 @@ import logging
 
 # v1.5 (additive): manifest vocabulary gained the optional derived-provenance keys
 # (derived/recipe/fidelity/cannot_detect) and an optional per-field "hz" cadence,
-# so locally derived capabilities publish, discover, and bind like any other. No
-# field renames, no verb changes — same-major peers ignore the new keys.
-PROTOCOL_VERSION = "1.5"
+# so locally derived capabilities publish, discover, and bind like any other.
+# v1.6 (additive): manifest vocabulary gained one optional honesty key,
+# "cannot_observe" — valid on ANY manifest (distinct from the derived-only
+# cannot_detect) — carried by the Phase 7 read-only diagnostic capabilities.
+# v1.7 (additive): the intervention (mutating) layer — a third consent tier
+# "intervention", an optional manifest "cannot_fix" honesty key + a per-action
+# "mutating" flag, and the propose_intervention verb (owner-gated). No field
+# renames — same-major peers ignore the new keys/verb.
+PROTOCOL_VERSION = "1.7"
 VERSION_FIELD = "v"
 
 logger = logging.getLogger("d2a.protocol")

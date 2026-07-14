@@ -1,3 +1,4 @@
+import hashlib
 import inspect
 import os
 import threading
@@ -24,7 +25,10 @@ from d2a.stream_source import (
     ThermalSource, BatterySource, DiskIOSource, NetIOSource,
     CameraMetaSource, MicrophoneMetaSource, LocationMetaSource,
     DisplayMetaSource, StorageSource, NetworkMetaSource,
+    DIAGNOSTIC_SOURCES,
 )
+from d2a.interventions import INTERVENTION_EXECUTORS
+from d2a.audit import AuditLog, AuditError
 from d2a.data_provider import DataProvider
 from d2a.sense_layer import SenseLayer
 from d2a.sense_types import SenseRequest, SenseFrame
@@ -144,6 +148,21 @@ class DeviceRuntime:
         # get_reading / the action verb consult this BEFORE the DataProvider, so
         # virtual caps bind & serve through the SAME broker/lease/policy path.
         self._virtual: dict[str, dict] = {}
+
+        # ── intervention layer (Phase 8) ──────────────────────────────────────
+        # MUTATING capabilities registered via attach_intervention. They are
+        # DELIBERATELY NOT in self._virtual — the ungated `action` verb must never
+        # execute a mutation. Every mutation rides ONLY the propose_intervention
+        # verb, through the DOUBLE GATE (bind approval + per-plan owner approval)
+        # and the signed audit. name -> {executor, family, target, paired_family}.
+        self._interventions: dict[str, dict] = {}
+        # Per-plan owner approval callback: fn(plan: dict, agent_id: str) -> bool.
+        # Default None → DENY (safe). Distinct from policy.approval_callback so the
+        # existing two-tier consent machinery is untouched.
+        self._intervention_approval_callback = None
+        # Signed append-only audit log (lazily created on first use, so a device
+        # that never intervenes writes no file). Keyed by device name + host key.
+        self._audit: AuditLog | None = None
 
         # ── sense layer ───────────────────────────────────────────────────────
         # Nothing runs until handle() is called. Shares the same sources dict as
@@ -931,6 +950,125 @@ class DeviceRuntime:
             return {"type": "action_result", "capability": capability,
                     "binding_id": binding_id, "action": action, "result": result}
 
+        # ── intervention: propose_intervention (Phase 8, MUTATING) ────────────
+        # TOCTOU-free single round: propose → owner gate → execute → device-run
+        # verify → signed audit → result, all here. The agent never re-submits plan
+        # fields between approval and execution — the device acts on the exact
+        # normalized plan it hashed. EVERY terminal path is audited (deny too).
+        if mtype == "propose_intervention":
+            binding_id = message.get("binding_id", "")
+            capability = message.get("capability", "")
+            plan       = message.get("plan")
+            agent_id   = message.get("from_node", "")
+
+            # Type-validate the verb entry up front (rider): a malformed request is
+            # a clean INVALID_PLAN, never a handler crash.
+            if not isinstance(binding_id, str):
+                binding_id = ""
+            if not isinstance(capability, str) or not capability:
+                return errors.error(errors.INVALID_PLAN, "capability must be a string",
+                                    binding_id=binding_id)
+
+            if not self._verify_binding_scope(binding_id, capability):
+                return errors.error(errors.BINDING_INVALID_OR_OUT_OF_SCOPE,
+                                    binding_id=binding_id)
+
+            intv = self._interventions.get(capability)
+            if intv is None:
+                return errors.error(errors.NOT_AN_INTERVENTION_CAPABILITY,
+                                    binding_id=binding_id)
+
+            ok, why, nplan = self._validate_plan(capability, plan)
+            if not ok:
+                return errors.error(errors.INVALID_PLAN, why, binding_id=binding_id)
+
+            plan_hash = hashlib.sha256(crypto.canonical_json(nplan)).hexdigest()
+
+            def _result(status, *, approved, executed, verify, detail="", code=None,
+                        audit_seq=None):
+                out = {
+                    "type":           "intervention_result",
+                    "capability":     capability, "binding_id": binding_id,
+                    "plan_hash":      plan_hash, "status": status,
+                    "approved":       approved, "executed": executed,
+                    "verify":         verify,
+                    "reversible":     nplan["reversible"],
+                    "reversible_how": nplan["reversible_how"],
+                    "detail":         detail, "audit_seq": audit_seq,
+                }
+                if code:
+                    out["code"] = code
+                return out
+
+            _NO_VERIFY = {"ran": False, "passed": False,
+                          "condition": nplan["verify"]["condition"], "reading": {}}
+
+            # FAIL-CLOSED: never intervene (not even prompt) on top of a tampered
+            # audit chain — a mutation we cannot record must not happen.
+            chain_ok, chain_detail = self._audit_log().verify_chain()
+            if not chain_ok:
+                print(f"[{self.name}] propose_intervention REFUSED — audit chain broken: {chain_detail}")
+                return errors.error(errors.AUDIT_SEALED, chain_detail, binding_id=binding_id)
+
+            # Pre-flight (privilege / tool availability) — refuse BEFORE mutating.
+            pf_ok, pf_reason = intv["executor"].preflight()
+            if not pf_ok:
+                entry = self._audit_intervention(
+                    agent_id=agent_id, capability=capability, plan=nplan,
+                    plan_hash=plan_hash, approved=False, executed=False,
+                    verify_outcome="not_run", result_status="refused_preflight",
+                    detail=pf_reason)
+                return _result("refused_preflight", approved=False, executed=False,
+                               verify=_NO_VERIFY, detail=pf_reason,
+                               code=errors.INTERVENTION_PREFLIGHT_REFUSED,
+                               audit_seq=(entry or {}).get("seq"))
+
+            # PER-PLAN owner approval (second gate; default DENY). The owner sees
+            # the FULL normalized plan (incl reversible / reversible_ack).
+            if not self._intervention_approve(nplan, agent_id):
+                entry = self._audit_intervention(
+                    agent_id=agent_id, capability=capability, plan=nplan,
+                    plan_hash=plan_hash, approved=False, executed=False,
+                    verify_outcome="not_run", result_status="denied",
+                    detail="owner declined this plan")
+                print(f"[{self.name}] propose_intervention DENIED by owner "
+                      f"cap={capability} action={nplan['action']}")
+                return _result("denied", approved=False, executed=False,
+                               verify=_NO_VERIFY, detail="owner declined this plan",
+                               code=errors.APPROVAL_REQUIRED,
+                               audit_seq=(entry or {}).get("seq"))
+
+            # APPROVED → execute the mutation, then the DEVICE runs the declared
+            # verify itself (never trusted from the agent).
+            exec_res = intv["executor"].execute(nplan["action"], nplan["params"])
+            executed = bool(exec_res.get("ok"))
+
+            if not executed:
+                entry = self._audit_intervention(
+                    agent_id=agent_id, capability=capability, plan=nplan,
+                    plan_hash=plan_hash, approved=True, executed=False,
+                    verify_outcome="not_run", result_status="error",
+                    detail=exec_res.get("detail", ""))
+                return _result("error", approved=True, executed=False,
+                               verify=_NO_VERIFY, detail=exec_res.get("detail", ""),
+                               code=errors.INTERVENTION_ERROR,
+                               audit_seq=(entry or {}).get("seq"))
+
+            verify = self._run_verify(intv, nplan)
+            status = "executed" if verify["passed"] else "failed_verify"
+            entry = self._audit_intervention(
+                agent_id=agent_id, capability=capability, plan=nplan,
+                plan_hash=plan_hash, approved=True, executed=True,
+                verify_outcome=("pass" if verify["passed"] else "fail"),
+                result_status=status, verify_reading=verify.get("reading"),
+                detail=exec_res.get("detail", ""))
+            print(f"[{self.name}] propose_intervention {status.upper()} "
+                  f"cap={capability} action={nplan['action']} verify={verify['passed']}")
+            return _result(status, approved=True, executed=True, verify=verify,
+                           detail=exec_res.get("detail", ""),
+                           code=(None if verify["passed"] else errors.INTERVENTION_VERIFY_FAILED),
+                           audit_seq=(entry or {}).get("seq"))
+
         # ── async task polling (v1.3 Phase 2) ─────────────────────────────────
         if mtype == "task_status":
             binding_id = message.get("binding_id", "")
@@ -1259,6 +1397,361 @@ class DeviceRuntime:
         self.broker.quotas.pop(cap_name, None)
         print(f"[{self.name}] detach_peripheral  path={path!r}  cap={cap_name}")
         return {"status": "detached", "cap_name": cap_name, "path": path}
+
+    # ── diagnostics on-wire (Phase 7 — read-only self-inspection) ─────────────
+
+    @staticmethod
+    def _diag_slug(s: str) -> str:
+        """Filesystem/wire-safe slug for a diagnostic target (used in cap name)."""
+        return "".join(c if c.isalnum() else "_" for c in s).strip("_").lower() or "target"
+
+    def attach_diagnostic(self, family: str, target: str,
+                          name: str | None = None, **opts) -> dict:
+        """
+        Publish a READ-ONLY diagnostic as a normal manifested, readable,
+        condition-subscribable capability on THIS node.
+
+        A diagnostic lets an agent SEE a subsystem's failure state BEFORE any fix
+        is attempted — it is the read-only half of the fix loop (intervention is a
+        later phase). `family` is one of DIAGNOSTIC_SOURCES; `target` names the
+        concrete subsystem (a device node path, kernel module, systemd unit, or
+        USB bus id). `opts` pass through to the source (e.g. user=True for a
+        --user service, dmesg_tail=N for a module).
+
+        Same risk class as the existing probes: reads /proc, /sys, or a read-only
+        query to a standard tool. It NEVER mutates state. Diagnostics are sensitive
+        (system introspection reveals running processes / device inventory), so a
+        remote agent is DENIED by default and needs explicit owner approval —
+        exactly like camera/microphone.
+
+        Returns the capability descriptor, or {"error": ...} for an unknown family.
+        """
+        cls = DIAGNOSTIC_SOURCES.get(family)
+        if cls is None:
+            return {"error": "unknown_diagnostic_family", "family": family,
+                    "known": sorted(DIAGNOSTIC_SOURCES)}
+
+        source   = cls(target, **opts)
+        man      = _manifest.diagnostic_manifest(family, target)
+        tier     = man["consent_tier"]                       # always "sensitive"
+        cap_name = name or f"diag_{family}_{self._diag_slug(target)}"
+        access   = "consent_required" if tier == "sensitive" else "open"
+
+        # Register the read-only source so get_reading + the shared sampling loop
+        # (streams AND condition-events) drive it exactly like a hardware source.
+        self.data._sources[cap_name] = [source]
+
+        # Consent gate — same path as attach_peripheral / camera-mic. Sensitive →
+        # require_approval (default callback DENIES), so a remote agent can't bind
+        # this introspection surface until the owner opts in.
+        if tier == "sensitive":
+            self.policy.require_approval(cap_name)
+        else:
+            self.policy.allow(cap_name)
+
+        cap = Capability(
+            name=cap_name,
+            tags=[cap_name, access, "diagnostic", family],
+            live_state={"family": family, "target": target, "access": access,
+                        "read_only": True},
+            node_id=self.node_id,
+            public_key=self.public_key,
+            manifest=man,
+        )
+        self.capabilities[cap_name]  = cap
+        self.broker.quotas[cap_name] = 1
+
+        # Best-effort immediate publish (both transports) if the swarm is up; a
+        # diagnostic attached before start_swarm is picked up by publish_capabilities.
+        try:
+            ip, port = self.swarm.address
+            self.swarm.publish(self._capability_record(cap, ip, port))
+        except Exception:
+            pass
+
+        print(f"[{self.name}] attach_diagnostic  family={family}  target={target!r}  "
+              f"cap={cap_name}  access={access}")
+        return {"name": cap_name, "family": family, "target": target,
+                "access": access, "consent_tier": tier, "node_id": self.node_id}
+
+    def detach_diagnostic(self, cap_name: str) -> dict:
+        """Remove a previously attached diagnostic: tears down any binding's
+        streams/events through the unified path, drops the source + capability +
+        quota, and unpublishes the record so discovery drops it immediately."""
+        if cap_name not in self.capabilities or "diagnostic" not in self.capabilities[cap_name].tags:
+            return {"error": "diagnostic_not_found", "cap_name": cap_name}
+        try:
+            infos = self.broker.teardown_capability(cap_name, "shutdown")
+        except Exception:
+            infos = []
+        for info in infos:
+            try:
+                self._cleanup_binding_stream(info["binding_id"])
+            except Exception:
+                pass
+        self.capabilities.pop(cap_name, None)
+        self.broker.quotas.pop(cap_name, None)
+        self.data._sources.pop(cap_name, None)
+        try:
+            self.swarm.unpublish({"node_id": self.node_id, "name": cap_name})
+        except Exception:
+            pass
+        print(f"[{self.name}] detach_diagnostic  cap={cap_name}")
+        return {"status": "detached", "cap_name": cap_name}
+
+    # ── intervention layer on-wire (Phase 8 — MUTATING, double-gated) ─────────
+
+    def set_intervention_approval_callback(self, fn) -> None:
+        """Wire the PER-PLAN owner approval gate: fn(plan: dict, agent_id: str) ->
+        bool. Called for every propose_intervention AFTER preflight. Default (no
+        callback) DENIES — nothing mutates without an explicit owner yes. The
+        callback receives the FULL plan (including reversible / reversible_how) so
+        the owner approves a SPECIFIC plan, not a resource name."""
+        self._intervention_approval_callback = fn
+
+    def _audit_log(self) -> AuditLog:
+        if self._audit is None:
+            self._audit = AuditLog(self.name, self.private_key, self.public_key)
+        return self._audit
+
+    def attach_intervention(self, family: str, target: str,
+                           name: str | None = None, **opts) -> dict:
+        """
+        Publish a MUTATING intervention capability on THIS node — the FIX half of
+        the fix loop (diagnose → plan → approve → execute → verify → audit).
+
+        DOUBLE GATE (deny-by-default): binding this capability needs owner approval
+        (the right to PROPOSE), and every concrete plan needs its own per-plan owner
+        approval (set_intervention_approval_callback) before anything executes.
+
+        `family` ∈ INTERVENTION_EXECUTORS; `target` names the subsystem (a systemd
+        unit / device node / module). `opts` pass to the executor (e.g. user=True).
+        Returns the capability descriptor, or {"error": ...} for an unknown family.
+        """
+        cls = INTERVENTION_EXECUTORS.get(family)
+        if cls is None:
+            return {"error": "unknown_intervention_family", "family": family,
+                    "known": sorted(INTERVENTION_EXECUTORS)}
+
+        executor      = cls(target, **opts)
+        man           = _manifest.intervention_manifest(family, target)
+        tier          = man["consent_tier"]                       # "intervention"
+        paired_family = _manifest.INTERVENTION_PAIRED_DIAGNOSTIC.get(family, "")
+        cap_name      = name or f"intv_{family}_{self._diag_slug(target)}"
+        access        = "consent_required"
+
+        live_state = {"family": family, "target": target,
+                      "paired_diagnostic": paired_family, "mutating": True,
+                      "access": access}
+
+        # Readable through the DEFAULT get_reading path (a proper DataProvider
+        # frame), but NOT registered in self._virtual — so the ungated `action`
+        # verb cannot reach it. Only propose_intervention can mutate.
+        self.data.register_reading_source(cap_name, lambda ls=dict(live_state): dict(ls))
+
+        # BIND-TIME gate (first of the double gate): intervention tier requires
+        # owner approval to even hold a propose-lease. Default approval callback
+        # DENIES, so a remote agent gets nothing without explicit owner opt-in.
+        self.policy.require_approval(cap_name)
+
+        cap = Capability(
+            name=cap_name,
+            tags=[cap_name, access, "intervention", family],
+            live_state=live_state,
+            node_id=self.node_id,
+            public_key=self.public_key,
+            manifest=man,
+        )
+        self.capabilities[cap_name]   = cap
+        self.broker.quotas[cap_name]  = 1
+        self._interventions[cap_name] = {
+            "executor": executor, "family": family, "target": target,
+            "paired_family": paired_family,
+        }
+
+        try:
+            ip, port = self.swarm.address
+            self.swarm.publish(self._capability_record(cap, ip, port))
+        except Exception:
+            pass
+
+        print(f"[{self.name}] attach_intervention  family={family}  target={target!r}  "
+              f"cap={cap_name}  tier={tier}  (double-gated)")
+        return {"name": cap_name, "family": family, "target": target,
+                "paired_diagnostic": paired_family, "consent_tier": tier,
+                "access": access, "node_id": self.node_id}
+
+    def detach_intervention(self, cap_name: str) -> dict:
+        """Remove an intervention capability: tears down bindings, drops the
+        executor + capability + quota + source, and unpublishes the record."""
+        if cap_name not in self._interventions:
+            return {"error": "intervention_not_found", "cap_name": cap_name}
+        try:
+            infos = self.broker.teardown_capability(cap_name, "shutdown")
+        except Exception:
+            infos = []
+        for info in infos:
+            try:
+                self._cleanup_binding_stream(info["binding_id"])
+            except Exception:
+                pass
+        self._interventions.pop(cap_name, None)
+        self.capabilities.pop(cap_name, None)
+        self.broker.quotas.pop(cap_name, None)
+        self.data._sources.pop(cap_name, None)
+        try:
+            self.swarm.unpublish({"node_id": self.node_id, "name": cap_name})
+        except Exception:
+            pass
+        print(f"[{self.name}] detach_intervention  cap={cap_name}")
+        return {"status": "detached", "cap_name": cap_name}
+
+    # ── plan validation + verify + audit (device-side, never trusted from agent) ─
+
+    def _validate_plan(self, capability: str, plan) -> tuple[bool, str, dict]:
+        """
+        Structurally validate an InterventionPlan against the capability's manifest
+        and its paired diagnostic. Returns (ok, why, normalized_plan). The
+        normalized plan is exactly what gets hashed, approved, executed, audited —
+        so approval binds to a concrete plan (TOCTOU-free single round).
+
+        Mandatory: action (a manifest mutating action), params (dict), evidence
+        (dict), expected (non-empty str), verify {diagnostic, condition} (the
+        condition VALIDATED against the paired diagnostic's manifest, no 'changed'),
+        reversible (bool). reversible:true REQUIRES a non-empty reversible_how;
+        reversible:false REQUIRES reversible_how == "" AND reversible_ack == true
+        (an explicit no-undo acknowledgement, surfaced to the owner).
+        """
+        intv = self._interventions[capability]
+        man  = self.capabilities[capability].manifest or {}
+
+        if not isinstance(plan, dict):
+            return False, "plan must be an object", {}
+
+        action = plan.get("action")
+        actions = man.get("actions", {})
+        if action not in actions:
+            return False, f"unknown action {action!r}; manifest declares {sorted(actions)}", {}
+        if not actions[action].get("mutating"):
+            return False, f"action {action!r} is not a mutating action", {}
+
+        params = plan.get("params", {})
+        if not isinstance(params, dict):
+            return False, "params must be an object", {}
+
+        evidence = plan.get("evidence")
+        if not isinstance(evidence, dict) or not evidence:
+            return False, "evidence (the diagnostic reading justifying the fix) is required", {}
+
+        expected = plan.get("expected")
+        if not isinstance(expected, str) or not expected:
+            return False, "expected (a statement of the intended outcome) is required", {}
+
+        verify = plan.get("verify")
+        if not isinstance(verify, dict):
+            return False, "verify {diagnostic, condition} is required", {}
+        condition = verify.get("condition")
+        if not isinstance(condition, dict):
+            return False, "verify.condition is required", {}
+        if condition.get("op") == "changed":
+            return False, "verify.condition op 'changed' is not a definite predicate", {}
+        # Validate the condition against the PAIRED diagnostic's manifest so an
+        # agent cannot declare an unverifiable or meaningless check.
+        try:
+            diag_man = _manifest.diagnostic_manifest(intv["paired_family"], intv["target"])
+            norm_cond = conditions.validate_condition(condition, diag_man)
+        except _manifest.ManifestError as e:
+            return False, f"paired diagnostic unavailable: {e}", {}
+        except conditions.ConditionError as e:
+            return False, f"invalid verify.condition: {e}", {}
+
+        reversible = plan.get("reversible")
+        if not isinstance(reversible, bool):
+            return False, "reversible (bool, explicit) is required", {}
+        reversible_how = plan.get("reversible_how", "")
+        if reversible:
+            if not isinstance(reversible_how, str) or not reversible_how:
+                return False, "reversible:true requires a non-empty reversible_how", {}
+            reversible_ack = False
+        else:
+            if reversible_how not in ("", None):
+                return False, "reversible:false requires reversible_how == \"\"", {}
+            reversible_how = ""
+            if plan.get("reversible_ack") is not True:
+                return False, ("reversible:false requires an explicit reversible_ack:true "
+                               "(a no-undo acknowledgement, surfaced to the owner)"), {}
+            reversible_ack = True
+
+        normalized = {
+            "action":         action,
+            "params":         params,
+            "evidence":       evidence,
+            "expected":       expected,
+            "verify":         {"diagnostic": verify.get("diagnostic", intv["paired_family"]),
+                               "condition": norm_cond},
+            "reversible":     reversible,
+            "reversible_how": reversible_how,
+            "reversible_ack": reversible_ack,
+        }
+        return True, "", normalized
+
+    def _run_verify(self, intv: dict, plan: dict) -> dict:
+        """
+        DEVICE-run post-action verify: read the paired diagnostic FRESH and check
+        the plan's declared condition against it. The device NEVER trusts a verify
+        result asserted by the agent — it reads real state itself. Returns
+        {ran, passed, condition, reading}.
+        """
+        cond = plan["verify"]["condition"]
+        try:
+            # Read the paired diagnostic in the SAME scope the executor mutated
+            # (e.g. user-scope service), so verify never checks the wrong thing.
+            dkw     = intv["executor"].diagnostic_kwargs()
+            src     = DIAGNOSTIC_SOURCES[intv["paired_family"]](intv["target"], **dkw)
+            reading = src.read() or {}
+            passed  = conditions.satisfied(cond, reading)
+            return {"ran": True, "passed": bool(passed),
+                    "condition": cond, "reading": reading}
+        except Exception as e:
+            return {"ran": True, "passed": False, "condition": cond,
+                    "reading": {"error": f"{type(e).__name__}: {e}"}}
+
+    def _intervention_approve(self, plan: dict, agent_id: str) -> bool:
+        cb = self._intervention_approval_callback
+        if cb is None:
+            return False                                  # default DENY (safe)
+        try:
+            return bool(cb(plan, agent_id))
+        except Exception:
+            return False
+
+    def _audit_intervention(self, *, agent_id: str, capability: str, plan: dict,
+                            plan_hash: str, approved: bool, executed: bool,
+                            verify_outcome: str, result_status: str,
+                            verify_reading: dict | None = None,
+                            detail: str = "") -> dict | None:
+        """Append ONE signed audit entry for a terminal intervention outcome.
+        Returns the signed entry, or None if the log refused (fail-closed)."""
+        try:
+            return self._audit_log().append({
+                "kind":           "intervention",
+                "agent_id":       agent_id,
+                "device_node_id": self.node_id,
+                "capability":     capability,
+                "plan":           plan,
+                "plan_hash":      plan_hash,
+                "approved":       approved,
+                "approver":       "device_owner@local",   # at-device attestation, not a key
+                "executed":       executed,
+                "verify_outcome": verify_outcome,          # pass | fail | not_run
+                "verify_reading": verify_reading or {},
+                "result_status":  result_status,
+                "reversible":     plan.get("reversible"),
+                "reversible_how": plan.get("reversible_how", ""),
+                "ts":             time.time(),
+            })
+        except AuditError:
+            return None
 
     # ── virtual capabilities on-wire (Case 2 VSO + Case 3 emergent) ───────────
 

@@ -499,6 +499,7 @@ exactly one name):
 | Policy | `policy_blocked`, `approval_required` |
 | Broker | `capability_not_found`, `no_active_bind`, `binding_not_found` |
 | Scope / action / event guards | `binding_invalid_or_out_of_scope`, `not_an_action_capability`, `no_manifest_for_conditions`, `invalid_condition`, `event_cap_exceeded`, `device_event_capacity` |
+| Intervention (Phase 8, mutating) | `not_an_intervention_capability`, `invalid_plan`, `intervention_preflight_refused`, `intervention_verify_failed`, `intervention_error`, `audit_sealed` |
 | Agent-side | `no_response`, `binding_id_mismatch`, `no_provider` |
 
 **Boundary — what is NOT in the registry.** Codes that appear **inside**
@@ -554,6 +555,155 @@ verb, and an ungraceful death still behaves identically to before. *Known bound:
 all three steps are best-effort — an agent whose address the device never learned
 gets no notice (same limitation as `lease_expired`), and a DHT replica that is not
 among the key's current K-closest ages its copy out by TTL rather than by tombstone.
+
+## Diagnostic Surface (core; v1.6 additive)
+
+### Phase 7 — diagnostics
+
+Before an agent can *fix* a subsystem it has to *see* what's wrong with it. The
+diagnostic surface is the **read-only half of the fix loop**: a family of
+capabilities that expose a subsystem's health as normal manifested, readable,
+condition-subscribable readings — so an agent can observe a failure state
+*before* any intervention is attempted. **Intervention — acting on what a
+diagnostic reveals — is the [Intervention Surface (Phase 8)](#intervention-surface-phase-8-v17-additive) below; nothing in
+*this* section mutates state.** Every diagnostic reads `/proc`, `/sys`, or a
+read-only query to a standard tool and never changes anything: it is the same
+risk class as the existing resource probes.
+
+A diagnostic is attached at a concrete target and published like any other
+capability:
+
+```python
+device.attach_diagnostic("device_node_health", "/dev/video0")
+device.attach_diagnostic("kernel_module_health", "uvcvideo")
+device.attach_diagnostic("service_health", "ollama.service")     # user=True for --user
+device.attach_diagnostic("usb_power_health", "3-2")              # a sysfs USB bus id
+```
+
+| Family | What it **sees** (reading) | What it **cannot observe** |
+|---|---|---|
+| `device_node_health` | `present`, `readable`, `path`, `holder_pids` (PIDs holding an open fd, via a read-only `/proc/*/fd` scan) | whether the sensor hardware physically works; BIOS-level enablement; fds held by other users' processes without privilege |
+| `kernel_module_health` | `loaded` (from `/proc/modules`), `dmesg_lines` (tail lines mentioning the module), `dmesg_available` | kernel log when `dmesg` needs privilege (`kernel.dmesg_restrict`); whether the module's hardware works; parameters / version drift |
+| `service_health` | `active`, `active_state`, `sub_state` (systemd `is-active` / `show`, system or `--user`) | whether the service does useful work; its logs / exit code; non-systemd init systems |
+| `usb_power_health` | `autosuspend`, `control`, `runtime_status`, `autosuspend_delay_ms` (sysfs `power/*`) | actual watts drawn; whether the downstream device functions; hub / upstream power budget |
+
+**Manifest honesty.** Each diagnostic's manifest carries a `cannot_observe` list —
+a new **optional, non-derived** honesty key (v1.6, valid on any manifest, distinct
+from the derived-only `cannot_detect`): a real reading still has a limited vantage
+point and says so on-wire, so a discovering agent learns the blind spots from the
+record alone. Every family reading also carries the shared `observable: bool` +
+`reason: str` contract.
+
+**Consent.** System introspection reveals running processes (fd holders) and the
+device / module / service inventory of the host, so **all diagnostics are
+`sensitive` in the consent SSOT** (`DIAGNOSTIC_SENSITIVITY`) and **deny-by-default
+to remote agents** — a remote bind needs explicit owner approval, exactly like
+camera/microphone.
+
+**Conditions.** Diagnostics are condition-subscribable through the existing event
+layer. The boolean state field (`present` / `loaded` / `active` / `autosuspend`)
+is an `eq`-on-`bool` target, so *"notify me when `/dev/video0.present` becomes
+false"* fires on the true→false edge (verified against a controllable fixture node,
+not the real camera).
+
+**Platform honesty.** Everything here is **Linux-specific**. Each diagnostic
+degrades gracefully where its source is absent — it returns `observable: false`
+plus a `reason` (and the boolean state defaults to its safe value) **rather than
+raising an unhandled `FileNotFoundError`**. "Unknown" is modelled as
+`observable: false` alongside the boolean, so the state field stays a real boolean
+and an `eq`-on-`bool` condition still validates and evaluates cleanly — a
+`present: false` with `observable: true` means *confirmed absent*, with
+`observable: false` means *couldn't tell*.
+
+Demo: `examples/diagnostics_demo.py`. Tests: `tests/test_diagnostics.py`.
+
+## Intervention Surface (Phase 8; v1.7 additive)
+
+Diagnosis is the read-only half of the fix loop; **intervention is the half that
+mutates.** An intervention capability lets an agent *act* on what a diagnostic
+revealed — stop a wedged service, release a device node, unload a bad module — and
+then the device *proves the fix worked*. Where ordinary code has git as its undo
+net, a live device fix has none, so this layer trades that for two things: **owner
+approval of a concrete plan** and a **tamper-evident signed audit trail**. The
+whole loop is `diagnose → plan → approve → execute → verify → audit`.
+
+```python
+device.attach_intervention("service_intervene", "ollama.service", user=True)
+device.set_intervention_approval_callback(lambda plan, agent_id: owner_says_yes(plan))
+# agent side:
+agent.propose_intervention(binding, plan)   # plan = {action, params, evidence,
+                                            #         expected, verify, reversible, ...}
+```
+
+**Double gate (deny-by-default, both layers).** Binding an intervention capability
+needs owner approval — the right merely to *propose* — because the tier is
+`intervention` (a third consent tier above `open` / `sensitive`), so an unapproved
+bind is denied `approval_required` exactly like camera/mic. Then **every concrete
+plan needs its own per-plan approval** via `set_intervention_approval_callback(fn(plan,
+agent_id) -> bool)`, which **defaults to DENY** — nothing mutates without an explicit
+owner *yes* to *that specific plan*. Loosening this later is one line; tightening it
+would be a breaking change, so it ships tight. The callback receives the **full
+normalized plan** (including `reversible` / `reversible_how` / `reversible_ack`), so
+the owner approves a plan, not a resource name.
+
+**The plan is mandatory and self-justifying.** A proposal is rejected `invalid_plan`
+unless it carries: a manifest-declared **`action`** (marked `mutating`), **`params`**,
+**`evidence`** (the diagnostic reading that justifies the fix), **`expected`** (the
+intended outcome in words), a **`verify`** `{diagnostic, condition}`, and an explicit
+**`reversible`** bool. `reversible:true` requires a non-empty `reversible_how` (the
+inverse action); `reversible:false` requires `reversible_ack:true` — a deliberate
+no-undo acknowledgement that is surfaced to the owner in the approval callback.
+
+**TOCTOU-free single round.** Propose → owner gate → execute → verify → audit all
+happen in one device-side handler on the **exact normalized plan the device hashed**;
+the agent never re-submits plan fields between approval and execution.
+
+**The device verifies its own fix — the agent is never trusted for it.** The
+`verify.condition` is validated **at propose time against the paired diagnostic's
+manifest** (an agent cannot declare an unverifiable or meaningless check; `changed`
+is rejected as not a definite predicate). After executing, the **device reads that
+paired diagnostic fresh, in the same scope it mutated**, and evaluates the condition
+itself. A fix that ran but whose verify did not hold comes back **`failed_verify`,
+never a silent success**.
+
+**Reference set (this machine).**
+
+| Family | Action(s) | Reversible? | Paired diagnostic | Status here |
+|---|---|---|---|---|
+| `service_intervene` | start / stop / restart | **yes** (stop↔start) | `service_health` | primary — real user-scope unit, real state change, diagnostic-confirmed |
+| `process_release` | release (signal the holder PID) | **no** (a kill has no undo) | `device_node_health` | the `reversible:false` demonstrator; tested against a test-spawned child, never a real device |
+| `kernel_module_intervene` | load / unload | yes (load↔unload) | `kernel_module_health` | ships **privilege-gated** — `preflight` refuses (`intervention_preflight_refused`) without `CAP_SYS_MODULE`/root, so on this unprivileged dev machine the real mutation is **skipped-with-reason**, never half-run |
+
+**Signed, hash-chained, fail-closed audit.** Every *terminal* outcome — approved+
+executed, `failed_verify`, `refused_preflight`, and **owner-DENIED** — is written as
+**one device-signed line** to `d2a_home()/audit/<device>.jsonl` (same base dir /
+`0600` perms as keys). Each entry stores the sha256 of the previous entry's signed
+bytes inside its own signed payload, so the log is an Ed25519-signed hash chain:
+rewriting or truncating any past line breaks a signature or the chain, caught by
+`verify_chain()`. The device is **fail-closed** — before it extends the log it
+re-verifies the whole chain, and **refuses to extend a tampered log** (`audit_sealed`); a compromised
+log is never silently continued. It survives restart by reading and verifying the
+existing chain and continuing from its head.
+
+**The approver is a local at-device attestation.** Audit entries record
+`approver: "device_owner@local"` — this asserts *the owner said yes at the device*,
+**not** a cryptographic owner signature. That is the honest seam where remote or
+keyed owner approval lands later; today it is a local trust assertion.
+
+**Known limits (stated, not hidden).**
+- **No auto-revert.** A `failed_verify` (or any bad outcome) is *reported and
+  audited*; the device does **not** automatically run the inverse action. Undo is
+  the owner's to propose as a new plan.
+- **`cannot_fix` is on-wire honesty, not a guarantee.** Each intervention manifest
+  carries a `cannot_fix` list (v1.7, the mutating sibling of `cannot_observe`) — a
+  fixer's real blind spots (dead hardware, BIOS/firmware, privilege it lacks, the
+  bootstrapping limit that a restart only bounces a buggy service). A discovering
+  agent learns them from the record alone.
+- **Reversibility is a per-plan claim**, evaluated structurally, not proven by the
+  device — it lives in the plan (and the audit), not the static manifest.
+- Everything here is **Linux-specific** (systemd, `/proc`, `modprobe`).
+
+Demo: `examples/intervention_demo.py`. Tests: `tests/test_intervention.py`.
 
 ## Capability Derivation (application layer; v1.5 additive publish path)
 
@@ -848,7 +998,7 @@ Still out of scope, each by design: chains deeper than `MAX_DERIVATION_DEPTH` (a
 
 ## Versioning & Compatibility
 
-**The wire format is `v1.5`** as of the publish-derived arc — `d2a.PROTOCOL_VERSION = "1.5"` (defined in `d2a/protocol.py`). v1.1 added the `sig` / `sig_key` / `ts` fields (Ed25519 trust); v1.2 **additively** added an optional `manifest` field to capability records; v1.3 **additively** added the `subscribe_event` / `unsubscribe_event` / `event` / `task_status` verbs, an optional per-action `long_running` manifest key, and a small set of eventable live-frame reading fields to the built-in manifests (see *Event Layer* above). **v1.4 is the one *non-additive* bump so far** — it unifies every error/denial onto a single shape with a stable `code` from the [error registry](#error-model-v14). This is a **sanctioned pre-adoption break**: it renames wire fields (`reason` / `error` → `code`), so it is not additive, and it is done now precisely because there are no external consumers yet. **v1.5 is *additive*** — the manifest vocabulary gains four optional derived-provenance keys (`derived` / `recipe` / `fidelity` / `cannot_detect`) and an optional per-field `hz` cadence, so a locally derived capability publishes, discovers, and binds like any other (closing derivation protocol gaps 1 and 3, dated 2026-07-12). It adds a `derived_input_failed` code to the [error registry](#error-model-v14) for a published derivation whose required input died. No field renames, no verb changes; same-major peers ignore the new keys. See the *Error model* section for the migration and the full code registry. Records/messages without any of these remain valid. Records without a manifest remain valid. Every outbound message and every published capability record carries a top-level `"v"` field, injected at the serialization chokepoints (TCP `_tcp_send` / `_handle_tcp`, LAN UDP `_broadcast` / `_handle_udp`, Kademlia `_send` / `_handle`, and both `publish()` sites). It is a plain field, **not** an envelope, so handlers that read `msg["type"]` are unaffected.
+**The wire format is `v1.7`** as of the intervention-surface arc — `d2a.PROTOCOL_VERSION = "1.7"` (defined in `d2a/protocol.py`). **v1.7 is *additive*** — it adds the `propose_intervention` verb (mutating fix loop; its `intervention_result` reply and the six `intervention_*` / `invalid_plan` / `audit_sealed` [error codes](#error-model-v14)) and one optional manifest key, `cannot_fix` (the mutating sibling of `cannot_observe`, valid on any manifest, listing a fixer's honest blind spots), carried by Phase 8 intervention capabilities; same-major peers ignore both and records without them stay valid. **v1.6 was *additive*** — the manifest vocabulary gained one optional honesty key, `cannot_observe` (valid on any manifest, distinct from the derived-only `cannot_detect`), carried by the Phase 7 read-only diagnostic capabilities; same-major peers ignore it and records without it stay valid. v1.1 added the `sig` / `sig_key` / `ts` fields (Ed25519 trust); v1.2 **additively** added an optional `manifest` field to capability records; v1.3 **additively** added the `subscribe_event` / `unsubscribe_event` / `event` / `task_status` verbs, an optional per-action `long_running` manifest key, and a small set of eventable live-frame reading fields to the built-in manifests (see *Event Layer* above). **v1.4 is the one *non-additive* bump so far** — it unifies every error/denial onto a single shape with a stable `code` from the [error registry](#error-model-v14). This is a **sanctioned pre-adoption break**: it renames wire fields (`reason` / `error` → `code`), so it is not additive, and it is done now precisely because there are no external consumers yet. **v1.5 is *additive*** — the manifest vocabulary gains four optional derived-provenance keys (`derived` / `recipe` / `fidelity` / `cannot_detect`) and an optional per-field `hz` cadence, so a locally derived capability publishes, discovers, and binds like any other (closing derivation protocol gaps 1 and 3, dated 2026-07-12). It adds a `derived_input_failed` code to the [error registry](#error-model-v14) for a published derivation whose required input died. No field renames, no verb changes; same-major peers ignore the new keys. See the *Error model* section for the migration and the full code registry. Records/messages without any of these remain valid. Records without a manifest remain valid. Every outbound message and every published capability record carries a top-level `"v"` field, injected at the serialization chokepoints (TCP `_tcp_send` / `_handle_tcp`, LAN UDP `_broadcast` / `_handle_udp`, Kademlia `_send` / `_handle`, and both `publish()` sites). It is a plain field, **not** an envelope, so handlers that read `msg["type"]` are unaffected.
 
 The compatibility contract:
 
@@ -928,7 +1078,7 @@ d2a/
 ├── manifest.py            Capability manifest vocabulary + validator + built-ins (v1.2)
 ├── conditions.py          Event condition vocabulary: validate-against-manifest + edge/re-arm (v1.3)
 ├── identity.py            Node ID (binding handles) + Ed25519 token signing
-├── protocol.py            Wire version (PROTOCOL_VERSION="1.0") + negotiation helpers
+├── protocol.py            Wire version (PROTOCOL_VERSION="1.7") + negotiation helpers
 ├── verbs.py               bind / rebind / renew / unbind operations
 ├── broker.py              Contention broker: priority · quota · preemption · waitqueue
 ├── probes.py              OS probes: CPU, memory, GPU, thermal, battery, disk, net
@@ -1020,6 +1170,8 @@ All examples run single-process with no network setup required unless noted.
 | `composition_run_demo.py` | Full 10-stage pipeline: happy path, atomic rollback, fallback-on-bind, runtime distress + re-bind, atomic context-manager release | `python3 examples/composition_run_demo.py` |
 | `composition_simple_demo.py` | `with agent.achieve("vision") as comp: comp.run()` — the 2-line goal API with auto-release | `python3 examples/composition_simple_demo.py` |
 | `manifest_demo.py` | Capability manifests: discover records, print each capability's signed self-description (reading schema, actions, consent tier) | `python3 examples/manifest_demo.py` |
+| `diagnostics_demo.py` | Read-only diagnostics (Phase 7): attach four families against real subsystems, discover each manifest's `cannot_observe`, sensitive deny-by-default, approved read of genuine state, and a boolean-field condition firing on `present`→false | `python3 examples/diagnostics_demo.py` |
+| `intervention_demo.py` | Mutating fix loop (Phase 8): double gate (unapproved bind denied, then per-plan approval), owner-approved `stop`/`start` of a real user-scope service with device-run verify, a `failed_verify` that is not reported as success, and the signed hash-chained audit chain verified across all four terminal outcomes | `python3 examples/intervention_demo.py` |
 | `composition_wire_demo.py` | Composition on the wire: host publishes a Guardian VSO's smart surface; agent discovers its manifest, binds under a lease, drives a `verdict` action | `python3 examples/composition_wire_demo.py` |
 | `swarm_local_demo.py` | LANSwarm on localhost: publish a record, discover it, send a TCP message | `python3 examples/swarm_local_demo.py` |
 | `swarm_multinode_demo.py` | Two runtimes + one agent on a real LAN (**requires two terminals or two machines**) | `python3 examples/run_node.py` then `run_provider.py` then `run_seeker.py` |

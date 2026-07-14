@@ -15,6 +15,9 @@ from d2a import errors
 from d2a.errors import WireError
 from d2a import manifest
 from d2a.manifest import validate_manifest, ManifestError
+from d2a import audit
+from d2a.audit import AuditLog, AuditError
+from d2a import interventions
 from d2a.identity import generate_node_id, generate_keypair, derive_node_id
 from d2a.verbs import (
     make_bind_request, make_bind_token, verify_token, verify_bind_token,
@@ -93,6 +96,11 @@ __all__ = [
     # capability manifests (v1.2)
     "manifest",
     "validate_manifest",
+    # intervention layer (Phase 8)
+    "audit",
+    "AuditLog",
+    "AuditError",
+    "interventions",
     "ManifestError",
     # identity
     "generate_node_id",

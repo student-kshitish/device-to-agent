@@ -72,6 +72,14 @@ INVALID_CONDITION               = "invalid_condition"
 EVENT_CAP_EXCEEDED              = "event_cap_exceeded"
 DEVICE_EVENT_CAPACITY           = "device_event_capacity"
 
+# ── intervention layer (Phase 8 — mutating capabilities) ─────────────────────
+NOT_AN_INTERVENTION_CAPABILITY = "not_an_intervention_capability"
+INVALID_PLAN                   = "invalid_plan"
+INTERVENTION_PREFLIGHT_REFUSED = "intervention_preflight_refused"
+INTERVENTION_VERIFY_FAILED     = "intervention_verify_failed"
+INTERVENTION_ERROR             = "intervention_error"  # the mutation itself failed to run
+AUDIT_SEALED                   = "audit_sealed"        # fail-closed: audit chain broken, refuse
+
 # ── agent-side (never leave the agent, but share the one shape) ──────────────
 NO_RESPONSE         = "no_response"
 BINDING_ID_MISMATCH = "binding_id_mismatch"
@@ -90,6 +98,8 @@ ALL_CODES = frozenset({
     BINDING_INVALID_OR_OUT_OF_SCOPE, NOT_AN_ACTION_CAPABILITY,
     NO_MANIFEST_FOR_CONDITIONS, INVALID_CONDITION,
     EVENT_CAP_EXCEEDED, DEVICE_EVENT_CAPACITY,
+    NOT_AN_INTERVENTION_CAPABILITY, INVALID_PLAN, INTERVENTION_PREFLIGHT_REFUSED,
+    INTERVENTION_VERIFY_FAILED, INTERVENTION_ERROR, AUDIT_SEALED,
     NO_RESPONSE, BINDING_ID_MISMATCH, NO_PROVIDER,
 })
 

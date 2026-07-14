@@ -54,7 +54,9 @@ and cycle-free.
 
 import json
 
-from d2a.resource_probes import RESOURCE_SENSITIVITY
+from d2a.resource_probes import (
+    RESOURCE_SENSITIVITY, DIAGNOSTIC_SENSITIVITY, INTERVENTION_SENSITIVITY,
+)
 from d2a.guardian.device_kinds import KIND_SENSITIVITY, KIND_PRIMITIVES
 
 # ── vocabulary ───────────────────────────────────────────────────────────────
@@ -66,16 +68,33 @@ MANIFEST_MAX_BYTES = 4096          # publish rejects a manifest larger than this
 # on-wire, so a discovering agent learns it is a substitute and its honest limits
 # with no demo code. This is the manifest half of closing derivation protocol gap 3.
 _DERIVED_KEYS = {"derived", "recipe", "fidelity", "cannot_detect"}
-_TOP_LEVEL_KEYS = {"description", "reading", "actions", "consent_tier", "streaming"} | _DERIVED_KEYS
+# v1.6 (Phase 7) added ONE optional top-level honesty key, valid on ANY manifest:
+# "cannot_observe" — an explicit list of what this capability STRUCTURALLY cannot
+# see, so a discovering agent learns the blind spots of a REAL reading with no
+# demo code. It is deliberately distinct from the derived-only "cannot_detect"
+# (which states the limits of a SUBSTITUTE): a diagnostic reads genuine state, it
+# is not derived, yet it must still declare what its read-only vantage point
+# cannot reach (e.g. whether the hardware physically works).
+_OBSERVE_KEYS = {"cannot_observe"}
+# v1.7 (Phase 8) added ONE optional top-level honesty key for the intervention
+# (mutating) capabilities: "cannot_fix" — an explicit list of what a fixer
+# STRUCTURALLY cannot repair (dead hardware, BIOS/firmware, anything needing a
+# privilege the runtime lacks, and the bootstrapping limit: D2A cannot fix its own
+# broken runtime). Sibling of cannot_observe; valid on any manifest.
+_FIX_KEYS = {"cannot_fix"}
+_TOP_LEVEL_KEYS = ({"description", "reading", "actions", "consent_tier", "streaming"}
+                   | _DERIVED_KEYS | _OBSERVE_KEYS | _FIX_KEYS)
 _SCALAR_TYPES = {"number", "string", "boolean", "object"}
 _ALL_TYPES = _SCALAR_TYPES | {"array"}
-_CONSENT_TIERS = {"open", "sensitive"}
+# Third tier (v1.7): "intervention" — MUTATING capabilities, above sensitive.
+# Deny-by-default with a double gate (bind approval + per-plan approval).
+_CONSENT_TIERS = {"open", "sensitive", "intervention"}
 # v1.5 added optional per-field "hz": the provider's native sample cadence for a
 # reading field (closing derivation protocol gap 1). Absent means "unknown" and the
 # derive contract-checker falls back to the device MAX_SAMPLE_HZ clamp.
 _FIELD_KEYS = {"type", "unit", "description", "items", "format", "hz"}
 _PARAM_KEYS = _FIELD_KEYS | {"required"}
-_ACTION_KEYS = {"description", "params", "long_running"}
+_ACTION_KEYS = {"description", "params", "long_running", "mutating"}
 
 
 class ManifestError(ValueError):
@@ -93,6 +112,18 @@ def consent_tier_for_resource(name: str) -> str:
 def consent_tier_for_kind(kind: str) -> str:
     """Intrinsic consent tier of a peripheral kind (unknown → 'sensitive')."""
     return KIND_SENSITIVITY.get(kind, "sensitive")
+
+
+def consent_tier_for_diagnostic(family: str) -> str:
+    """Intrinsic consent tier of a diagnostic family (unknown → 'sensitive').
+    All diagnostics are sensitive — see DIAGNOSTIC_SENSITIVITY (the SSOT)."""
+    return DIAGNOSTIC_SENSITIVITY.get(family, "sensitive")
+
+
+def consent_tier_for_intervention(family: str) -> str:
+    """Intrinsic consent tier of an intervention family (unknown → 'intervention').
+    All interventions are the third tier — see INTERVENTION_SENSITIVITY (SSOT)."""
+    return INTERVENTION_SENSITIVITY.get(family, "intervention")
 
 
 # ── validation ───────────────────────────────────────────────────────────────
@@ -180,6 +211,8 @@ def validate_manifest(manifest: dict, expected_consent_tier: str,
             raise ManifestError(f"actions.{aname}: 'description' is required")
         if "long_running" in aspec and not isinstance(aspec["long_running"], bool):
             raise ManifestError(f"actions.{aname}: 'long_running' must be a boolean")
+        if "mutating" in aspec and not isinstance(aspec["mutating"], bool):
+            raise ManifestError(f"actions.{aname}: 'mutating' must be a boolean")
         params = aspec.get("params", {})
         if not isinstance(params, dict):
             raise ManifestError(f"actions.{aname}.params: must be an object")
@@ -220,6 +253,13 @@ def validate_manifest(manifest: dict, expected_consent_tier: str,
             raise ManifestError(
                 f"a non-derived manifest must not carry derived-provenance keys "
                 f"{present} (set 'derived': true, or remove them)")
+
+    # ── cannot_observe (v1.6) / cannot_fix (v1.7) — optional, any manifest ────
+    for _k in ("cannot_observe", "cannot_fix"):
+        if _k in manifest:
+            v = manifest[_k]
+            if not isinstance(v, list) or not all(isinstance(x, str) for x in v):
+                raise ManifestError(f"'{_k}' must be a list of strings")
 
     out = {**manifest, "streaming": streaming}
 
@@ -488,6 +528,221 @@ def emergent_manifest(kind: str, combined_contract: dict | None = None) -> dict:
     return validate_manifest(m, tier)
 
 
+# ── diagnostic manifests (Phase 7) — the READ-ONLY self-inspection surface ───
+# Each diagnostic declares WHAT it observes (reading) and, via cannot_observe,
+# what its read-only vantage point structurally CANNOT reach. Diagnosis is the
+# read-only half of the fix loop; intervention is a later phase. consent_tier is
+# always "sensitive" (system introspection) per DIAGNOSTIC_SENSITIVITY.
+#
+# The boolean state field (present/loaded/active/…) is condition-subscribable
+# (eq-on-bool), so an agent can ask to be notified when e.g. a device node's
+# `present` becomes false. "observable" flags whether that boolean is a CONFIRMED
+# reading or an unknown (source absent) — never overload the boolean itself.
+
+_DIAGNOSTICS = {
+    "device_node_health": {
+        "description": "Read-only health of a device node: existence, permissions, "
+                       "and which PIDs hold it open. Never opens the device.",
+        "reading": {
+            "present":     {"type": "boolean", "description": "device node exists"},
+            "readable":    {"type": "boolean", "description": "readable by this process (R_OK)"},
+            "path":        {"type": "string",  "description": "the device node path inspected"},
+            "holder_pids": {"type": "array", "items": "number",
+                            "description": "PIDs holding an open fd on the node (best-effort)"},
+            "holder_count": {"type": "number",
+                             "description": "count of holder_pids; conditionable (0 == released)"},
+            "observable":  {"type": "boolean", "description": "primary signal was inspectable"},
+            "reason":      {"type": "string",  "description": "why the reading degraded, if it did"},
+        },
+        "cannot_observe": [
+            "whether the sensor hardware is physically functional",
+            "BIOS-level enablement of the device",
+            "file descriptors held by processes owned by other users without privilege",
+        ],
+    },
+    "kernel_module_health": {
+        "description": "Read-only health of a kernel module: whether it is loaded "
+                       "(/proc/modules) plus dmesg tail lines mentioning it.",
+        "reading": {
+            "loaded":          {"type": "boolean", "description": "module present in /proc/modules"},
+            "module":          {"type": "string",  "description": "module name inspected"},
+            "dmesg_available": {"type": "boolean", "description": "dmesg log was readable"},
+            "dmesg_lines":     {"type": "array", "items": "string",
+                                "description": "tail of dmesg lines mentioning the module"},
+            "observable":      {"type": "boolean", "description": "/proc/modules was readable"},
+            "reason":          {"type": "string",  "description": "why the reading degraded, if it did"},
+        },
+        "cannot_observe": [
+            "kernel log lines when dmesg requires privilege (kernel.dmesg_restrict)",
+            "whether the module's underlying hardware actually works",
+            "module parameters, version drift, or taint state",
+        ],
+    },
+    "service_health": {
+        "description": "Read-only active-state of a systemd unit via systemctl "
+                       "is-active / show (system or --user scope).",
+        "reading": {
+            "active":       {"type": "boolean", "description": "ActiveState == active"},
+            "active_state": {"type": "string",  "description": "systemd ActiveState"},
+            "sub_state":    {"type": "string",  "description": "systemd SubState"},
+            "service":      {"type": "string",  "description": "unit name inspected"},
+            "scope":        {"type": "string",  "description": "system | user"},
+            "observable":   {"type": "boolean", "description": "systemctl was available"},
+            "reason":       {"type": "string",  "description": "why the reading degraded, if it did"},
+        },
+        "cannot_observe": [
+            "whether the service is doing useful work (only its systemd state)",
+            "the unit's logs or last exit code",
+            "services managed by a non-systemd init system",
+        ],
+    },
+    "usb_power_health": {
+        "description": "Read-only USB power state from sysfs: autosuspend control, "
+                       "runtime status, and autosuspend delay. Never writes power policy.",
+        "reading": {
+            "present":              {"type": "boolean", "description": "USB device power sysfs exists"},
+            "autosuspend":          {"type": "boolean", "description": "power/control == auto"},
+            "control":              {"type": "string",  "description": "power/control (auto|on)"},
+            "runtime_status":       {"type": "string",  "description": "power/runtime_status"},
+            "autosuspend_delay_ms": {"type": "number", "unit": "ms",
+                                     "description": "power/autosuspend_delay_ms (-1 if unknown)"},
+            "path":                 {"type": "string",  "description": "sysfs device path inspected"},
+            "observable":           {"type": "boolean", "description": "power sysfs was readable"},
+            "reason":               {"type": "string",  "description": "why the reading degraded, if it did"},
+        },
+        "cannot_observe": [
+            "actual electrical power draw in watts",
+            "whether the downstream USB device is functioning",
+            "hub or upstream port power budget",
+        ],
+    },
+}
+
+
+def diagnostic_manifest(family: str, target: str) -> dict:
+    """
+    Composed, validated manifest for a diagnostic capability of `family`, pointed
+    at `target` (a device path / module / service / usb id). The target is woven
+    into the human description only — the reading schema is fixed per family.
+    consent_tier is the family's SSOT sensitivity (always sensitive). Raises
+    ManifestError for an unknown family (no silent fallback for a bad wire word).
+    """
+    base = _DIAGNOSTICS.get(family)
+    if base is None:
+        raise ManifestError(f"unknown diagnostic family {family!r}; "
+                            f"known: {sorted(_DIAGNOSTICS)}")
+    tier = consent_tier_for_diagnostic(family)
+    m = {
+        "description": f"{base['description']} Target: {target}. Linux-only; degrades "
+                       f"gracefully (observable=false) where its source is absent.",
+        "reading": base["reading"],
+        "cannot_observe": list(base["cannot_observe"]),
+        "consent_tier": tier,
+        "streaming": True,   # condition-subscribable through the event layer
+    }
+    return validate_manifest(m, tier)
+
+
+# ── intervention manifests (Phase 8) — the MUTATING surface ──────────────────
+# An intervention CHANGES device state to fix it. Each family declares its
+# mutating action(s) (marked mutating:true), the diagnostic family it is PAIRED
+# with (evidence justifying the fix + the post-action verify read against the same
+# family), and a cannot_fix list — the honest blind spots of a fixer (dead
+# hardware, BIOS/firmware, privilege it lacks, and the bootstrapping limit).
+# consent_tier is always "intervention" (the third tier). Reversibility is a
+# per-PLAN property (it depends on the concrete action/target), so it lives in the
+# InterventionPlan, not the static manifest.
+
+# family → its paired diagnostic family (evidence + verify are read against this).
+INTERVENTION_PAIRED_DIAGNOSTIC = {
+    "service_intervene":       "service_health",
+    "process_release":         "device_node_health",
+    "kernel_module_intervene": "kernel_module_health",
+}
+
+_INTERVENTIONS = {
+    "service_intervene": {
+        "description": "Mutating fixer for a systemd (user-scope) unit: start / stop / "
+                       "restart it. Reversible (stop<->start). Paired diagnostic: service_health.",
+        "actions": {
+            "start":   {"description": "start the unit (systemctl --user start)", "mutating": True},
+            "stop":    {"description": "stop the unit (systemctl --user stop)",   "mutating": True},
+            "restart": {"description": "restart the unit (systemctl --user restart)", "mutating": True},
+        },
+        "cannot_fix": [
+            "a service failing due to its own bug (a restart only bounces it)",
+            "system-scope units without privilege",
+            "the unit's config errors or missing dependencies",
+            "dead hardware the service depends on",
+        ],
+    },
+    "process_release": {
+        "description": "Mutating fixer that releases a device node by signalling the process "
+                       "holding it (default SIGTERM). IRREVERSIBLE — a kill has no undo. "
+                       "Paired diagnostic: device_node_health.",
+        "actions": {
+            "release": {"description": "signal the PID holding the node so the device can reopen",
+                        "mutating": True,
+                        "params": {"pid":    {"type": "number", "required": True},
+                                   "signal": {"type": "string", "required": False,
+                                              "description": "TERM (default) | KILL | HUP"}}},
+        },
+        "cannot_fix": [
+            "restoring a killed process (a kill is not reversible)",
+            "processes owned by other users without privilege",
+            "why the process was holding the device",
+            "dead hardware behind the node",
+        ],
+    },
+    "kernel_module_intervene": {
+        "description": "Mutating fixer for a kernel module: load / unload it (modprobe). "
+                       "Reversible (load<->unload). REQUIRES privilege (CAP_SYS_MODULE) — "
+                       "refused at preflight otherwise. Paired diagnostic: kernel_module_health.",
+        "actions": {
+            "load":   {"description": "load the module (modprobe)",       "mutating": True},
+            "unload": {"description": "unload the module (modprobe -r)",   "mutating": True},
+        },
+        "cannot_fix": [
+            "loading a module without CAP_SYS_MODULE / root (refused at preflight)",
+            "a module absent from the kernel's module tree",
+            "hardware the module drives",
+            "firmware / BIOS-level enablement",
+        ],
+    },
+}
+
+
+def intervention_manifest(family: str, target: str) -> dict:
+    """
+    Composed, validated manifest for an intervention capability of `family`,
+    pointed at `target` (a systemd unit / device node / module name). consent_tier
+    is always "intervention" (the third tier). Declares the mutating action(s) +
+    cannot_fix. Raises ManifestError for an unknown family.
+    """
+    base = _INTERVENTIONS.get(family)
+    if base is None:
+        raise ManifestError(f"unknown intervention family {family!r}; "
+                            f"known: {sorted(_INTERVENTIONS)}")
+    tier   = consent_tier_for_intervention(family)
+    paired = INTERVENTION_PAIRED_DIAGNOSTIC.get(family, "")
+    m = {
+        "description": f"{base['description']} Target: {target}. Linux-only; MUTATING — "
+                       f"each concrete plan needs its own owner approval.",
+        "reading": {
+            "family":            {"type": "string"},
+            "target":            {"type": "string"},
+            "paired_diagnostic": {"type": "string",
+                                  "description": f"diagnostic family for evidence + verify ({paired})"},
+            "mutating":          {"type": "boolean", "description": "always true — this fixes state"},
+        },
+        "actions": base["actions"],
+        "cannot_fix": list(base["cannot_fix"]),
+        "consent_tier": tier,
+        "streaming": False,
+    }
+    return validate_manifest(m, tier)
+
+
 def builtin_manifest(cap) -> dict | None:
     """
     Return the validated built-in manifest for a Capability, or None if we do
@@ -509,3 +764,12 @@ def builtin_manifest(cap) -> dict | None:
 # Fail loudly at import if a shipped manifest ever drifts out of the vocabulary.
 for _n, _m in _RESOURCE_MANIFESTS.items():
     validate_manifest(_m, consent_tier_for_resource(_n))
+
+# Same guard for every diagnostic family (Phase 7): a vocabulary regression in a
+# diagnostic manifest fails at import, not silently at attach/publish time.
+for _fam in _DIAGNOSTICS:
+    diagnostic_manifest(_fam, "_validation_probe")
+
+# And every intervention family (Phase 8).
+for _fam in _INTERVENTIONS:
+    intervention_manifest(_fam, "_validation_probe")

@@ -33,6 +33,40 @@ RESOURCE_SENSITIVITY: dict[str, str] = {
 }
 
 
+# ── Diagnostic consent SSOT (Phase 7) ──────────────────────────────────────────
+# Diagnostics are a READ-ONLY self-inspection family (see d2a/stream_source.py):
+# each reads a subsystem's health via read-only means only (no state ever
+# changes). They are ALL sensitive: system introspection reveals running
+# processes (fd holders), the module/service/device inventory of the host — so a
+# remote agent is denied by default and needs explicit owner approval, exactly
+# like camera/microphone. Keyed by diagnostic FAMILY (a concrete diagnostic
+# capability is named diag_<family>_<target-slug>; its policy rule is set per
+# capability at attach time, but the family's intrinsic tier lives HERE so the
+# manifest consent_tier can be validated against the one SSOT).
+DIAGNOSTIC_SENSITIVITY: dict[str, str] = {
+    "device_node_health":   "sensitive",
+    "kernel_module_health": "sensitive",
+    "service_health":       "sensitive",
+    "usb_power_health":     "sensitive",
+}
+
+
+# ── Intervention consent SSOT (Phase 8) ─────────────────────────────────────────
+# Interventions MUTATE device state (restart a service, kill a holder, load a
+# module). A wrong intervention can worsen things with NO undo, so this is a THIRD
+# consent tier above "sensitive": "intervention". It is deny-by-default with a
+# DOUBLE GATE — binding an intervention capability needs owner approval (the right
+# to PROPOSE), and every concrete plan needs its own per-plan owner approval before
+# anything executes. Keyed by intervention FAMILY; the concrete capability is named
+# intv_<family>_<target-slug>. The tier lives HERE (the one SSOT) so a manifest's
+# consent_tier can be validated against it, exactly like the other two families.
+INTERVENTION_SENSITIVITY: dict[str, str] = {
+    "service_intervene":       "intervention",
+    "process_release":         "intervention",
+    "kernel_module_intervene": "intervention",
+}
+
+
 # ── Individual probes ──────────────────────────────────────────────────────────
 
 def probe_camera() -> dict | None:
