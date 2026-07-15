@@ -500,6 +500,7 @@ exactly one name):
 | Broker | `capability_not_found`, `no_active_bind`, `binding_not_found` |
 | Scope / action / event guards | `binding_invalid_or_out_of_scope`, `not_an_action_capability`, `no_manifest_for_conditions`, `invalid_condition`, `event_cap_exceeded`, `device_event_capacity` |
 | Intervention (Phase 8, mutating) | `not_an_intervention_capability`, `invalid_plan`, `intervention_preflight_refused`, `intervention_verify_failed`, `intervention_error`, `audit_sealed` |
+| Remote keyed owner approval (Phase 10A) | `owner_approval_required` (non-terminal — sign the returned `plan_hash`), `owner_unregistered`, `owner_key_mismatch`, `owner_sig_invalid`, `owner_approval_stale` |
 | Agent-side | `no_response`, `binding_id_mismatch`, `no_provider` |
 
 **Boundary — what is NOT in the registry.** Codes that appear **inside**
@@ -704,6 +705,76 @@ keyed owner approval lands later; today it is a local trust assertion.
 - Everything here is **Linux-specific** (systemd, `/proc`, `modprobe`).
 
 Demo: `examples/intervention_demo.py`. Tests: `tests/test_intervention.py`.
+
+### Remote keyed owner approval (Phase 10A; v1.9 additive)
+
+Phase 8 approved a plan with a **local console callback** and recorded
+`approver: "device_owner@local"` — a local attestation, **not** a cryptographic
+proof of *who* approved. Phase 8 named this its seam. 10A closes it: an **owner
+keypair** — a principal **distinct from the device host key** — can approve a plan
+by **signing its `plan_hash` over the wire**, and the audit then records the owner
+pubkey + signature.
+
+**Register the owner (TOFU).** The owner pre-registers their *public* key on the
+device; the device stores only the public key (the owner private key lives with
+the owner — a phone/console app — never on the device):
+
+```python
+device.set_owner_pubkey(owner_pubkey)            # TOFU-pinned, persisted 0600
+# a different key later is rejected unless set_owner_pubkey(k, rotate=True)
+```
+
+Once set, it **populates the Phase-9 node-descriptor `owner_pubkey` slot** — any
+agent that `describe_node`s the device learns "this device answers to owner
+`<fingerprint>`."
+
+**Approve by signature (two rounds, one verb).** Keyed approval is an optional
+`owner_approval` field on the existing `propose_intervention` — no new verb, so the
+whole gate/execute/verify/audit path is reused. Because the owner must sign the
+device's *normalized* `plan_hash`, a first round hands it back:
+
+1. Agent proposes the plan. If keyed approval is the active path (owner key
+   registered, no local callback), the device replies a **non-terminal**
+   `status:"pending_owner_approval"` carrying `{plan_hash, device_node_id, nonce,
+   ts}` — nothing mutates, nothing is audited.
+2. The owner signs it — `signing.sign_owner_approval(plan_hash, device_node_id,
+   owner_priv, owner_pub)` — the **one** canonical subject builder shared by device
+   and owner tooling.
+3. The agent resubmits the **same** plan with `owner_approval=<signed>`. The device
+   verifies and proceeds exactly as Phase 8, and the audit entry's `approver`
+   becomes the owner key fingerprint with the owner pubkey + signature attached.
+
+**What the signature is bound to.** The signed subject is
+`{kind:"intervention_approval", plan_hash, device_node_id, nonce, ts}`. So an
+approval is bound to:
+
+- **the exact normalized plan** — the device rebuilds the subject with the
+  `plan_hash` it *recomputes* from the resubmitted plan, so a signature for plan X
+  fails for plan Y (different subject, verification fails — no separate compare);
+- **this device** — `device_node_id` in the subject defeats cross-device replay;
+- **freshness** — `ts` must be within the 60 s replay window (the same discipline
+  as signed trust messages), and a small **bounded nonce seen-cache** (pruned past
+  the window) stops a captured approval being reused.
+
+**Coexistence — one gate, no second policy surface.** The per-plan gate stays at
+the same point; only its *acceptance proof* widens, in a strict priority: an
+attached owner signature → keyed verify (a bad sig is a **hard deny**, never a
+silent fall-through); else a local callback → Phase 8 unchanged; else an owner key
+is registered → `pending_owner_approval`; else → deny. A device with **no owner key
+registered behaves exactly as v1.8** (local callback / default deny). A describe of
+the plan gate never prompts twice — keyed verification is a pure signature check,
+no owner prompt.
+
+**Honest limit — this proves *which key*, not *who held it*.** A valid owner
+signature proves the pinned owner *key* approved this plan on this device. It does
+**not** prove a specific human was at the keyboard: **key custody is out of
+scope** — a stolen or auto-signing owner key is the same trust assumption as every
+other Ed25519 key in D2A (host keys, agent keys). 10A upgrades "a string on the
+device" to "a signature from the pinned owner key," and no further. (The seam a
+future *per-agent* remote-keyed authority would revisit — delegating the *right to
+propose* to a specific agent — is Phase 10B, lease delegation.)
+
+Tests: `tests/test_keyed_approval.py`.
 
 ## Node Catalog (v1.8; additive)
 
@@ -1103,7 +1174,7 @@ Still out of scope, each by design: chains deeper than `MAX_DERIVATION_DEPTH` (a
 
 ## Versioning & Compatibility
 
-**The wire format is `v1.8`** as of the node-catalog arc — `d2a.PROTOCOL_VERSION = "1.8"` (defined in `d2a/protocol.py`). **v1.8 is *additive*** — it adds the `describe_node` / `describe_node_response` verbs (the node-level `list_tools` / agent-card; host-key-signed catalog + node self-descriptor) and enriches the existing `node:<id>` DHT record into a signed node descriptor carrying the disclosed capability **names** (address retained, so old address-resolution consumers are unaffected). No field renames, no error codes; same-major peers ignore the new verbs and the extra descriptor fields. See *[Node Catalog](#node-catalog-v18-additive)* above. **v1.7 is *additive*** — it adds the `propose_intervention` verb (mutating fix loop; its `intervention_result` reply and the six `intervention_*` / `invalid_plan` / `audit_sealed` [error codes](#error-model-v14)) and one optional manifest key, `cannot_fix` (the mutating sibling of `cannot_observe`, valid on any manifest, listing a fixer's honest blind spots), carried by Phase 8 intervention capabilities; same-major peers ignore both and records without them stay valid. **v1.6 was *additive*** — the manifest vocabulary gained one optional honesty key, `cannot_observe` (valid on any manifest, distinct from the derived-only `cannot_detect`), carried by the Phase 7 read-only diagnostic capabilities; same-major peers ignore it and records without it stay valid. v1.1 added the `sig` / `sig_key` / `ts` fields (Ed25519 trust); v1.2 **additively** added an optional `manifest` field to capability records; v1.3 **additively** added the `subscribe_event` / `unsubscribe_event` / `event` / `task_status` verbs, an optional per-action `long_running` manifest key, and a small set of eventable live-frame reading fields to the built-in manifests (see *Event Layer* above). **v1.4 is the one *non-additive* bump so far** — it unifies every error/denial onto a single shape with a stable `code` from the [error registry](#error-model-v14). This is a **sanctioned pre-adoption break**: it renames wire fields (`reason` / `error` → `code`), so it is not additive, and it is done now precisely because there are no external consumers yet. **v1.5 is *additive*** — the manifest vocabulary gains four optional derived-provenance keys (`derived` / `recipe` / `fidelity` / `cannot_detect`) and an optional per-field `hz` cadence, so a locally derived capability publishes, discovers, and binds like any other (closing derivation protocol gaps 1 and 3, dated 2026-07-12). It adds a `derived_input_failed` code to the [error registry](#error-model-v14) for a published derivation whose required input died. No field renames, no verb changes; same-major peers ignore the new keys. See the *Error model* section for the migration and the full code registry. Records/messages without any of these remain valid. Records without a manifest remain valid. Every outbound message and every published capability record carries a top-level `"v"` field, injected at the serialization chokepoints (TCP `_tcp_send` / `_handle_tcp`, LAN UDP `_broadcast` / `_handle_udp`, Kademlia `_send` / `_handle`, and both `publish()` sites). It is a plain field, **not** an envelope, so handlers that read `msg["type"]` are unaffected.
+**The wire format is `v1.9`** as of the remote-keyed-approval arc — `d2a.PROTOCOL_VERSION = "1.9"` (defined in `d2a/protocol.py`). **v1.9 is *additive*** — it adds an optional `owner_approval` field on `propose_intervention` (an owner Ed25519 signature over the `plan_hash`, an alternative to the local console callback), a non-terminal `pending_owner_approval` result (round 1 returns the exact `plan_hash` for the owner to sign), and five `owner_*` [error codes](#error-model-v14); the audit entry gains the owner pubkey + signature and the descriptor's `owner_pubkey` is now populated. A device with no owner key registered behaves exactly as v1.8; same-major peers ignore the new field. See *[Remote keyed owner approval](#remote-keyed-owner-approval-phase-10a-v19-additive)* above. **v1.8 is *additive*** — it adds the `describe_node` / `describe_node_response` verbs (the node-level `list_tools` / agent-card; host-key-signed catalog + node self-descriptor) and enriches the existing `node:<id>` DHT record into a signed node descriptor carrying the disclosed capability **names** (address retained, so old address-resolution consumers are unaffected). No field renames, no error codes; same-major peers ignore the new verbs and the extra descriptor fields. See *[Node Catalog](#node-catalog-v18-additive)* above. **v1.7 is *additive*** — it adds the `propose_intervention` verb (mutating fix loop; its `intervention_result` reply and the six `intervention_*` / `invalid_plan` / `audit_sealed` [error codes](#error-model-v14)) and one optional manifest key, `cannot_fix` (the mutating sibling of `cannot_observe`, valid on any manifest, listing a fixer's honest blind spots), carried by Phase 8 intervention capabilities; same-major peers ignore both and records without them stay valid. **v1.6 was *additive*** — the manifest vocabulary gained one optional honesty key, `cannot_observe` (valid on any manifest, distinct from the derived-only `cannot_detect`), carried by the Phase 7 read-only diagnostic capabilities; same-major peers ignore it and records without it stay valid. v1.1 added the `sig` / `sig_key` / `ts` fields (Ed25519 trust); v1.2 **additively** added an optional `manifest` field to capability records; v1.3 **additively** added the `subscribe_event` / `unsubscribe_event` / `event` / `task_status` verbs, an optional per-action `long_running` manifest key, and a small set of eventable live-frame reading fields to the built-in manifests (see *Event Layer* above). **v1.4 is the one *non-additive* bump so far** — it unifies every error/denial onto a single shape with a stable `code` from the [error registry](#error-model-v14). This is a **sanctioned pre-adoption break**: it renames wire fields (`reason` / `error` → `code`), so it is not additive, and it is done now precisely because there are no external consumers yet. **v1.5 is *additive*** — the manifest vocabulary gains four optional derived-provenance keys (`derived` / `recipe` / `fidelity` / `cannot_detect`) and an optional per-field `hz` cadence, so a locally derived capability publishes, discovers, and binds like any other (closing derivation protocol gaps 1 and 3, dated 2026-07-12). It adds a `derived_input_failed` code to the [error registry](#error-model-v14) for a published derivation whose required input died. No field renames, no verb changes; same-major peers ignore the new keys. See the *Error model* section for the migration and the full code registry. Records/messages without any of these remain valid. Records without a manifest remain valid. Every outbound message and every published capability record carries a top-level `"v"` field, injected at the serialization chokepoints (TCP `_tcp_send` / `_handle_tcp`, LAN UDP `_broadcast` / `_handle_udp`, Kademlia `_send` / `_handle`, and both `publish()` sites). It is a plain field, **not** an envelope, so handlers that read `msg["type"]` are unaffected.
 
 The compatibility contract:
 
@@ -1153,6 +1224,7 @@ Each device probes itself at startup using `/proc/meminfo`, `/proc/loadavg`, `/s
 - **Multi-hop derivation chaining (Phase 4, application layer — no protocol change): a recipe's `requires` may be met by a derived capability, so derivations stack (`compute → presence → activity_summary`) both fully-local (planner instantiates the inner recipe) and across-the-wire (consume another agent's published derived cap) on LAN + DHT; strict preference (real > single-hop > two-hop), `MAX_DERIVATION_DEPTH = 2` safety rail, cycle + depth guards (distinct refusal codes), nested provenance with chain-max tier + `cannot_detect` union + concatenated fidelity, and inner-failure propagation through the existing healer/lifecycle state machine** — `python3 examples/chain_demo.py`.
 - **Recipe distribution as community infrastructure (Phase 5, application layer — no protocol change, stdlib only): fetch a signed package from a local directory (a git repo you cloned — no shelling out) or a raw http(s) URL; a mechanical review-then-trust `install` (verify sig → print author fingerprint + requires/provides + effective tier + `fidelity`/`cannot_detect` + the full `transform.py` → typed confirmation, stronger `author-trust` for a new author) that lands the package + trust entry, refuses bad-sig / duplicate-version, and re-reviews a bumped version as new code; a `sign` self-check gate that refuses missing honesty fields or a failing dry-run; `new` scaffolding with the honesty fields present-but-empty; a `conformance` runner emitting a machine-readable `{dry_run, live, environment, passed}` report (dry-run twice across reloads + bounded live run); `registry list`/`show` hygiene** — see [Phase 5](#phase-5--the-registry-as-community-infrastructure).
 - **Observed-cost ranking & quarantine (Phase 6, application layer — no protocol change, stdlib only): the deferred cost optimizer made real from the data the system already generates. A bounded, persistent per-recipe metrics store (`derive_metrics.json`: runs, uptime, heal/failed counts, mean staleness, last conformance — one disk write per run, no per-frame IO) feeds a deterministic within-tier ranking `(observed_score → cost_rank_hint → num_inputs)` where `observed_score = (failure_rate, heal_rate, mean_staleness)`; the strict invariant holds structurally (real > single-hop > two-hop is never overridden — fidelity honesty outranks measured reliability); cold-start recipes rank by hint alone; `python -m d2a_derive.explain <cap>` prints WHY the planner picks what it picks (naming the deciding factor, off the planner's own ranking key); a quarantine quality-gate (failure-rate threshold or a failed conformance run) that `registry list`/`show` surface and the planner refuses to plan without `include_quarantined`, cleared only by a passing conformance run** — see [Phase 6](#phase-6--observed-cost-ranking--quarantine).
+- **Remote keyed owner approval (v1.9): an owner keypair (distinct from the host key) is TOFU-registered on the device (`set_owner_pubkey`, persisted, populates the node-descriptor `owner_pubkey`); an intervention plan is approved by an owner Ed25519 signature over the device-computed `plan_hash` (two-round `pending_owner_approval` → sign → execute), bound to the plan + this device + a nonce/ts (replay-guarded); the audit records the owner pubkey + signature (approver = owner fingerprint) and survives restart with the chain intact; a bad/foreign/stale/replayed/cross-device signature is rejected with a distinct `owner_*` code; a device with no owner key falls back to the local callback unchanged — one gate, no second policy surface; both transports** — honest limit: proves *which key* signed, not *who held it* (key custody out of scope). See [Remote keyed owner approval](#remote-keyed-owner-approval-phase-10a-v19-additive).
 - **Node capability catalog (v1.8): `describe_node` returns the full consent-filtered catalog (name + tier + manifest) + a signed node self-descriptor, host-key-signed once and TOFU-verified + tamper-rejected; sensitive/intervention capabilities OMITTED (not name-only) unless the owner opened them — the one predicate `policy.check == "allow"` builds both the catalog and the `node:<id>` names-record, so visibility never exceeds bind-ability and flips exactly with policy; a describe never prompts the owner; an agent enumerates a reachable node's offering over the DHT with zero prior name knowledge (`agent.node_capabilities`), names-record within an ≤8 KB / ≤256-name budget with truncation; both transports** — see [Node Catalog](#node-catalog-v18-additive).
 - Sense Layer Part 1: all 4 shapes, verdict + confidence, CPU burn load test; **verdict-transition `event_emitter` + `safety_check` hooks closed (Part 2)**
 - Full 10-stage Capability Composition: plan → atomic bind → runtime monitor + fallback → atomic release

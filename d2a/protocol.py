@@ -41,7 +41,15 @@ import logging
 # can enumerate "what does node X offer" over the DHT — complementing "who offers
 # Y"). No field renames — same-major peers ignore the new verbs; the descriptor
 # keeps `address` so old node:<id> address-resolution consumers are unaffected.
-PROTOCOL_VERSION = "1.8"
+# v1.9 (additive): remote KEYED owner approval — an intervention plan can be
+# approved by an OWNER SIGNATURE over the plan_hash (bound to this device + a
+# nonce/ts, replay-guarded), arriving as an optional `owner_approval` field on
+# propose_intervention, as an alternative to the local console callback. Adds a
+# non-terminal `pending_owner_approval` result (round 1 hands the owner the exact
+# plan_hash to sign) and five owner_* error codes; the audit records the owner
+# pubkey + signature. A device with no owner key registered behaves exactly as
+# v1.8 (local callback / default deny); same-major peers ignore the new field.
+PROTOCOL_VERSION = "1.9"
 VERSION_FIELD = "v"
 
 logger = logging.getLogger("d2a.protocol")

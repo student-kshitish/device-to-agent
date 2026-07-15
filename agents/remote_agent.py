@@ -546,7 +546,8 @@ class RemoteAgent:
         return response
 
     def propose_intervention(self, binding: dict, plan: dict,
-                             capability: str = None) -> dict:
+                             capability: str = None,
+                             owner_approval: dict = None) -> dict:
         """
         Propose a MUTATING intervention plan (Phase 8). The device runs a DOUBLE
         GATE — this binding already needed owner approval to exist (the right to
@@ -558,23 +559,34 @@ class RemoteAgent:
         `plan` is an InterventionPlan: {action, params, evidence, expected,
         verify:{diagnostic, condition}, reversible, reversible_how|reversible_ack}.
 
+        REMOTE KEYED APPROVAL (Phase 10A): if the device has an owner key
+        registered and no local console callback, a first proposal returns
+        status=="pending_owner_approval" with an `owner_approval_request`
+        ({plan_hash, device_node_id, nonce, ts}). The owner signs it
+        (signing.sign_owner_approval) and the caller resubmits this SAME plan with
+        the resulting dict as `owner_approval`. The device verifies the signature
+        against the pinned owner key and proceeds. See examples/keyed_approval.
+
         Returns {"type":"intervention_result", "status": executed|denied|
-        failed_verify|refused_preflight|error, "approved", "executed", "verify",
-        "reversible", "reversible_how", "plan_hash", "audit_seq", ...} or the
-        unified error shape. NOTE: a fix that ran but whose verify failed comes back
-        status=="failed_verify" (never a silent success).
+        failed_verify|refused_preflight|error|pending_owner_approval, "approved",
+        "executed", "verify", "reversible", "reversible_how", "plan_hash",
+        "audit_seq", ...} or the unified error shape. NOTE: a fix that ran but whose
+        verify failed comes back status=="failed_verify" (never a silent success).
         """
         self._raise_if_lost(binding.get("binding_id", ""))
         cap    = capability or binding.get("capability_name", "")
         target = binding.get("provider_node_id", "")
         bid    = binding.get("binding_id", "")
-        response = self.swarm.send_and_recv(target, {
+        req = {
             "type":       "propose_intervention",
             "from_node":  self.agent_id,
             "binding_id": bid,
             "capability": cap,
             "plan":       plan,
-        }, timeout=30.0)   # allows for the mutating subprocess + verify read
+        }
+        if owner_approval is not None:
+            req["owner_approval"] = owner_approval
+        response = self.swarm.send_and_recv(target, req, timeout=30.0)   # mutating subprocess + verify read
         if not response:
             return errors.error(errors.NO_RESPONSE, binding_id=bid)
         self._check_version(response)

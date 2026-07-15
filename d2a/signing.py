@@ -22,6 +22,7 @@ and published capability records (device-signed). get_reading / subscribe /
 stream_frame stay binding_id-bearer and are NOT signed (ruling #2).
 """
 
+import os
 import time
 
 from d2a import crypto
@@ -71,6 +72,43 @@ def sign_record(record: dict, private_key: str, public_key: str) -> dict:
 
 def is_signed(msg: dict) -> bool:
     return isinstance(msg, dict) and "sig" in msg and "sig_key" in msg
+
+
+# ── remote keyed owner approval (Phase 10A) ─────────────────────────────────────
+# An owner approves an intervention plan by SIGNING a canonical subject that binds
+# the approval to the exact plan (plan_hash), THIS device (device_node_id), and a
+# fresh nonce+ts (replay). The device and the owner tooling MUST build the subject
+# the same way, so it lives here as one function — the anti-drift point for keyed
+# approval, exactly as the manifest helper is for records.
+OWNER_APPROVAL_KIND = "intervention_approval"
+
+
+def owner_approval_subject(plan_hash: str, device_node_id: str,
+                           nonce: str, ts: float) -> bytes:
+    """The canonical bytes an owner signs to approve ONE plan on ONE device."""
+    return crypto.canonical_json({
+        "kind":           OWNER_APPROVAL_KIND,
+        "plan_hash":      plan_hash,
+        "device_node_id": device_node_id,
+        "nonce":          nonce,
+        "ts":             ts,
+    })
+
+
+def sign_owner_approval(plan_hash: str, device_node_id: str,
+                        owner_private: str, owner_public: str,
+                        nonce: str | None = None, ts: float | None = None) -> dict:
+    """
+    OWNER-SIDE tool: produce the `owner_approval` field an agent attaches to a
+    (re)submitted propose_intervention. Signs the canonical subject with the
+    owner's private key; the device verifies it against the pinned owner pubkey.
+    A fresh nonce + ts default in so each approval is single-use within the window.
+    """
+    nonce = os.urandom(8).hex() if nonce is None else nonce
+    ts = time.time() if ts is None else ts
+    sig = crypto.sign(owner_approval_subject(plan_hash, device_node_id, nonce, ts),
+                      owner_private)
+    return {"owner_pubkey": owner_public, "nonce": nonce, "ts": ts, "sig": sig.hex()}
 
 
 def verify_record(record: dict, pins: "crypto.PinStore") -> str | None:

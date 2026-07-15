@@ -88,7 +88,6 @@ class TestNodeCatalogUnit(unittest.TestCase):
         hdr = resp["node"]
         self.assertEqual(hdr["node_id"], self.dev.node_id)
         self.assertEqual(hdr["protocol_version"], PROTOCOL_VERSION)
-        self.assertEqual(hdr["protocol_version"], "1.8")
         self.assertEqual(hdr["device_class"], self.dev.device_class)
         self.assertEqual(hdr["host_pubkey"], self.dev.public_key)
         self.assertIn("catalog_ts", hdr)
@@ -279,7 +278,7 @@ class NodeCatalogWireMixin:
         self.assertTrue(resp.get("verified"))
         self.assertEqual(resp["provider_node_id"], d.node_id)
         self.assertEqual(resp["node"]["node_id"], d.node_id)
-        self.assertEqual(resp["node"]["protocol_version"], "1.8")
+        self.assertEqual(resp["node"]["protocol_version"], PROTOCOL_VERSION)
         names = sorted(c["name"] for c in resp["catalog"])
         self.assertEqual(names, ["compute", "sensing"])   # camera omitted
         # composes with describe(name): same manifest for a single cap

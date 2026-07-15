@@ -80,6 +80,13 @@ INTERVENTION_VERIFY_FAILED     = "intervention_verify_failed"
 INTERVENTION_ERROR             = "intervention_error"  # the mutation itself failed to run
 AUDIT_SEALED                   = "audit_sealed"        # fail-closed: audit chain broken, refuse
 
+# ── remote keyed owner approval (Phase 10A — owner signs a plan over the wire) ─
+OWNER_APPROVAL_REQUIRED = "owner_approval_required"  # non-terminal: sign the returned plan_hash
+OWNER_UNREGISTERED      = "owner_unregistered"       # keyed approval sent but no owner key pinned
+OWNER_KEY_MISMATCH      = "owner_key_mismatch"       # owner sig from a key that isn't the pinned owner
+OWNER_SIG_INVALID       = "owner_sig_invalid"        # owner signature did not verify over the subject
+OWNER_APPROVAL_STALE    = "owner_approval_stale"     # owner approval outside replay window / replayed
+
 # ── agent-side (never leave the agent, but share the one shape) ──────────────
 NO_RESPONSE         = "no_response"
 BINDING_ID_MISMATCH = "binding_id_mismatch"
@@ -100,6 +107,8 @@ ALL_CODES = frozenset({
     EVENT_CAP_EXCEEDED, DEVICE_EVENT_CAPACITY,
     NOT_AN_INTERVENTION_CAPABILITY, INVALID_PLAN, INTERVENTION_PREFLIGHT_REFUSED,
     INTERVENTION_VERIFY_FAILED, INTERVENTION_ERROR, AUDIT_SEALED,
+    OWNER_APPROVAL_REQUIRED, OWNER_UNREGISTERED, OWNER_KEY_MISMATCH,
+    OWNER_SIG_INVALID, OWNER_APPROVAL_STALE,
     NO_RESPONSE, BINDING_ID_MISMATCH, NO_PROVIDER,
 })
 

@@ -1,5 +1,6 @@
 import hashlib
 import inspect
+import json
 import os
 import threading
 import time
@@ -77,11 +78,18 @@ class DeviceRuntime:
         self.node_id = self.keypair.node_id
         self.private_key = self.keypair.private_key
         self.public_key = self.keypair.public_key
-        # Owner public key, if one is ever registered with this node. FORWARD HOOK
-        # (v1.8): no owner-key registry exists yet, so this stays None and is
-        # OMITTED from the node self-descriptor. When owner registration lands it
-        # rides the descriptor header ("this device belongs to <owner>").
-        self.owner_pubkey: str | None = None
+        # Owner public key (Phase 10A). Persisted, TOFU-pinned owner identity — a
+        # principal DISTINCT from this device's host key. Registered via
+        # set_owner_pubkey(); when present it (a) rides the node descriptor header
+        # ("this device answers to owner <fp>") and (b) enables REMOTE KEYED
+        # approval of intervention plans (an owner signature over the plan_hash, an
+        # alternative to the local console callback). None → Phase 8 behaviour
+        # unchanged (local callback / default deny).
+        self._owner_pin_path = crypto.d2a_home() / f"owner-{name}.json"
+        self.owner_pubkey: str | None = self._load_owner_pubkey()
+        # Bounded replay guard for accepted owner approvals: nonce -> ts, pruned
+        # past the replay window. Stops a captured owner signature being reused.
+        self._owner_approval_seen: dict[str, float] = {}
         # This device pins the AGENTS that bind to it. Per-name pin file so
         # concurrent nodes in one process don't clobber each other's pins.
         self.pins = crypto.PinStore(path=crypto.d2a_home() / f"pins-{name}.json")
@@ -1199,19 +1207,44 @@ class DeviceRuntime:
                                code=errors.INTERVENTION_PREFLIGHT_REFUSED,
                                audit_seq=(entry or {}).get("seq"))
 
-            # PER-PLAN owner approval (second gate; default DENY). The owner sees
-            # the FULL normalized plan (incl reversible / reversible_ack).
-            if not self._intervention_approve(nplan, agent_id):
+            # PER-PLAN owner approval (second gate; default DENY). Local console
+            # callback OR a remote KEYED owner signature (Phase 10A) — one gate,
+            # resolved here. The owner sees the FULL normalized plan.
+            decision = self._resolve_plan_approval(nplan, plan_hash, agent_id, message)
+
+            # PENDING (10A round 1): keyed approval is required but no signature was
+            # attached. Hand the owner the exact plan_hash + nonce to sign and
+            # resubmit. NON-TERMINAL — nothing mutates, nothing is audited yet.
+            if decision["kind"] == "pending":
+                print(f"[{self.name}] propose_intervention PENDING owner signature "
+                      f"cap={capability} action={nplan['action']}")
+                out = _result("pending_owner_approval", approved=False, executed=False,
+                              verify=_NO_VERIFY, detail="owner signature required",
+                              code=errors.OWNER_APPROVAL_REQUIRED)
+                out["owner_approval_request"] = {
+                    "plan_hash":      plan_hash,
+                    "device_node_id": self.node_id,
+                    "owner_pubkey":   self.owner_pubkey,
+                    "nonce":          decision["nonce"],
+                    "ts":             decision["ts"],
+                }
+                return out
+
+            if not decision["approved"]:
+                # A keyed denial carries a distinct code (bad sig / stale / mismatch);
+                # a local-callback denial keeps the Phase 8 approval_required code.
+                deny_code   = decision.get("code", errors.APPROVAL_REQUIRED)
+                deny_detail = decision.get("detail", "owner declined this plan")
                 entry = self._audit_intervention(
                     agent_id=agent_id, capability=capability, plan=nplan,
                     plan_hash=plan_hash, approved=False, executed=False,
                     verify_outcome="not_run", result_status="denied",
-                    detail="owner declined this plan")
-                print(f"[{self.name}] propose_intervention DENIED by owner "
-                      f"cap={capability} action={nplan['action']}")
+                    detail=deny_detail, approval=decision)
+                print(f"[{self.name}] propose_intervention DENIED ({decision['kind']}) "
+                      f"cap={capability} action={nplan['action']} — {deny_detail}")
                 return _result("denied", approved=False, executed=False,
-                               verify=_NO_VERIFY, detail="owner declined this plan",
-                               code=errors.APPROVAL_REQUIRED,
+                               verify=_NO_VERIFY, detail=deny_detail,
+                               code=deny_code,
                                audit_seq=(entry or {}).get("seq"))
 
             # APPROVED → execute the mutation, then the DEVICE runs the declared
@@ -1224,7 +1257,7 @@ class DeviceRuntime:
                     agent_id=agent_id, capability=capability, plan=nplan,
                     plan_hash=plan_hash, approved=True, executed=False,
                     verify_outcome="not_run", result_status="error",
-                    detail=exec_res.get("detail", ""))
+                    detail=exec_res.get("detail", ""), approval=decision)
                 return _result("error", approved=True, executed=False,
                                verify=_NO_VERIFY, detail=exec_res.get("detail", ""),
                                code=errors.INTERVENTION_ERROR,
@@ -1237,7 +1270,7 @@ class DeviceRuntime:
                 plan_hash=plan_hash, approved=True, executed=True,
                 verify_outcome=("pass" if verify["passed"] else "fail"),
                 result_status=status, verify_reading=verify.get("reading"),
-                detail=exec_res.get("detail", ""))
+                detail=exec_res.get("detail", ""), approval=decision)
             print(f"[{self.name}] propose_intervention {status.upper()} "
                   f"cap={capability} action={nplan['action']} verify={verify['passed']}")
             return _result(status, approved=True, executed=True, verify=verify,
@@ -1684,8 +1717,132 @@ class DeviceRuntime:
         bool. Called for every propose_intervention AFTER preflight. Default (no
         callback) DENIES — nothing mutates without an explicit owner yes. The
         callback receives the FULL plan (including reversible / reversible_how) so
-        the owner approves a SPECIFIC plan, not a resource name."""
+        the owner approves a SPECIFIC plan, not a resource name.
+
+        Coexists with remote KEYED approval (Phase 10A): if a request carries an
+        owner signature it takes precedence; this local console callback is the
+        fallback used when no signature is attached."""
         self._intervention_approval_callback = fn
+
+    # ── owner identity (Phase 10A — remote keyed approval) ────────────────────
+
+    def _load_owner_pubkey(self) -> str | None:
+        try:
+            if self._owner_pin_path.exists():
+                return json.loads(self._owner_pin_path.read_text()).get("owner_pubkey")
+        except (OSError, ValueError):
+            pass
+        return None
+
+    def _save_owner_pubkey(self, pubkey: str) -> None:
+        self._owner_pin_path.parent.mkdir(parents=True, exist_ok=True)
+        fd = os.open(self._owner_pin_path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        try:
+            os.write(fd, json.dumps({"owner_pubkey": pubkey}).encode())
+        finally:
+            os.close(fd)
+        try:
+            os.chmod(self._owner_pin_path, 0o600)
+        except OSError:
+            pass
+
+    def set_owner_pubkey(self, pubkey: str, rotate: bool = False) -> dict:
+        """
+        Register the OWNER's public key on this device (Phase 10A). TOFU: the first
+        registration pins it; a DIFFERENT key later is rejected unless rotate=True
+        (owner key rotation is a deliberate, rare act). Persists across restarts
+        (0600, like keys/pins). Once set it populates the node descriptor's
+        owner_pubkey slot and enables keyed approval of intervention plans.
+        """
+        if not isinstance(pubkey, str) or not pubkey:
+            return {"status": "error", "code": errors.OWNER_SIG_INVALID,
+                    "detail": "owner pubkey must be a non-empty hex string"}
+        existing = self.owner_pubkey
+        if existing and existing != pubkey and not rotate:
+            return {"status": "error", "code": errors.OWNER_KEY_MISMATCH,
+                    "detail": "an owner key is already pinned; pass rotate=True to replace it"}
+        self._save_owner_pubkey(pubkey)
+        self.owner_pubkey = pubkey
+        # Reflect the new owner in discovery immediately if the swarm is up.
+        try:
+            self._publish_node_descriptor()
+        except Exception:
+            pass
+        return {"status": "ok", "owner_fingerprint": "owner:" + crypto.derive_node_id(pubkey),
+                "rotated": bool(existing and existing != pubkey)}
+
+    def _prune_owner_seen(self, now: float) -> None:
+        stale = [n for n, t in self._owner_approval_seen.items()
+                 if now - t > signing.REPLAY_WINDOW_SECONDS]
+        for n in stale:
+            self._owner_approval_seen.pop(n, None)
+
+    def _verify_owner_approval(self, owner_approval: dict, plan_hash: str) -> dict:
+        """
+        Verify a keyed owner approval bound to `plan_hash`. Returns a decision dict:
+          {"kind":"keyed","approved":True, owner_pubkey, owner_sig, nonce, ts, approver}
+          {"kind":"keyed","approved":False, "code":..., "detail":...}
+        The signature must be over signing.owner_approval_subject(plan_hash, THIS
+        device, nonce, ts) — so it binds to the exact normalized plan, THIS device,
+        and a fresh nonce+ts. A signature for a different plan yields a different
+        subject and fails verification (no separate plan compare needed).
+        """
+        def deny(code, detail):
+            return {"kind": "keyed", "approved": False, "code": code, "detail": detail}
+
+        if self.owner_pubkey is None:
+            return deny(errors.OWNER_UNREGISTERED, "no owner key registered on this device")
+        pub   = owner_approval.get("owner_pubkey")
+        sig   = owner_approval.get("sig")
+        nonce = owner_approval.get("nonce")
+        ts    = owner_approval.get("ts")
+        if pub != self.owner_pubkey:
+            return deny(errors.OWNER_KEY_MISMATCH, "owner signature is not from the pinned owner key")
+        if not isinstance(ts, (int, float)) or isinstance(ts, bool):
+            return deny(errors.OWNER_APPROVAL_STALE, "owner approval has no valid ts")
+        now = time.time()
+        if abs(now - ts) > signing.REPLAY_WINDOW_SECONDS:
+            return deny(errors.OWNER_APPROVAL_STALE, "owner approval outside the replay window")
+        if not isinstance(nonce, str) or not nonce:
+            return deny(errors.OWNER_APPROVAL_STALE, "owner approval has no nonce")
+        self._prune_owner_seen(now)
+        if nonce in self._owner_approval_seen:
+            return deny(errors.OWNER_APPROVAL_STALE, "owner approval nonce already used (replay)")
+        try:
+            sig_bytes = bytes.fromhex(sig)
+        except (ValueError, TypeError):
+            return deny(errors.OWNER_SIG_INVALID, "owner signature is not valid hex")
+        subject = signing.owner_approval_subject(plan_hash, self.node_id, nonce, ts)
+        if not crypto.verify(subject, sig_bytes, pub):
+            return deny(errors.OWNER_SIG_INVALID, "owner signature did not verify over the plan")
+        # Accept — record the nonce so this exact approval cannot be replayed.
+        self._owner_approval_seen[nonce] = now
+        return {"kind": "keyed", "approved": True, "owner_pubkey": pub,
+                "owner_sig": sig, "nonce": nonce, "ts": ts,
+                "approver": "owner:" + crypto.derive_node_id(pub)}
+
+    def _resolve_plan_approval(self, nplan: dict, plan_hash: str,
+                               agent_id: str, message: dict) -> dict:
+        """
+        THE per-plan approval decision, ONE gate, priority order (no second policy
+        surface — only the ACCEPTANCE proof differs):
+          1. an attached owner signature  → keyed verify (authoritative; a bad sig
+             is a hard deny, never a silent fall-through to the callback);
+          2. else a local console callback → Phase 8 behaviour (unchanged);
+          3. else an owner key is registered → PENDING: hand the owner the exact
+             plan_hash + nonce to sign and resubmit;
+          4. else → deny (Phase 8 default).
+        """
+        owner_approval = message.get("owner_approval")
+        if isinstance(owner_approval, dict):
+            return self._verify_owner_approval(owner_approval, plan_hash)
+        if self._intervention_approval_callback is not None:
+            approved = self._intervention_approve(nplan, agent_id)
+            return {"kind": "local", "approved": approved, "approver": "device_owner@local"}
+        if self.owner_pubkey is not None:
+            return {"kind": "pending", "approved": False,
+                    "nonce": os.urandom(8).hex(), "ts": time.time()}
+        return {"kind": "local", "approved": False, "approver": "device_owner@local"}
 
     def _audit_log(self) -> AuditLog:
         if self._audit is None:
@@ -1909,9 +2066,26 @@ class DeviceRuntime:
                             plan_hash: str, approved: bool, executed: bool,
                             verify_outcome: str, result_status: str,
                             verify_reading: dict | None = None,
-                            detail: str = "") -> dict | None:
+                            detail: str = "",
+                            approval: dict | None = None) -> dict | None:
         """Append ONE signed audit entry for a terminal intervention outcome.
-        Returns the signed entry, or None if the log refused (fail-closed)."""
+        Returns the signed entry, or None if the log refused (fail-closed).
+
+        `approval` is the resolver's decision (Phase 10A). For a KEYED approval the
+        entry records the owner PUBKEY + owner SIGNATURE and the `approver` becomes
+        the owner key fingerprint — cryptographic proof of WHICH key approved,
+        upgrading the old 'device_owner@local' console attestation. A local-callback
+        approval keeps the console-attestation string and adds no owner fields."""
+        approver   = "device_owner@local"
+        owner_flds: dict = {}
+        if approval and approval.get("kind") == "keyed" and approval.get("approved"):
+            approver = approval.get("approver", approver)
+            owner_flds = {
+                "owner_pubkey": approval.get("owner_pubkey"),
+                "owner_sig":    approval.get("owner_sig"),
+                "owner_nonce":  approval.get("nonce"),
+                "owner_ts":     approval.get("ts"),
+            }
         try:
             return self._audit_log().append({
                 "kind":           "intervention",
@@ -1921,7 +2095,8 @@ class DeviceRuntime:
                 "plan":           plan,
                 "plan_hash":      plan_hash,
                 "approved":       approved,
-                "approver":       "device_owner@local",   # at-device attestation, not a key
+                "approver":       approver,            # owner key fp (keyed) or local attestation
+                **owner_flds,
                 "executed":       executed,
                 "verify_outcome": verify_outcome,          # pass | fail | not_run
                 "verify_reading": verify_reading or {},
