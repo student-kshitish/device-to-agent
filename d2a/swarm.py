@@ -46,6 +46,28 @@ class SwarmTransport(abc.ABC):
         Concrete LAN/DHT transports override this.
         """
 
+    def publish_node_descriptor(self, descriptor: dict) -> None:
+        """
+        Publish a per-node descriptor (v1.8): a signed record carrying the node's
+        OPEN-TIER capability NAMES plus its address, keyed by node id so an agent
+        can enumerate "what does node X offer" over the discovery layer. Default
+        no-op — a broadcast transport (LANSwarm) already carries every open cap
+        record on the wire, so the names are discoverable from the record cache;
+        only a keyed DHT needs a dedicated node record. DHTSwarm overrides.
+        """
+
+    def fetch_node_descriptor(self, node_id: str) -> dict | None:
+        """
+        Return the raw (still-signed) node descriptor for node_id, or None if this
+        transport does not keep one (the consumer then falls back to whatever
+        capability records it already holds for the node). DHTSwarm overrides.
+        """
+        return None
+
+    def unpublish_node_descriptor(self, node_id: str) -> None:
+        """Retract this node's descriptor on graceful departure. Default no-op
+        (nothing to retract on a broadcast transport). DHTSwarm overrides."""
+
     @abc.abstractmethod
     def discover(self, capability_name: str = None) -> list[dict]:
         """Return live capability records. None = all."""

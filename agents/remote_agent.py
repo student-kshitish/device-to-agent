@@ -201,6 +201,60 @@ class RemoteAgent:
                         return man
         return None
 
+    def describe_node(self, target_node_id: str) -> dict:
+        """
+        Ask a reachable node for its FULL, consent-filtered capability catalog +
+        node self-descriptor (v1.8 — the MCP list_tools / A2A agent-card
+        equivalent). Point-to-point, signed both ways: our request is signed (so
+        the node can raise our disclosure above open tier if we're authorized),
+        the response is host-key-signed and verified + TOFU-pinned here exactly
+        like a bind_response. Returns {node, catalog, verified} or an error dict.
+
+        The catalog omits any capability we could not bind right now (deny-by-
+        default): sensitive / intervention entries are ABSENT — not name-only —
+        unless the owner has pre-allowed them. Composes with describe(name): use
+        this for the whole node, describe() for one cached capability's manifest.
+        """
+        request = signing.sign_message(
+            {"type": "describe_node", "from_node": self.agent_id},
+            self.private_key, self.public_key,
+        )
+        response = self.swarm.send_and_recv(target_node_id, request, timeout=5.0)
+        if not response:
+            return {"status": "error", "code": errors.NO_RESPONSE,
+                    "detail": f"No response from {target_node_id[:8]}",
+                    "provider_node_id": target_node_id}
+        self._check_version(response)                      # raises on major mismatch
+
+        trust_error = signing.verify_message(response, target_node_id, self.pins)
+        response["provider_node_id"] = target_node_id
+        if trust_error is not None:
+            response["verified"]    = False
+            response["trust_error"] = trust_error
+            return response
+        response["verified"] = True
+        return response
+
+    def node_capabilities(self, node_id: str) -> list[str]:
+        """
+        Enumerate the OPEN-TIER capability NAMES a node offers with ZERO prior name
+        knowledge (v1.8) — "what does node X offer", complementing find_capability
+        ("who offers Y"). On a DHT this reads the signed node:<id> descriptor and
+        verifies + TOFU-pins it before trusting the names; a tampered / key-changed
+        descriptor yields []. On a broadcast transport (no keyed descriptor) it
+        falls back to the names already in the local discovery cache. For the FULL
+        manifests, follow up with describe_node(node_id).
+        """
+        desc = self.swarm.fetch_node_descriptor(node_id)
+        if desc is not None:
+            if signing.verify_record(desc, self.pins) is None:
+                return sorted(desc.get("capability_names", []))
+            return []                                      # tamper / pin mismatch
+        # Fallback: names from whatever records we've cached for this node.
+        with self.swarm._lock:
+            return sorted({name for (nid, name) in self.swarm.records
+                           if nid == node_id and name})
+
     def bind_remote_to(self, target_node_id: str, capability_name: str, priority: int = 5) -> dict:
         """
         Bind a specific named capability on a specific provider node.

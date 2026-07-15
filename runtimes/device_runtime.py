@@ -18,6 +18,7 @@ from d2a import (
 )
 from d2a import signing
 from d2a import manifest as _manifest
+from d2a.protocol import PROTOCOL_VERSION
 from d2a.resource_probes import probe_resources, RESOURCE_SENSITIVITY
 from d2a.policy import ResourcePolicy
 from d2a.stream_source import (
@@ -40,6 +41,15 @@ from d2a.sense_types import SenseRequest, SenseFrame
 MAX_SAMPLE_HZ = 10.0
 EVENT_SUBS_PER_BINDING   = 8    # what a single live lease may purchase
 EVENT_SUBS_PER_CAPABILITY = 32  # device-wide ceiling on one shared loop
+
+# ── node capability catalog (v1.8) ──────────────────────────────────────────────
+# Size discipline for the DHT node descriptor (node:<id> names-record). It rides a
+# single UDP datagram with exactly ONE provider (the node itself), so the N×record
+# ceiling that bounds cap:<name> does NOT apply — but we still cap it to stay well
+# clear of the datagram limit and match the manifest-cap philosophy. describe_node
+# (TCP, no datagram ceiling) is the complete-catalog fallback when this truncates.
+MAX_DESCRIPTOR_NAMES = 256      # open-tier names in one node:<id> record
+MAX_DESCRIPTOR_BYTES = 8192     # serialized ceiling; trim names past it
 
 
 class DeviceRuntime:
@@ -67,6 +77,11 @@ class DeviceRuntime:
         self.node_id = self.keypair.node_id
         self.private_key = self.keypair.private_key
         self.public_key = self.keypair.public_key
+        # Owner public key, if one is ever registered with this node. FORWARD HOOK
+        # (v1.8): no owner-key registry exists yet, so this stays None and is
+        # OMITTED from the node self-descriptor. When owner registration lands it
+        # rides the descriptor header ("this device belongs to <owner>").
+        self.owner_pubkey: str | None = None
         # This device pins the AGENTS that bind to it. Per-name pin file so
         # concurrent nodes in one process don't clobber each other's pins.
         self.pins = crypto.PinStore(path=crypto.d2a_home() / f"pins-{name}.json")
@@ -500,6 +515,12 @@ class DeviceRuntime:
                 self.swarm.unpublish({"node_id": nid, "name": name})
             except Exception:
                 pass
+        # Retract the node descriptor too (v1.8) so node:<id> stops answering
+        # "what does node X offer" the moment we leave — no TTL ghost.
+        try:
+            self.swarm.unpublish_node_descriptor(self.node_id)
+        except Exception:
+            pass
 
     # ── lease expiry sweeper ────────────────────────────────────────────────────
 
@@ -588,6 +609,17 @@ class DeviceRuntime:
             "token_sig": b.token.signature,
         })
 
+    def _cap_manifest(self, cap) -> dict | None:
+        """
+        THE single source of a capability's manifest: its own attached manifest
+        (virtual / diagnostic / intervention / derived) or the shipped built-in
+        (compute / sensing / raw_*), else None. Anti-drift rule (v1.8): BOTH the
+        published capability record (_capability_record) AND the describe_node
+        catalog route through this ONE expression, so the on-wire manifest and the
+        catalog manifest can never disagree.
+        """
+        return cap.manifest if getattr(cap, "manifest", None) else _manifest.builtin_manifest(cap)
+
     def _capability_record(self, cap, ip, port) -> dict:
         """
         THE single capability-record builder — used by BOTH the UDP/DHT publish
@@ -608,7 +640,7 @@ class DeviceRuntime:
             "device_class": self.device_class,
             "ts":           time.time(),
         }
-        man = cap.manifest if getattr(cap, "manifest", None) else _manifest.builtin_manifest(cap)
+        man = self._cap_manifest(cap)
         if man is not None:
             record["manifest"] = man
         return signing.sign_record(record, self.private_key, self.public_key)
@@ -617,6 +649,127 @@ class DeviceRuntime:
         ip, port = self.swarm.address
         for cap in self.advertise():
             self.swarm.publish(self._capability_record(cap, ip, port))
+        # v1.8: (re)publish the node descriptor (open-tier names under node:<id>)
+        # AFTER the caps so its name list reflects the freshly published set.
+        self._publish_node_descriptor()
+
+    # ── node capability catalog (v1.8) ──────────────────────────────────────────
+
+    def _cap_tier(self, cap) -> str:
+        """The capability's consent tier ('open'|'sensitive'|'intervention').
+        From its manifest's consent_tier (the SSOT-validated value), else the
+        resource's intrinsic sensitivity (unknown → 'sensitive', safe)."""
+        man = self._cap_manifest(cap)
+        if man and man.get("consent_tier"):
+            return man["consent_tier"]
+        return _manifest.consent_tier_for_resource(cap.name)
+
+    def _catalog_entry(self, cap) -> dict:
+        """One catalog row: name + tier + full manifest (via the SAME _cap_manifest
+        expression the published record uses — anti-drift) + tags."""
+        return {
+            "name":     cap.name,
+            "tier":     self._cap_tier(cap),
+            "tags":     list(cap.tags),
+            "manifest": self._cap_manifest(cap),   # may be None (additive contract)
+        }
+
+    def _catalog_for(self, requester_id: str) -> list[dict]:
+        """
+        Assemble the consent-filtered catalog. ONE PREDICATE (v1.8, binding): a
+        capability is disclosed IFF it would pass the bind gate's static half right
+        now — policy.check(name, requester, is_remote=True) == "allow". Nothing
+        else. needs_approval / deny entries are OMITTED ENTIRELY (not name-only),
+        so an unauthorized agent cannot even tell they exist. Visibility never
+        exceeds bind-ability, and it flips EXACTLY when policy.check flips.
+
+        This SAME predicate builds the describe_node catalog AND the node:<id>
+        names-record — no second/parallel visibility rule anywhere, so the two
+        surfaces can never disagree. It is a READ: it calls policy.check (the
+        static rule table) and NEVER policy.approve (no owner prompt — a catalog
+        request that prompts the owner would be a DoS).
+
+        `requester_id` is passed straight to policy.check. Today the policy is
+        agent-agnostic (rules are per-resource), so the disclosed set is the same
+        for every requester; the id is threaded through so a future per-agent
+        policy tightens BOTH the catalog and binding through this one call. A cap
+        the owner has opened with policy.allow() (e.g. camera) becomes bindable by
+        any remote agent AND therefore enumerable — consistent, by design. A cap
+        left at needs_approval (the default for every sensitive / intervention
+        capability) stays un-bindable-without-consent AND invisible.
+        """
+        return [self._catalog_entry(cap) for cap in self.advertise()
+                if self.policy.check(cap.name, requester_id, is_remote=True) == "allow"]
+
+    def _node_header(self, catalog_count: int, catalog_truncated: bool) -> dict:
+        """The node self-descriptor header (ruling 2): one answer to 'what is this
+        node'. owner_pubkey is omitted while unregistered (forward hook)."""
+        hdr = {
+            "node_id":           self.node_id,
+            "protocol_version":  PROTOCOL_VERSION,
+            "device_class":      self.device_class,
+            "host_pubkey":       self.public_key,
+            "catalog_ts":        time.time(),
+            "catalog_count":     catalog_count,
+            "catalog_truncated": catalog_truncated,
+        }
+        if self.owner_pubkey:
+            hdr["owner_pubkey"] = self.owner_pubkey
+        return hdr
+
+    def _node_descriptor(self) -> dict:
+        """
+        Build the signed node descriptor for the node:<id> names-record: the
+        disclosed capability names (the SAME _catalog_for predicate the
+        describe_node catalog uses — one predicate, both surfaces) plus the
+        address (retained for _resolve_peer). The names-record is world-readable,
+        so it carries names only — never manifests — and, like the catalog, omits
+        any cap the owner hasn't opened for binding. Size-disciplined: truncated
+        to MAX_DESCRIPTOR_NAMES / MAX_DESCRIPTOR_BYTES with truncated:true past it.
+        Signed with sign_record (ts excluded, TTL-managed) like every DHT record.
+        """
+        names = [e["name"] for e in self._catalog_for("")]
+        names.sort()
+        truncated = False
+        if len(names) > MAX_DESCRIPTOR_NAMES:
+            names = names[:MAX_DESCRIPTOR_NAMES]
+            truncated = True
+        try:
+            ip, port = self.swarm.address
+        except Exception:
+            ip, port = ("0.0.0.0", 0)
+
+        def _signed(nm, trunc):
+            return signing.sign_record({
+                "node_id":          self.node_id,
+                "node_descriptor":  True,
+                "device_class":     self.device_class,
+                "public_key":       self.public_key,
+                "address":          [ip, port],
+                "capability_names": list(nm),
+                "truncated":        trunc,
+            }, self.private_key, self.public_key)
+
+        # Enforce the serialized byte ceiling on the SIGNED record (the on-wire
+        # shape — the signature/keys are ~200 B of fixed overhead) by trimming
+        # names, the cheapest signal to drop; the full catalog is still reachable
+        # via describe_node over TCP, which has no datagram ceiling.
+        import json as _json
+        signed = _signed(names, truncated)
+        while len(_json.dumps(signed, default=str).encode()) > MAX_DESCRIPTOR_BYTES and names:
+            names.pop()
+            truncated = True
+            signed = _signed(names, truncated)
+        return signed
+
+    def _publish_node_descriptor(self) -> None:
+        """(Re)publish the node descriptor whenever the offered capability set
+        changes. Best-effort + no-op on transports without a keyed node record
+        (LANSwarm carries every open cap record on the wire already)."""
+        try:
+            self.swarm.publish_node_descriptor(self._node_descriptor())
+        except Exception:
+            pass
 
     # ── binding scope verification ─────────────────────────────────────────────
 
@@ -886,6 +1039,29 @@ class DeviceRuntime:
             ip, port = self.swarm.address
             records = [self._capability_record(cap, ip, port) for cap in self.advertise()]
             return {"type": "capabilities_response", "records": records}
+
+        # ── node capability catalog (v1.8 — the list_tools / agent-card verb) ──
+        # Point-to-point: an agent that can REACH this node asks it directly for
+        # its FULL, consent-filtered catalog + a node self-descriptor. The whole
+        # response is host-key-signed (ONE signature over header + catalog), so the
+        # agent verifies + TOFU-pins it exactly like a bind_response.
+        #
+        # Disclosure is the ONE PREDICATE (policy.check == "allow", via
+        # _catalog_for): a cap is listed IFF the requester could bind it right now.
+        # A describe is a pure READ — it consults the static rule table and NEVER
+        # policy.approve, so it can never prompt the owner (that would be a DoS).
+        # The signed `from_node` is threaded to policy.check (agent-agnostic today;
+        # a future per-agent policy narrows the catalog through the same call). We
+        # deliberately do NOT verify/pin the requester here — describe leaves no
+        # trust side effect; the RESPONSE is what carries authenticity.
+        if mtype == "describe_node":
+            requester = message.get("from_node", "") or ""
+            catalog = self._catalog_for(requester)
+            header  = self._node_header(catalog_count=len(catalog), catalog_truncated=False)
+            print(f"[{self.name}] describe_node from {(requester or 'anon')[:8]} "
+                  f"→ {len(catalog)} cap(s)")
+            return self._sign({"type": "describe_node_response",
+                               "node": header, "catalog": catalog})
 
         # ── on-demand data pull (THE DEFAULT) ─────────────────────────────────
         if mtype == "get_reading":
@@ -1466,6 +1642,7 @@ class DeviceRuntime:
         try:
             ip, port = self.swarm.address
             self.swarm.publish(self._capability_record(cap, ip, port))
+            self._publish_node_descriptor()                # offered set changed
         except Exception:
             pass
 
@@ -1494,6 +1671,7 @@ class DeviceRuntime:
         self.data._sources.pop(cap_name, None)
         try:
             self.swarm.unpublish({"node_id": self.node_id, "name": cap_name})
+            self._publish_node_descriptor()                # offered set changed
         except Exception:
             pass
         print(f"[{self.name}] detach_diagnostic  cap={cap_name}")
@@ -1572,6 +1750,7 @@ class DeviceRuntime:
         try:
             ip, port = self.swarm.address
             self.swarm.publish(self._capability_record(cap, ip, port))
+            self._publish_node_descriptor()                # offered set changed
         except Exception:
             pass
 
@@ -1601,6 +1780,7 @@ class DeviceRuntime:
         self.data._sources.pop(cap_name, None)
         try:
             self.swarm.unpublish({"node_id": self.node_id, "name": cap_name})
+            self._publish_node_descriptor()                # offered set changed
         except Exception:
             pass
         print(f"[{self.name}] detach_intervention  cap={cap_name}")
@@ -1801,6 +1981,7 @@ class DeviceRuntime:
 
         ip, port = self.swarm.address
         self.swarm.publish(self._capability_record(cap, ip, port))
+        self._publish_node_descriptor()                    # offered set changed
         print(f"[{self.name}] publish_virtual name={name} kind={kind} access={access}")
         return {"name": name, "kind": kind, "access": access, "node_id": self.node_id}
 
@@ -1897,6 +2078,7 @@ class DeviceRuntime:
         self.broker.quotas.pop(cap_name, None)
         try:
             self.swarm.unpublish({"node_id": self.node_id, "name": cap_name})
+            self._publish_node_descriptor()                # offered set changed
         except Exception:
             pass
         print(f"[{self.name}] unpublish_derived name={cap_name} code={code} "

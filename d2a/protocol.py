@@ -33,7 +33,15 @@ import logging
 # "intervention", an optional manifest "cannot_fix" honesty key + a per-action
 # "mutating" flag, and the propose_intervention verb (owner-gated). No field
 # renames — same-major peers ignore the new keys/verb.
-PROTOCOL_VERSION = "1.7"
+# v1.8 (additive): the node capability catalog — the describe_node /
+# describe_node_response verbs (point-to-point, host-key-signed: a node's FULL
+# tier-filtered capability catalog, the MCP list_tools / A2A agent-card
+# equivalent), a node self-descriptor header, and a richer node:<id> DHT record
+# (a signed node descriptor carrying the open-tier capability NAMES, so an agent
+# can enumerate "what does node X offer" over the DHT — complementing "who offers
+# Y"). No field renames — same-major peers ignore the new verbs; the descriptor
+# keeps `address` so old node:<id> address-resolution consumers are unaffected.
+PROTOCOL_VERSION = "1.8"
 VERSION_FIELD = "v"
 
 logger = logging.getLogger("d2a.protocol")

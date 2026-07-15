@@ -115,11 +115,14 @@ class DHTSwarm(LANSwarm):
             if nid and rec.get("address"):
                 self._peers[nid] = tuple(rec["address"])
 
-        # Publish into the DHT: by capability name and by node id (address resolution).
+        # Publish into the DHT by capability name. The node:<id> key is NOT written
+        # here anymore: as of v1.8 it holds a dedicated signed NODE DESCRIPTOR
+        # (open-tier capability names + address), published via
+        # publish_node_descriptor() by the runtime. Until that lands, address
+        # resolution still works from the local _peers cache (populated above) and
+        # from any cap:<name> record, which also carries `address`.
         if name:
             self._dht.store(f"cap:{name}", rec)
-        if nid:
-            self._dht.store(f"node:{nid}", rec)
 
     def discover(self, capability_name: str = None) -> list[dict]:
         if capability_name is not None:
@@ -152,8 +155,40 @@ class DHTSwarm(LANSwarm):
         # locate the record in its (node_id, name)-keyed cache and drop it.
         if name:
             self._dht.remove(f"cap:{name}", nid, {"name": name})
-        if nid:
-            self._dht.remove(f"node:{nid}", nid, {"name": name})
+        # node:<id> is NOT tombstoned here — it now holds the shared node
+        # descriptor (v1.8), which outlives any single capability. Retracting one
+        # capability instead refreshes the descriptor (runtime republishes a
+        # smaller name list); the descriptor is tombstoned only on full departure
+        # via unpublish_node_descriptor().
+
+    # ── per-node descriptor (v1.8) — the names-record under node:<id> ─────────────
+
+    def publish_node_descriptor(self, descriptor: dict) -> None:
+        """Store the signed node descriptor under node:<id> (the SAME key used for
+        address resolution — extended, not forked). It carries the open-tier
+        capability names + address, so _resolve_peer keeps working from it."""
+        nid = descriptor.get("node_id", "")
+        if not nid:
+            return
+        with self._lock:
+            if descriptor.get("address"):
+                self._peers[nid] = tuple(descriptor["address"])
+        self._dht.store(f"node:{nid}", dict(descriptor))
+
+    def fetch_node_descriptor(self, node_id: str) -> dict | None:
+        """Fetch the raw signed node descriptor from the DHT (the consumer verifies
+        + TOFU-pins it before trusting the names). None if none is published."""
+        found = self._dht.find_value(f"node:{node_id}")
+        self._absorb(found)                                # keep _peers warm
+        for r in found:
+            if r.get("node_descriptor") and not r.get("tombstone"):
+                return dict(r)
+        return None
+
+    def unpublish_node_descriptor(self, node_id: str) -> None:
+        """Tombstone the node descriptor on full graceful departure."""
+        if node_id:
+            self._dht.remove(f"node:{node_id}", node_id, {"node_descriptor": True})
 
     def _absorb(self, records: list[dict]) -> None:
         """Merge DHT-discovered records into the local records + peer tables. A
@@ -164,6 +199,14 @@ class DHTSwarm(LANSwarm):
                 nid = r.get("node_id", "")
                 name = r.get("name", "")
                 if not nid:
+                    continue
+                # A node descriptor (v1.8) is NOT a capability record — it only
+                # carries address + open-tier names. Use it to warm _peers, but
+                # never insert it into the (node_id, name)-keyed capability cache
+                # (it has no `name`, and it must not surface from discover()).
+                if r.get("node_descriptor"):
+                    if not r.get("tombstone") and r.get("address"):
+                        self._peers[nid] = tuple(r["address"])
                     continue
                 if r.get("tombstone"):
                     self.records.pop((nid, name), None)

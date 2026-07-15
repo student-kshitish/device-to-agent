@@ -705,6 +705,111 @@ keyed owner approval lands later; today it is a local trust assertion.
 
 Demo: `examples/intervention_demo.py`. Tests: `tests/test_intervention.py`.
 
+## Node Catalog (v1.8; additive)
+
+Every arc before this made a *named* capability easier to find, trust, or bind.
+This one adds the primitive both MCP (`list_tools`) and A2A (the agent card) treat
+as foundational and D2A lacked: **ask a node WHAT IT CAN DO without knowing any
+capability name in advance.** Until now discovery was lookup-by-name — ask the DHT
+*"who provides `sensing`?"* — with no *"what does node X offer?"* and no
+full-manifest enumeration (`discover(None)` on a DHT can only return the local
+cache; a DHT can't enumerate its keys).
+
+**`describe_node` — the node-level `list_tools` / agent-card.** An agent that can
+**reach** a node asks it directly (point-to-point TCP) for its **full capability
+catalog**: for every capability the node hosts — real, VSO, emergent, diagnostic,
+intervention — its `name`, `tier`, and full `manifest`, plus a **node
+self-descriptor** header (`node_id`, `protocol_version`, `device_class`,
+`host_pubkey`, `owner_pubkey` if one is ever registered — a forward hook, absent
+today — `catalog_ts`, `catalog_count`, `catalog_truncated`). The whole response is
+**host-key-signed once** (one Ed25519 signature over header + catalog) and the
+agent **verifies + TOFU-pins** it exactly like a `bind_response`; tamper any entry
+and the signature fails.
+
+```python
+resp = agent.describe_node(node_id)          # signed request, verified response
+resp["node"]["catalog_count"]                # what the node offers *to me*
+[c["name"] for c in resp["catalog"]]         # names — zero prior knowledge
+agent.describe("compute", node_id=node_id)   # still there: one cap's manifest
+```
+
+`describe_node` **composes with** `describe(name)` (a single cached capability's
+manifest) rather than replacing it — the catalog is the node-level roll-up; the
+per-capability lookup is unchanged.
+
+**The `node:<id>` names-record — DHT enumeration.** The DHT key that already
+resolves a node's address is **extended** (not forked) to carry a signed **node
+descriptor**: the node's disclosed capability **names** (names only — never
+manifests) alongside its address. So an agent enumerates *"what does node X
+offer"* straight from the DHT (`agent.node_capabilities(node_id)`), then fetches
+the full manifests point-to-point with `describe_node`. It is signed with
+`sign_record` and verified + TOFU-pinned like every other DHT record; a broadcast
+transport (LANSwarm) already carries every open cap record on the wire, so it
+keeps the names-record as a default no-op and answers from its record cache.
+
+*Size discipline.* The names-record rides a **single** UDP datagram with exactly
+**one** provider (the node itself), so the `N × record` ceiling that bounds
+`cap:<name>` FIND_VALUE replies (see *Capability Manifests*) **does not apply** —
+it is one record, not `N`. It is still capped (`≤256` names / `≤8 KB` serialized,
+measured on the *signed* record); past the cap it truncates and sets
+`truncated:true`, and `describe_node` (TCP — no datagram ceiling) is the
+complete-catalog fallback.
+
+**Consent filtering — a catalog is an information-disclosure surface.** A catalog
+that enumerated sensitive/intervention capabilities to anyone would be a
+reconnaissance gift (*"this node runs nginx and exposes a restart fixer"*). The
+rule is **deny-by-default, one predicate**:
+
+> A capability is disclosed **iff it would pass the bind gate's static half right
+> now** — `policy.check(name, requester, is_remote=True) == "allow"`. Nothing else.
+
+- `needs_approval` / `deny` entries are **omitted entirely** — not name-only. An
+  unauthorized agent cannot even tell they exist, and they are absent from
+  `catalog_count`. (A *stub* — name + tier with the manifest withheld — was
+  considered and **rejected**: the stub *is* the reconnaissance leak.)
+- **Visibility never exceeds bind-ability, and flips exactly when `policy.check`
+  flips.** The *same* predicate builds the `describe_node` catalog and the
+  `node:<id>` names-record — no second, parallel visibility rule anywhere, so the
+  two surfaces can never disagree. Every sensitive / intervention capability
+  defaults to `needs_approval`, so it is invisible **and** un-bindable-without-
+  consent until the owner acts.
+- A capability the owner **opens** with `policy.allow()` (say `camera`) becomes
+  bindable by any remote agent **and therefore enumerable in both surfaces** —
+  consistent, and the owner's explicit choice. Leaving it at `needs_approval`
+  keeps it both un-bindable-without-consent and invisible. One knob, one meaning.
+- **A describe is a READ.** It consults the static rule table (`policy.check`) and
+  **never** `policy.approve` — so a catalog request can never prompt the owner (a
+  describe that prompted the owner on every call would be a DoS). The requester id
+  is threaded to `policy.check` so a future **per-agent** policy would narrow the
+  catalog and binding through the *same* call.
+
+**What this closes, and the honest residual.** A **reachable** node's full offering
+is now enumerable — `discover(None)`'s gap is closed *for a node you can reach*.
+Two limits stay, by design:
+
+- **The interactive-approvable set is not enumerable.** A capability the owner
+  would approve *case-by-case* (`needs_approval` with a live callback) is still
+  invisible — the catalog reveals only the *statically* authorized set, never the
+  *potentially-approvable* one. You learn such a name out-of-band and bind it
+  directly. This is the seam a future **remote keyed approval** (owner authorizes a
+  specific agent id) would revisit — the requester id already flows to
+  `policy.check` for exactly that.
+- **There is no global census.** `describe_node` upgrades *per-node* introspection
+  from lookup-by-name to full enumeration; it does **not** enumerate ALL nodes on
+  the network. A Kademlia DHT has no global key enumeration and D2A keeps **no
+  global registry, by design** — you still need a node's id (from a `cap:<name>`
+  discovery, a `node:<id>` resolution, a manual seed, or `probe_peer`) before you
+  can describe it.
+
+**Deliberately declined: the MCP/A2A session lifecycle + `initialize` handshake.**
+D2A stays **connectionless** — per-message version negotiation + leases, not
+sessions. `describe_node` is a single signed round-trip, not a stateful
+capability-negotiation handshake. A session/`initialize` layer would duplicate the
+lease + per-message-version machinery and add reconnection state D2A intentionally
+avoids; the connectionless model is the point, so the handshake is out of scope.
+
+Tests: `tests/test_node_catalog.py`.
+
 ## Capability Derivation (application layer; v1.5 additive publish path)
 
 Every arc before this one made a *real* capability easier to find, trust, compose,
@@ -998,7 +1103,7 @@ Still out of scope, each by design: chains deeper than `MAX_DERIVATION_DEPTH` (a
 
 ## Versioning & Compatibility
 
-**The wire format is `v1.7`** as of the intervention-surface arc — `d2a.PROTOCOL_VERSION = "1.7"` (defined in `d2a/protocol.py`). **v1.7 is *additive*** — it adds the `propose_intervention` verb (mutating fix loop; its `intervention_result` reply and the six `intervention_*` / `invalid_plan` / `audit_sealed` [error codes](#error-model-v14)) and one optional manifest key, `cannot_fix` (the mutating sibling of `cannot_observe`, valid on any manifest, listing a fixer's honest blind spots), carried by Phase 8 intervention capabilities; same-major peers ignore both and records without them stay valid. **v1.6 was *additive*** — the manifest vocabulary gained one optional honesty key, `cannot_observe` (valid on any manifest, distinct from the derived-only `cannot_detect`), carried by the Phase 7 read-only diagnostic capabilities; same-major peers ignore it and records without it stay valid. v1.1 added the `sig` / `sig_key` / `ts` fields (Ed25519 trust); v1.2 **additively** added an optional `manifest` field to capability records; v1.3 **additively** added the `subscribe_event` / `unsubscribe_event` / `event` / `task_status` verbs, an optional per-action `long_running` manifest key, and a small set of eventable live-frame reading fields to the built-in manifests (see *Event Layer* above). **v1.4 is the one *non-additive* bump so far** — it unifies every error/denial onto a single shape with a stable `code` from the [error registry](#error-model-v14). This is a **sanctioned pre-adoption break**: it renames wire fields (`reason` / `error` → `code`), so it is not additive, and it is done now precisely because there are no external consumers yet. **v1.5 is *additive*** — the manifest vocabulary gains four optional derived-provenance keys (`derived` / `recipe` / `fidelity` / `cannot_detect`) and an optional per-field `hz` cadence, so a locally derived capability publishes, discovers, and binds like any other (closing derivation protocol gaps 1 and 3, dated 2026-07-12). It adds a `derived_input_failed` code to the [error registry](#error-model-v14) for a published derivation whose required input died. No field renames, no verb changes; same-major peers ignore the new keys. See the *Error model* section for the migration and the full code registry. Records/messages without any of these remain valid. Records without a manifest remain valid. Every outbound message and every published capability record carries a top-level `"v"` field, injected at the serialization chokepoints (TCP `_tcp_send` / `_handle_tcp`, LAN UDP `_broadcast` / `_handle_udp`, Kademlia `_send` / `_handle`, and both `publish()` sites). It is a plain field, **not** an envelope, so handlers that read `msg["type"]` are unaffected.
+**The wire format is `v1.8`** as of the node-catalog arc — `d2a.PROTOCOL_VERSION = "1.8"` (defined in `d2a/protocol.py`). **v1.8 is *additive*** — it adds the `describe_node` / `describe_node_response` verbs (the node-level `list_tools` / agent-card; host-key-signed catalog + node self-descriptor) and enriches the existing `node:<id>` DHT record into a signed node descriptor carrying the disclosed capability **names** (address retained, so old address-resolution consumers are unaffected). No field renames, no error codes; same-major peers ignore the new verbs and the extra descriptor fields. See *[Node Catalog](#node-catalog-v18-additive)* above. **v1.7 is *additive*** — it adds the `propose_intervention` verb (mutating fix loop; its `intervention_result` reply and the six `intervention_*` / `invalid_plan` / `audit_sealed` [error codes](#error-model-v14)) and one optional manifest key, `cannot_fix` (the mutating sibling of `cannot_observe`, valid on any manifest, listing a fixer's honest blind spots), carried by Phase 8 intervention capabilities; same-major peers ignore both and records without them stay valid. **v1.6 was *additive*** — the manifest vocabulary gained one optional honesty key, `cannot_observe` (valid on any manifest, distinct from the derived-only `cannot_detect`), carried by the Phase 7 read-only diagnostic capabilities; same-major peers ignore it and records without it stay valid. v1.1 added the `sig` / `sig_key` / `ts` fields (Ed25519 trust); v1.2 **additively** added an optional `manifest` field to capability records; v1.3 **additively** added the `subscribe_event` / `unsubscribe_event` / `event` / `task_status` verbs, an optional per-action `long_running` manifest key, and a small set of eventable live-frame reading fields to the built-in manifests (see *Event Layer* above). **v1.4 is the one *non-additive* bump so far** — it unifies every error/denial onto a single shape with a stable `code` from the [error registry](#error-model-v14). This is a **sanctioned pre-adoption break**: it renames wire fields (`reason` / `error` → `code`), so it is not additive, and it is done now precisely because there are no external consumers yet. **v1.5 is *additive*** — the manifest vocabulary gains four optional derived-provenance keys (`derived` / `recipe` / `fidelity` / `cannot_detect`) and an optional per-field `hz` cadence, so a locally derived capability publishes, discovers, and binds like any other (closing derivation protocol gaps 1 and 3, dated 2026-07-12). It adds a `derived_input_failed` code to the [error registry](#error-model-v14) for a published derivation whose required input died. No field renames, no verb changes; same-major peers ignore the new keys. See the *Error model* section for the migration and the full code registry. Records/messages without any of these remain valid. Records without a manifest remain valid. Every outbound message and every published capability record carries a top-level `"v"` field, injected at the serialization chokepoints (TCP `_tcp_send` / `_handle_tcp`, LAN UDP `_broadcast` / `_handle_udp`, Kademlia `_send` / `_handle`, and both `publish()` sites). It is a plain field, **not** an envelope, so handlers that read `msg["type"]` are unaffected.
 
 The compatibility contract:
 
@@ -1048,6 +1153,7 @@ Each device probes itself at startup using `/proc/meminfo`, `/proc/loadavg`, `/s
 - **Multi-hop derivation chaining (Phase 4, application layer — no protocol change): a recipe's `requires` may be met by a derived capability, so derivations stack (`compute → presence → activity_summary`) both fully-local (planner instantiates the inner recipe) and across-the-wire (consume another agent's published derived cap) on LAN + DHT; strict preference (real > single-hop > two-hop), `MAX_DERIVATION_DEPTH = 2` safety rail, cycle + depth guards (distinct refusal codes), nested provenance with chain-max tier + `cannot_detect` union + concatenated fidelity, and inner-failure propagation through the existing healer/lifecycle state machine** — `python3 examples/chain_demo.py`.
 - **Recipe distribution as community infrastructure (Phase 5, application layer — no protocol change, stdlib only): fetch a signed package from a local directory (a git repo you cloned — no shelling out) or a raw http(s) URL; a mechanical review-then-trust `install` (verify sig → print author fingerprint + requires/provides + effective tier + `fidelity`/`cannot_detect` + the full `transform.py` → typed confirmation, stronger `author-trust` for a new author) that lands the package + trust entry, refuses bad-sig / duplicate-version, and re-reviews a bumped version as new code; a `sign` self-check gate that refuses missing honesty fields or a failing dry-run; `new` scaffolding with the honesty fields present-but-empty; a `conformance` runner emitting a machine-readable `{dry_run, live, environment, passed}` report (dry-run twice across reloads + bounded live run); `registry list`/`show` hygiene** — see [Phase 5](#phase-5--the-registry-as-community-infrastructure).
 - **Observed-cost ranking & quarantine (Phase 6, application layer — no protocol change, stdlib only): the deferred cost optimizer made real from the data the system already generates. A bounded, persistent per-recipe metrics store (`derive_metrics.json`: runs, uptime, heal/failed counts, mean staleness, last conformance — one disk write per run, no per-frame IO) feeds a deterministic within-tier ranking `(observed_score → cost_rank_hint → num_inputs)` where `observed_score = (failure_rate, heal_rate, mean_staleness)`; the strict invariant holds structurally (real > single-hop > two-hop is never overridden — fidelity honesty outranks measured reliability); cold-start recipes rank by hint alone; `python -m d2a_derive.explain <cap>` prints WHY the planner picks what it picks (naming the deciding factor, off the planner's own ranking key); a quarantine quality-gate (failure-rate threshold or a failed conformance run) that `registry list`/`show` surface and the planner refuses to plan without `include_quarantined`, cleared only by a passing conformance run** — see [Phase 6](#phase-6--observed-cost-ranking--quarantine).
+- **Node capability catalog (v1.8): `describe_node` returns the full consent-filtered catalog (name + tier + manifest) + a signed node self-descriptor, host-key-signed once and TOFU-verified + tamper-rejected; sensitive/intervention capabilities OMITTED (not name-only) unless the owner opened them — the one predicate `policy.check == "allow"` builds both the catalog and the `node:<id>` names-record, so visibility never exceeds bind-ability and flips exactly with policy; a describe never prompts the owner; an agent enumerates a reachable node's offering over the DHT with zero prior name knowledge (`agent.node_capabilities`), names-record within an ≤8 KB / ≤256-name budget with truncation; both transports** — see [Node Catalog](#node-catalog-v18-additive).
 - Sense Layer Part 1: all 4 shapes, verdict + confidence, CPU burn load test; **verdict-transition `event_emitter` + `safety_check` hooks closed (Part 2)**
 - Full 10-stage Capability Composition: plan → atomic bind → runtime monitor + fallback → atomic release
 - Consent policy: safe defaults, sensitive = denied unless owner opts in
