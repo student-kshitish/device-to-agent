@@ -47,6 +47,11 @@ class CapabilityBroker:
         self.waitqueue: dict[str, list] = {}
         self.bindings: dict[str, Binding] = {}
         self.bind_history: list = []
+        # Lease delegation (Phase 10B): parent_binding_id -> [child_binding_id].
+        # A child lives in `bindings` (so the data path's get_binding finds it) but
+        # NOT in active_binds — a delegation rides the parent's slot, so it never
+        # counts against quota, is never preempted, and never grants the waitqueue.
+        self.delegations: dict[str, list[str]] = {}
         self._lock = threading.RLock()
 
     def _log(self, event: str, **kwargs):
@@ -266,6 +271,87 @@ class CapabilityBroker:
             before = len(wq)
             self.waitqueue[capability_name] = [e for e in wq if e[1] != agent_id]
             return len(wq) > before
+
+    # ── lease delegation (Phase 10B) ───────────────────────────────────────────
+
+    def issue_delegation(self, parent_binding_id: str, delegate_agent_id: str,
+                         scope_restrict: dict | None, expires_at: float) -> dict:
+        """
+        Issue a CHILD binding for `delegate_agent_id` under `parent_binding_id`,
+        capped at `expires_at` (the caller guarantees expires_at <= parent expiry).
+        The child is device-signed like any token, stored in `bindings` (usable on
+        the data path) but NOT added to active_binds (it rides the parent's slot).
+        Re-gating and the parent-ownership check are the runtime's job — this is the
+        broker mechanism only. Returns {binding_id, token, expires_at}.
+        """
+        with self._lock:
+            parent = self.bindings.get(parent_binding_id)
+            cap = parent.capability_name
+            now = time.time()
+            ttl = max(1, int(expires_at - now))
+            req = make_bind_request(delegate_agent_id, cap, [])
+            token = make_bind_token(req, self.runtime.node_id, self.runtime.private_key,
+                                    self.runtime.public_key, ttl)
+            child = make_binding(token)
+            child.parent_binding_id = parent_binding_id
+            child.delegated_by      = parent.agent_id
+            child.scope_restrict    = scope_restrict
+            self.bindings[child.binding_id] = child
+            self.delegations.setdefault(parent_binding_id, []).append(child.binding_id)
+            self._log("delegated", agent_id=delegate_agent_id, capability=cap,
+                      parent=parent_binding_id)
+            return {"binding_id": child.binding_id, "token": token,
+                    "expires_at": token.expires_at}
+
+    def revoke_children(self, parent_binding_id: str, reason: str) -> list[dict]:
+        """Tear down every ACTIVE child of a binding (cascade). Marks each child
+        `reason` so the data path rejects it, and returns one info dict per child so
+        the runtime can clean up its streams and notify the delegate. Idempotent."""
+        with self._lock:
+            out = []
+            for child_id in self.delegations.pop(parent_binding_id, []):
+                b = self.bindings.get(child_id)
+                if b is not None and b.status == "active":
+                    b.status = reason
+                    b.release_reason = reason
+                    out.append({"binding_id": child_id, "agent_id": b.agent_id,
+                                "capability_name": b.capability_name})
+                    self._log(reason, agent_id=b.agent_id, capability=b.capability_name)
+            return out
+
+    def revoke_one_delegation(self, child_binding_id: str, reason: str = "revoked") -> dict | None:
+        """Tear down ONE child (explicit revoke). Returns its info or None if it is
+        not a live delegation. Also unlinks it from its parent's child list."""
+        with self._lock:
+            b = self.bindings.get(child_binding_id)
+            if b is None or not b.parent_binding_id or b.status != "active":
+                return None
+            b.status = reason
+            b.release_reason = reason
+            siblings = self.delegations.get(b.parent_binding_id, [])
+            if child_binding_id in siblings:
+                siblings.remove(child_binding_id)
+            self._log(reason, agent_id=b.agent_id, capability=b.capability_name)
+            return {"binding_id": child_binding_id, "agent_id": b.agent_id,
+                    "capability_name": b.capability_name}
+
+    def sweep_expired_delegations(self, now: float | None = None) -> list[dict]:
+        """Expire child bindings whose own (capped) token has lapsed BEFORE their
+        parent's teardown. The device clock is authoritative — a child never
+        outlives its cap. Returns one info dict per expired child."""
+        now = now if now is not None else time.time()
+        with self._lock:
+            out = []
+            for child_id, b in list(self.bindings.items()):
+                if b.parent_binding_id and b.status == "active" and now > b.token.expires_at:
+                    b.status = "expired"
+                    b.release_reason = "expired"
+                    siblings = self.delegations.get(b.parent_binding_id, [])
+                    if child_id in siblings:
+                        siblings.remove(child_id)
+                    out.append({"binding_id": child_id, "agent_id": b.agent_id,
+                                "capability_name": b.capability_name})
+            return out
 
     def get_binding(self, binding_id: str) -> Binding | None:
         return self.bindings.get(binding_id)

@@ -608,6 +608,78 @@ class RemoteAgent:
         self._check_version(response)
         return response
 
+    # ── lease delegation (Phase 10B) ──────────────────────────────────────────
+
+    def delegate_binding(self, binding: dict, delegate_agent_id: str,
+                         scope: dict = None, sub_ttl: float = None,
+                         owner_approval: dict = None) -> dict:
+        """
+        Delegate a binding this agent (A) holds to agent B. The device issues B a
+        CHILD binding capped by A's remaining lease (or `sub_ttl`, whichever is
+        shorter), RE-GATED for B (open passes; sensitive re-checks B; intervention
+        requires a keyed owner approval naming B — pass it via `owner_approval`,
+        e.g. signing.sign_delegation_approval(...)), optionally narrowed to a subset
+        of actions via `scope={"actions":[...]}` (never wider). Delegation transfers
+        USE, never the authority to approve. Signed by A.
+
+        Returns the device's delegation_result (status "delegated" with the child
+        binding_id, or "denied" with a code). Use accept_delegation() on B's side to
+        turn a successful result into a usable binding dict.
+        """
+        self._raise_if_lost(binding.get("binding_id", ""))
+        target = binding.get("provider_node_id", "")
+        try:
+            ip, port = self.swarm.address
+            deleg_addr = [ip, port]
+        except Exception:
+            deleg_addr = None
+        req = {
+            "type":              "delegate_binding",
+            "from_node":         self.agent_id,
+            "parent_binding_id": binding.get("binding_id", ""),
+            "capability":        binding.get("capability_name", ""),
+            "delegate_agent_id": delegate_agent_id,
+        }
+        if scope is not None:
+            req["scope"] = scope
+        if sub_ttl is not None:
+            req["sub_ttl"] = sub_ttl
+        if owner_approval is not None:
+            req["owner_approval"] = owner_approval
+        response = self.swarm.send_and_recv(
+            target, signing.sign_message(req, self.private_key, self.public_key), timeout=10.0)
+        if not response:
+            return errors.error(errors.NO_RESPONSE, binding_id=binding.get("binding_id", ""))
+        self._check_version(response)
+        if signing.verify_message(response, target, self.pins) is not None:
+            response["verified"] = False
+        return response
+
+    def revoke_delegation(self, provider_node_id: str, child_binding_id: str) -> dict:
+        """Revoke a delegation this agent granted — cuts the delegate off now
+        (device tears the child down through the unified path). Signed."""
+        req = {"type": "revoke_delegation", "from_node": self.agent_id,
+               "binding_id": child_binding_id}
+        response = self.swarm.send_and_recv(
+            provider_node_id, signing.sign_message(req, self.private_key, self.public_key), timeout=5.0)
+        if not response:
+            return errors.error(errors.NO_RESPONSE, binding_id=child_binding_id)
+        self._check_version(response)
+        return response
+
+    @staticmethod
+    def accept_delegation(delegation_result: dict) -> dict:
+        """B-side: turn a successful delegation_result into a binding dict usable
+        with request_data / start_stream / propose_intervention. A delegated child
+        is NON-RENEWABLE (its right rides A's lease), so no auto-renew lease is
+        started — it simply works until A's lease ends, A revokes, or it lapses."""
+        return {
+            "binding_id":       delegation_result.get("binding_id", ""),
+            "provider_node_id": delegation_result.get("node_id", ""),
+            "capability_name":  delegation_result.get("capability", ""),
+            "delegated":        True,
+        }
+
     # ── data delivery: OPT-IN (streaming) ─────────────────────────────────────
 
     def start_stream(self, binding: dict, on_frame, hz: float = 5.0) -> None:

@@ -49,7 +49,15 @@ import logging
 # plan_hash to sign) and five owner_* error codes; the audit records the owner
 # pubkey + signature. A device with no owner key registered behaves exactly as
 # v1.8 (local callback / default deny); same-major peers ignore the new field.
-PROTOCOL_VERSION = "1.9"
+# v1.10 (additive): LEASE DELEGATION — agent A hands a binding to agent B via the
+# delegate_binding / revoke_delegation verbs. B receives a device-issued CHILD
+# binding capped by A's lease (never longer), RE-GATED for B (open passes;
+# sensitive re-checks B through the same policy gate; intervention requires a
+# KEYED owner approval naming B — no laundering), optionally scope-narrowed to a
+# subset of the capability's actions (never wider), non-renewable, and torn down
+# when A's lease ends (cascade) or A revokes. Same-major peers ignore the new
+# verbs; a device that never receives one behaves exactly as v1.9.
+PROTOCOL_VERSION = "1.10"
 VERSION_FIELD = "v"
 
 logger = logging.getLogger("d2a.protocol")

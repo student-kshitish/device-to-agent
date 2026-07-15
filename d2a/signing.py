@@ -111,6 +111,45 @@ def sign_owner_approval(plan_hash: str, device_node_id: str,
     return {"owner_pubkey": owner_public, "nonce": nonce, "ts": ts, "sig": sig.hex()}
 
 
+# ── delegation approval (Phase 10B) — the owner sanctions B holding a PROPOSE
+# right on an intervention capability. Sibling of the plan-approval subject: it
+# binds to the capability, the delegate agent B, the parent binding, THIS device,
+# and a nonce/ts. So A cannot launder an intervention-tier binding to B — only the
+# owner can, by signing B's name.
+DELEGATION_APPROVAL_KIND = "delegation_approval"
+
+
+def delegation_approval_subject(capability: str, delegate_agent_id: str,
+                                parent_binding_id: str, device_node_id: str,
+                                nonce: str, ts: float) -> bytes:
+    """The canonical bytes an owner signs to sanction delegating an intervention
+    capability's PROPOSE right to a specific agent B."""
+    return crypto.canonical_json({
+        "kind":              DELEGATION_APPROVAL_KIND,
+        "capability":        capability,
+        "delegate_agent_id": delegate_agent_id,
+        "parent_binding_id": parent_binding_id,
+        "device_node_id":    device_node_id,
+        "nonce":             nonce,
+        "ts":                ts,
+    })
+
+
+def sign_delegation_approval(capability: str, delegate_agent_id: str,
+                             parent_binding_id: str, device_node_id: str,
+                             owner_private: str, owner_public: str,
+                             nonce: str | None = None, ts: float | None = None) -> dict:
+    """OWNER-SIDE tool: produce the `owner_approval` field attached to a
+    delegate_binding request for an INTERVENTION-tier capability."""
+    nonce = os.urandom(8).hex() if nonce is None else nonce
+    ts = time.time() if ts is None else ts
+    sig = crypto.sign(
+        delegation_approval_subject(capability, delegate_agent_id, parent_binding_id,
+                                    device_node_id, nonce, ts),
+        owner_private)
+    return {"owner_pubkey": owner_public, "nonce": nonce, "ts": ts, "sig": sig.hex()}
+
+
 def verify_record(record: dict, pins: "crypto.PinStore") -> str | None:
     """
     Verify a signed capability record and pin the device key. No replay window —

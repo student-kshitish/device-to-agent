@@ -579,6 +579,15 @@ class DeviceRuntime:
             print(f"[{self.name}] lease expired binding={binding_id[:8]} "
                   f"cap={info['capability_name']} → slot freed"
                   + (f", auto-granted to {info['next_agent_id'][:8]}" if info.get("next_agent_id") else ""))
+
+        # Sweep delegated children whose OWN (capped) lease lapsed before their
+        # parent's teardown — so a child never over-serves past its cap even if the
+        # parent is still alive. Same unified cleanup + best-effort notice.
+        for info in self.broker.sweep_expired_delegations():
+            self._cleanup_binding_stream(info["binding_id"])
+            self._notify_delegation_ended(info, errors.LEASE_EXPIRED)
+            print(f"[{self.name}] delegation expired binding={info['binding_id'][:8]} "
+                  f"cap={info['capability_name']} (child lease lapsed)")
         return expired
 
     def _handle_renew(self, agent_id: str, binding_id: str, capability: str) -> dict:
@@ -597,6 +606,12 @@ class DeviceRuntime:
             if b is None:
                 return denied(errors.UNKNOWN_BINDING)
             if b.agent_id != agent_id:
+                return denied(errors.NOT_OWNER)
+            # A delegated CHILD is non-renewable (Phase 10B): its right cannot be
+            # extended past — or independently of — the parent's lease. The
+            # delegate must ask the delegator to re-delegate. (The parent's owner
+            # renewing the parent is what keeps the umbrella alive.)
+            if b.parent_binding_id:
                 return denied(errors.NOT_OWNER)
             if capability and b.capability_name != capability:
                 return denied(errors.CAPABILITY_MISMATCH)
@@ -795,6 +810,20 @@ class DeviceRuntime:
             return False
         return True
 
+    def _scope_allows(self, binding_id: str, action: str) -> bool:
+        """Phase 10B scope check for an action/mutation. A normal binding (no
+        scope_restrict) allows everything the capability offers — a no-op, so
+        existing binds are unaffected. A NARROWED delegation allows only the
+        actions in its scope_restrict['actions'] allow-list (never wider than the
+        capability). None/absent list → full inheritance."""
+        b = self.broker.get_binding(binding_id)
+        if b is None or not b.scope_restrict:
+            return True
+        actions = b.scope_restrict.get("actions")
+        if actions is None:
+            return True
+        return action in actions
+
     def _cleanup_binding_stream(self, binding_id: str) -> None:
         """
         THE unified data-path teardown for a binding. Stops any streaming
@@ -826,6 +855,33 @@ class DeviceRuntime:
                 t = self._tasks.pop(task_id, None)
                 if t is not None:
                     t["cancel"].set()
+
+        # ── delegation cascade (Phase 10B) ────────────────────────────────────
+        # A delegated child's right cannot outlive its parent's lease. Whichever
+        # path tore THIS binding down (release / expiry / preemption / shutdown /
+        # capability-teardown) funnels here, so revoking + cleaning up its children
+        # HERE makes the cascade automatic for every path. Re-delegation is
+        # forbidden, so the recursion is depth-1, but it is written generally.
+        for info in self.broker.revoke_children(binding_id, "revoked"):
+            child_id = info["binding_id"]
+            self._notify_delegation_ended(info, errors.DELEGATION_REVOKED)
+            self._cleanup_binding_stream(child_id)
+
+    def _notify_delegation_ended(self, info: dict, code: str) -> None:
+        """Best-effort push telling a delegate B its child right ended (revoke or
+        parent-gone cascade). Reuses the lease-death shape so B's existing handler
+        marks the binding lost; only reachable if B's address is known."""
+        try:
+            self.swarm.send(info["agent_id"], {
+                "type":            "lease_expired",
+                "binding_id":      info["binding_id"],
+                "capability_name": info["capability_name"],
+                "node_id":         self.node_id,
+                "code":            code,
+                "expired_at":      time.time(),
+            })
+        except Exception:
+            pass
 
     def _cleanup_event_sub(self, binding_id: str, event_sub_id: str) -> bool:
         """Tear down ONE event subscription (explicit unsubscribe_event).
@@ -1098,6 +1154,12 @@ class DeviceRuntime:
             if not self._verify_binding_scope(binding_id, capability):
                 return errors.error(errors.BINDING_INVALID_OR_OUT_OF_SCOPE,
                                     binding_id=binding_id)
+            # Delegation scope (Phase 10B): a narrowed delegation may invoke only the
+            # actions in its allow-list. A normal binding allows everything (no-op).
+            if not self._scope_allows(binding_id, action):
+                return errors.error(errors.DELEGATION_SCOPE_EXCEEDED,
+                                    f"action {action!r} is outside this delegated scope",
+                                    binding_id=binding_id)
             v = self._virtual.get(capability)
             if v is None:
                 return errors.error(errors.NOT_AN_ACTION_CAPABILITY,
@@ -1165,6 +1227,14 @@ class DeviceRuntime:
             ok, why, nplan = self._validate_plan(capability, plan)
             if not ok:
                 return errors.error(errors.INVALID_PLAN, why, binding_id=binding_id)
+
+            # Delegation scope (Phase 10B): a narrowed intervention delegation may
+            # propose only the mutating actions in its allow-list — checked BEFORE
+            # the owner gate so a B can't even prompt for an out-of-scope action.
+            if not self._scope_allows(binding_id, nplan["action"]):
+                return errors.error(errors.DELEGATION_SCOPE_EXCEEDED,
+                                    f"action {nplan['action']!r} is outside this delegated scope",
+                                    binding_id=binding_id)
 
             plan_hash = hashlib.sha256(crypto.canonical_json(nplan)).hexdigest()
 
@@ -1445,7 +1515,176 @@ class DeviceRuntime:
             result   = self.broker_release(agent_id, cap_name)
             return self._sign({"type": "released", "status": result.get("status", "ok")})
 
+        # ── lease delegation: delegate_binding (Phase 10B, trust op) ───────────
+        # Agent A hands a binding to agent B. Signed by A. The device RE-GATES B
+        # (consent is never laundered), caps B's child lease to A's remaining lease,
+        # optionally narrows scope, and links the child for cascade teardown.
+        if mtype == "delegate_binding":
+            agent_id = message.get("from_node", "")
+            reason = signing.verify_message(message, agent_id, self.pins)
+            if reason is not None:
+                return self._sign({"type": "delegation_result", "status": "denied", "code": reason})
+            return self._sign(self._handle_delegate(agent_id, message))
+
+        # ── lease delegation: revoke_delegation (Phase 10B, trust op) ──────────
+        if mtype == "revoke_delegation":
+            agent_id = message.get("from_node", "")
+            reason = signing.verify_message(message, agent_id, self.pins)
+            if reason is not None:
+                return self._sign({"type": "delegation_revoked", "status": "denied", "code": reason})
+            return self._sign(self._handle_revoke_delegation(agent_id, message))
+
         return None
+
+    # ── lease delegation handlers (Phase 10B) ───────────────────────────────────
+
+    def _handle_delegate(self, agent_id: str, message: dict) -> dict:
+        """Issue a re-gated, lease-capped, optionally scope-narrowed CHILD binding
+        for a delegate B under A's parent binding. agent_id is the VERIFIED A."""
+        parent_id = message.get("parent_binding_id", "")
+        delegate  = message.get("delegate_agent_id", "")
+        cap       = message.get("capability", "")
+        scope     = message.get("scope")                 # {"actions":[...]} or None
+        sub_ttl   = message.get("sub_ttl")               # seconds, optional
+        deleg_addr = message.get("delegate_address")
+
+        def denied(code, detail=""):
+            return {"type": "delegation_result", "status": "denied",
+                    "code": code, "detail": detail, "parent_binding_id": parent_id}
+
+        if not isinstance(delegate, str) or not delegate:
+            return denied(errors.INVALID_PLAN, "delegate_agent_id required")
+
+        with self.broker._lock:
+            parent = self.broker.get_binding(parent_id)
+            # A must OWN a live parent binding for this capability.
+            if parent is None or parent.status != "active":
+                return denied(errors.BINDING_INVALID_OR_OUT_OF_SCOPE, "parent binding invalid")
+            if parent.agent_id != agent_id:
+                return denied(errors.NOT_DELEGATOR, "requester does not own the parent binding")
+            if cap and parent.capability_name != cap:
+                return denied(errors.CAPABILITY_MISMATCH, "capability does not match the parent binding")
+            cap = parent.capability_name
+            if parent.parent_binding_id:
+                # No re-delegation (v1): a child cannot itself be a delegation parent.
+                return denied(errors.NOT_DELEGATOR, "a delegated binding cannot be re-delegated")
+            now = time.time()
+            if now > parent.token.expires_at:
+                return denied(errors.LEASE_EXPIRED, "parent lease has expired")
+
+            # Scope: never wider than the capability's declared actions.
+            scope_restrict = None
+            if scope is not None:
+                if not isinstance(scope, dict):
+                    return denied(errors.DELEGATION_SCOPE_EXCEEDED, "scope must be an object")
+                actions = scope.get("actions")
+                if actions is not None:
+                    if not isinstance(actions, list) or not all(isinstance(a, str) for a in actions):
+                        return denied(errors.DELEGATION_SCOPE_EXCEEDED, "scope.actions must be a list of strings")
+                    man = self._cap_manifest(self.capabilities.get(cap)) if self.capabilities.get(cap) else None
+                    declared = set((man or {}).get("actions", {}) or {})
+                    if declared and not set(actions) <= declared:
+                        return denied(errors.DELEGATION_SCOPE_EXCEEDED,
+                                      f"actions {sorted(set(actions) - declared)} not offered by {cap}")
+                    scope_restrict = {"actions": list(actions)}
+
+            # RE-GATE B by tier — consent is never laundered from A to B.
+            tier = self._cap_tier(self.capabilities.get(cap)) if self.capabilities.get(cap) else "sensitive"
+            approval = None
+            if tier == "intervention":
+                approval = self._verify_delegation_approval(
+                    message.get("owner_approval"), cap, delegate, parent_id)
+                if not approval["approved"]:
+                    return denied(approval.get("code", errors.APPROVAL_REQUIRED),
+                                  approval.get("detail", "owner approval required to delegate an intervention right"))
+            else:
+                # open → allow; sensitive → the SAME policy gate a direct bind by B faces.
+                decision = self.policy.check(cap, delegate, is_remote=True)
+                if decision == "deny":
+                    return denied(errors.POLICY_BLOCKED, "resource blocked by device policy for the delegate")
+                if decision == "needs_approval" and not self.policy.approve(cap, delegate):
+                    return denied(errors.APPROVAL_REQUIRED, "owner approval required for the delegate at this tier")
+
+            # Cap the child lease to the parent's remaining lease (never longer).
+            expires_at = parent.token.expires_at
+            if isinstance(sub_ttl, (int, float)) and not isinstance(sub_ttl, bool) and sub_ttl > 0:
+                expires_at = min(expires_at, now + float(sub_ttl))
+
+            issued = self.broker.issue_delegation(parent_id, delegate, scope_restrict, expires_at)
+
+        # Best-effort: learn B's address so revoke/cascade notices can reach it.
+        if isinstance(deleg_addr, (list, tuple)) and len(deleg_addr) == 2:
+            self.swarm.add_known_peer(delegate, deleg_addr[0], int(deleg_addr[1]))
+
+        # Intervention-tier delegations are AUDITED (who delegated what to whom).
+        if tier == "intervention":
+            self._audit_delegation(delegator=agent_id, delegate=delegate, capability=cap,
+                                   parent_binding_id=parent_id, child_binding_id=issued["binding_id"],
+                                   scope_restrict=scope_restrict, approval=approval)
+
+        token = issued["token"]
+        print(f"[{self.name}] delegate_binding {agent_id[:8]} → {delegate[:8]} cap={cap} "
+              f"tier={tier} scope={scope_restrict} child={issued['binding_id'][:8]}")
+        return {
+            "type":              "delegation_result",
+            "status":            "delegated",
+            "capability":        cap,
+            "parent_binding_id": parent_id,
+            "binding_id":        issued["binding_id"],
+            "delegate_agent_id": delegate,
+            "scope":             scope_restrict,
+            "lease_expires_at":  issued["expires_at"],
+            "token_sig":         token.signature,
+            "node_id":           self.node_id,
+            "device_class":      self.device_class,
+        }
+
+    def _handle_revoke_delegation(self, agent_id: str, message: dict) -> dict:
+        """Revoke ONE delegation. Allowed to the DELEGATOR (A) or the owner-of-record
+        (the parent's agent). Tears the child down through the unified path."""
+        child_id = message.get("binding_id", "")
+        b = self.broker.get_binding(child_id)
+        if b is None or not b.parent_binding_id:
+            return {"type": "delegation_revoked", "status": "unknown",
+                    "code": errors.DELEGATION_NOT_FOUND, "binding_id": child_id}
+        parent = self.broker.get_binding(b.parent_binding_id)
+        delegator = parent.agent_id if parent else b.delegated_by
+        if agent_id != delegator:
+            return {"type": "delegation_revoked", "status": "denied",
+                    "code": errors.NOT_DELEGATOR, "binding_id": child_id}
+        info = self.broker.revoke_one_delegation(child_id, "revoked")
+        if info is None:
+            return {"type": "delegation_revoked", "status": "unknown",
+                    "code": errors.DELEGATION_NOT_FOUND, "binding_id": child_id}
+        self._cleanup_binding_stream(child_id)
+        self._notify_delegation_ended(info, errors.DELEGATION_REVOKED)
+        print(f"[{self.name}] revoke_delegation {agent_id[:8]} → child={child_id[:8]} cut off")
+        return {"type": "delegation_revoked", "status": "revoked", "binding_id": child_id}
+
+    def _audit_delegation(self, *, delegator: str, delegate: str, capability: str,
+                          parent_binding_id: str, child_binding_id: str,
+                          scope_restrict: dict | None, approval: dict | None) -> dict | None:
+        """Append ONE signed audit entry for an intervention-tier delegation — the
+        mutation-authority trail records who delegated a PROPOSE right to whom, with
+        the owner pubkey + signature that sanctioned it."""
+        entry = {
+            "kind":              "delegation",
+            "delegator":         delegator,
+            "delegate":          delegate,
+            "device_node_id":    self.node_id,
+            "capability":        capability,
+            "parent_binding_id": parent_binding_id,
+            "child_binding_id":  child_binding_id,
+            "scope_restrict":    scope_restrict,
+            "approver":          (approval or {}).get("approver", ""),
+            "owner_pubkey":      (approval or {}).get("owner_pubkey"),
+            "owner_sig":         (approval or {}).get("owner_sig"),
+            "ts":                time.time(),
+        }
+        try:
+            return self._audit_log().append(entry)
+        except AuditError:
+            return None
 
     # ── broker interface ───────────────────────────────────────────────────────
 
@@ -1819,6 +2058,55 @@ class DeviceRuntime:
         self._owner_approval_seen[nonce] = now
         return {"kind": "keyed", "approved": True, "owner_pubkey": pub,
                 "owner_sig": sig, "nonce": nonce, "ts": ts,
+                "approver": "owner:" + crypto.derive_node_id(pub)}
+
+    def _verify_delegation_approval(self, owner_approval: dict, capability: str,
+                                    delegate_agent_id: str, parent_binding_id: str) -> dict:
+        """
+        Verify a keyed owner approval that sanctions delegating an INTERVENTION-tier
+        capability's PROPOSE right to a SPECIFIC agent B (Phase 10B). Same TOFU +
+        replay + seen-cache discipline as _verify_owner_approval, but the signed
+        subject binds capability + delegate B + parent binding + this device — so A
+        cannot launder a mutation right to a B the owner never named. Returns a
+        decision dict {approved, code?, detail?, approver?, owner_*}.
+        """
+        def deny(code, detail):
+            return {"approved": False, "code": code, "detail": detail}
+
+        if self.owner_pubkey is None:
+            return deny(errors.OWNER_UNREGISTERED,
+                        "delegating an intervention right requires a registered owner key")
+        if not isinstance(owner_approval, dict):
+            return deny(errors.OWNER_APPROVAL_REQUIRED,
+                        "intervention-tier delegation requires a keyed owner approval naming the delegate")
+        pub   = owner_approval.get("owner_pubkey")
+        sig   = owner_approval.get("sig")
+        nonce = owner_approval.get("nonce")
+        ts    = owner_approval.get("ts")
+        if pub != self.owner_pubkey:
+            return deny(errors.OWNER_KEY_MISMATCH, "owner signature is not from the pinned owner key")
+        if not isinstance(ts, (int, float)) or isinstance(ts, bool):
+            return deny(errors.OWNER_APPROVAL_STALE, "delegation approval has no valid ts")
+        now = time.time()
+        if abs(now - ts) > signing.REPLAY_WINDOW_SECONDS:
+            return deny(errors.OWNER_APPROVAL_STALE, "delegation approval outside the replay window")
+        if not isinstance(nonce, str) or not nonce:
+            return deny(errors.OWNER_APPROVAL_STALE, "delegation approval has no nonce")
+        self._prune_owner_seen(now)
+        if nonce in self._owner_approval_seen:
+            return deny(errors.OWNER_APPROVAL_STALE, "delegation approval nonce already used (replay)")
+        try:
+            sig_bytes = bytes.fromhex(sig)
+        except (ValueError, TypeError):
+            return deny(errors.OWNER_SIG_INVALID, "delegation approval signature is not valid hex")
+        subject = signing.delegation_approval_subject(
+            capability, delegate_agent_id, parent_binding_id, self.node_id, nonce, ts)
+        if not crypto.verify(subject, sig_bytes, pub):
+            return deny(errors.OWNER_SIG_INVALID,
+                        "owner signature did not verify over (capability, delegate, parent)")
+        self._owner_approval_seen[nonce] = now
+        return {"approved": True, "owner_pubkey": pub, "owner_sig": sig,
+                "owner_nonce": nonce, "owner_ts": ts,
                 "approver": "owner:" + crypto.derive_node_id(pub)}
 
     def _resolve_plan_approval(self, nplan: dict, plan_hash: str,

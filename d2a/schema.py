@@ -60,7 +60,17 @@ class Binding:
     scope: str
     created_at: float
     rebind_count: int = 0
-    status: str = "active"  # active | rebound | released | expired | preempted
+    status: str = "active"  # active | rebound | released | expired | preempted | revoked
     # Why the binding left the active set. One of: "" (still active) | released |
-    # preempted | expired. Set only through the broker's shared teardown path.
+    # preempted | expired | revoked. Set only through the broker's shared teardown path.
     release_reason: str = ""
+    # ── lease delegation (Phase 10B; additive) ────────────────────────────────
+    # A CHILD binding: issued when agent A delegates this capability to agent B.
+    # parent_binding_id links it to A's binding (the umbrella lease); delegated_by
+    # is A's agent_id; scope_restrict optionally narrows what B may do (a subset of
+    # the capability's actions, never wider). All three default empty/None so a
+    # normal (non-delegated) binding is unchanged. A child is device-issued, capped
+    # to the parent's expiry, non-renewable, and torn down when the parent ends.
+    parent_binding_id: str = ""
+    delegated_by: str = ""
+    scope_restrict: dict | None = None

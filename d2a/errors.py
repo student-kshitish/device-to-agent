@@ -87,6 +87,12 @@ OWNER_KEY_MISMATCH      = "owner_key_mismatch"       # owner sig from a key that
 OWNER_SIG_INVALID       = "owner_sig_invalid"        # owner signature did not verify over the subject
 OWNER_APPROVAL_STALE    = "owner_approval_stale"     # owner approval outside replay window / replayed
 
+# ── lease delegation (Phase 10B — agent A hands a binding to agent B) ─────────
+NOT_DELEGATOR             = "not_delegator"              # requester does not own the parent binding
+DELEGATION_SCOPE_EXCEEDED = "delegation_scope_exceeded"  # delegated scope wider than the parent / action out of scope
+DELEGATION_NOT_FOUND      = "delegation_not_found"       # revoke of an unknown/foreign delegation
+DELEGATION_REVOKED        = "delegation_revoked"         # a delegated (child) right was ended (revoke or parent gone)
+
 # ── agent-side (never leave the agent, but share the one shape) ──────────────
 NO_RESPONSE         = "no_response"
 BINDING_ID_MISMATCH = "binding_id_mismatch"
@@ -109,6 +115,7 @@ ALL_CODES = frozenset({
     INTERVENTION_VERIFY_FAILED, INTERVENTION_ERROR, AUDIT_SEALED,
     OWNER_APPROVAL_REQUIRED, OWNER_UNREGISTERED, OWNER_KEY_MISMATCH,
     OWNER_SIG_INVALID, OWNER_APPROVAL_STALE,
+    NOT_DELEGATOR, DELEGATION_SCOPE_EXCEEDED, DELEGATION_NOT_FOUND, DELEGATION_REVOKED,
     NO_RESPONSE, BINDING_ID_MISMATCH, NO_PROVIDER,
 })
 
