@@ -57,7 +57,16 @@ import logging
 # subset of the capability's actions (never wider), non-renewable, and torn down
 # when A's lease ends (cascade) or A revokes. Same-major peers ignore the new
 # verbs; a device that never receives one behaves exactly as v1.9.
-PROTOCOL_VERSION = "1.10"
+# v1.11 (additive): CAPABILITY BOUNDARIES — an intervention manifest may declare
+# an optional "boundary" (the MCP "roots" concept, adapted): the operational lane
+# of targets/params it may EVER act on (d2a/boundary.py vocabulary: in / match /
+# range). The device enforces it at propose time BEFORE preflight and BEFORE both
+# consent gates — an out-of-boundary plan is refused structurally with the new
+# `out_of_boundary` code, audited, and the owner is never prompted. In-boundary
+# still requires the full owner approval (boundary is a pre-filter, not consent).
+# A manifest without a boundary behaves exactly as v1.10; same-major peers ignore
+# the new key/code.
+PROTOCOL_VERSION = "1.11"
 VERSION_FIELD = "v"
 
 logger = logging.getLogger("d2a.protocol")

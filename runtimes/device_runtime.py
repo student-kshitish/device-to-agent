@@ -18,6 +18,7 @@ from d2a import (
     crypto,
 )
 from d2a import signing
+from d2a import boundary as _boundary
 from d2a import manifest as _manifest
 from d2a.protocol import PROTOCOL_VERSION
 from d2a.resource_probes import probe_resources, RESOURCE_SENSITIVITY
@@ -1264,6 +1265,30 @@ class DeviceRuntime:
                 print(f"[{self.name}] propose_intervention REFUSED — audit chain broken: {chain_detail}")
                 return errors.error(errors.AUDIT_SEALED, chain_detail, binding_id=binding_id)
 
+            # BOUNDARY (Phase 11): the manifest's declared operational lane is
+            # enforced HERE — before preflight, before BOTH consent gates, and
+            # before the owner ever sees the plan (_resolve_plan_approval below is
+            # the sole entry to the local callback, the keyed path, AND the
+            # pending round). An out-of-boundary plan is refused STRUCTURALLY,
+            # regardless of any approval, and the attempt is audited — a
+            # well-formed plan aimed outside the lane is exactly the probe an
+            # audit log exists to capture. Absent boundary → (True, "") — compat.
+            bnd = (self.capabilities[capability].manifest or {}).get("boundary")
+            b_ok, b_why = _boundary.check(
+                bnd, {**nplan["params"], "target": intv["target"]})
+            if not b_ok:
+                entry = self._audit_intervention(
+                    agent_id=agent_id, capability=capability, plan=nplan,
+                    plan_hash=plan_hash, approved=False, executed=False,
+                    verify_outcome="not_run", result_status="out_of_boundary",
+                    detail=b_why)
+                print(f"[{self.name}] propose_intervention OUT_OF_BOUNDARY "
+                      f"cap={capability} action={nplan['action']} — {b_why}")
+                return _result("out_of_boundary", approved=False, executed=False,
+                               verify=_NO_VERIFY, detail=b_why,
+                               code=errors.OUT_OF_BOUNDARY,
+                               audit_seq=(entry or {}).get("seq"))
+
             # Pre-flight (privilege / tool availability) — refuse BEFORE mutating.
             pf_ok, pf_reason = intv["executor"].preflight()
             if not pf_ok:
@@ -2138,7 +2163,8 @@ class DeviceRuntime:
         return self._audit
 
     def attach_intervention(self, family: str, target: str,
-                           name: str | None = None, **opts) -> dict:
+                           name: str | None = None,
+                           boundary: dict | None = None, **opts) -> dict:
         """
         Publish a MUTATING intervention capability on THIS node — the FIX half of
         the fix loop (diagnose → plan → approve → execute → verify → audit).
@@ -2150,14 +2176,35 @@ class DeviceRuntime:
         `family` ∈ INTERVENTION_EXECUTORS; `target` names the subsystem (a systemd
         unit / device node / module). `opts` pass to the executor (e.g. user=True).
         Returns the capability descriptor, or {"error": ...} for an unknown family.
+
+        `boundary` (v1.11, optional, NOT an executor opt): the declared operational
+        lane — d2a.boundary constraints on "target" / action params, validated into
+        the manifest here (a bad vocabulary or a boundary on a param no action
+        takes refuses the attach), and enforced at propose time BEFORE the consent
+        gates. If the boundary constrains "target", the FIXED target passed here
+        must itself be in-lane — a capability pointing outside its own declared
+        boundary can never be published. Absent → unchanged (compat).
         """
         cls = INTERVENTION_EXECUTORS.get(family)
         if cls is None:
             return {"error": "unknown_intervention_family", "family": family,
                     "known": sorted(INTERVENTION_EXECUTORS)}
 
-        executor      = cls(target, **opts)
-        man           = _manifest.intervention_manifest(family, target)
+        executor = cls(target, **opts)
+        try:
+            man = _manifest.intervention_manifest(family, target, boundary)
+        except _manifest.ManifestError as e:
+            return {"error": "invalid_boundary", "family": family,
+                    "target": target, "detail": str(e)}
+        if boundary and _boundary.TARGET_KEY in boundary:
+            # Attach-time lane check: only "target" is known here (params are
+            # per-plan), so check exactly that constraint against the fixed target.
+            t_ok, t_why = _boundary.check(
+                {_boundary.TARGET_KEY: boundary[_boundary.TARGET_KEY]},
+                {_boundary.TARGET_KEY: target})
+            if not t_ok:
+                return {"error": "target_out_of_boundary", "family": family,
+                        "target": target, "detail": t_why}
         tier          = man["consent_tier"]                       # "intervention"
         paired_family = _manifest.INTERVENTION_PAIRED_DIAGNOSTIC.get(family, "")
         cap_name      = name or f"intv_{family}_{self._diag_slug(target)}"

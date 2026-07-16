@@ -54,6 +54,7 @@ and cycle-free.
 
 import json
 
+from d2a import boundary as _boundary
 from d2a.resource_probes import (
     RESOURCE_SENSITIVITY, DIAGNOSTIC_SENSITIVITY, INTERVENTION_SENSITIVITY,
 )
@@ -82,8 +83,16 @@ _OBSERVE_KEYS = {"cannot_observe"}
 # privilege the runtime lacks, and the bootstrapping limit: D2A cannot fix its own
 # broken runtime). Sibling of cannot_observe; valid on any manifest.
 _FIX_KEYS = {"cannot_fix"}
+# v1.11 (Phase 11) added ONE optional top-level key: "boundary" — a declared,
+# device-enforced operational lane (the MCP "roots" concept, adapted): the set
+# of targets/params this capability may EVER act on, checked BEFORE the consent
+# gate. Vocabulary + enforcement live in d2a/boundary.py (a leaf, like
+# conditions.py). Valid ONLY on intervention-tier manifests in v1 — a declared
+# boundary nobody enforces would look like protection, so other tiers reject it
+# until they grow an enforcement point (diagnostics/derivation are follow-ups).
+_BOUNDARY_KEYS = {"boundary"}
 _TOP_LEVEL_KEYS = ({"description", "reading", "actions", "consent_tier", "streaming"}
-                   | _DERIVED_KEYS | _OBSERVE_KEYS | _FIX_KEYS)
+                   | _DERIVED_KEYS | _OBSERVE_KEYS | _FIX_KEYS | _BOUNDARY_KEYS)
 _SCALAR_TYPES = {"number", "string", "boolean", "object"}
 _ALL_TYPES = _SCALAR_TYPES | {"array"}
 # Third tier (v1.7): "intervention" — MUTATING capabilities, above sensitive.
@@ -260,6 +269,20 @@ def validate_manifest(manifest: dict, expected_consent_tier: str,
             v = manifest[_k]
             if not isinstance(v, list) or not all(isinstance(x, str) for x in v):
                 raise ManifestError(f"'{_k}' must be a list of strings")
+
+    # ── boundary (v1.11) — optional, INTERVENTION tier only ───────────────────
+    # Validated against THIS manifest's actions (a boundary on a param no action
+    # takes is rejected at publish). Rejected on other tiers: a declared boundary
+    # with no enforcement point would be decoration masquerading as protection.
+    if "boundary" in manifest:
+        if tier != "intervention":
+            raise ManifestError(
+                "'boundary' is only valid on intervention-tier manifests in v1 "
+                "(a boundary nobody enforces would look like protection)")
+        try:
+            _boundary.validate_boundary(manifest["boundary"], manifest)
+        except _boundary.BoundaryError as e:
+            raise ManifestError(str(e)) from e
 
     out = {**manifest, "streaming": streaming}
 
@@ -712,12 +735,18 @@ _INTERVENTIONS = {
 }
 
 
-def intervention_manifest(family: str, target: str) -> dict:
+def intervention_manifest(family: str, target: str,
+                          boundary: dict | None = None) -> dict:
     """
     Composed, validated manifest for an intervention capability of `family`,
     pointed at `target` (a systemd unit / device node / module name). consent_tier
     is always "intervention" (the third tier). Declares the mutating action(s) +
     cannot_fix. Raises ManifestError for an unknown family.
+
+    `boundary` (v1.11, optional): the declared operational lane — per-key
+    constraints on "target" / action params from the d2a.boundary vocabulary.
+    Validated here against THIS manifest's actions, published signed, and
+    enforced by the device BEFORE the consent gate. Absent → unchanged (compat).
     """
     base = _INTERVENTIONS.get(family)
     if base is None:
@@ -740,6 +769,8 @@ def intervention_manifest(family: str, target: str) -> dict:
         "consent_tier": tier,
         "streaming": False,
     }
+    if boundary is not None:
+        m["boundary"] = boundary
     return validate_manifest(m, tier)
 
 

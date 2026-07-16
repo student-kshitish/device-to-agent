@@ -80,6 +80,11 @@ INTERVENTION_VERIFY_FAILED     = "intervention_verify_failed"
 INTERVENTION_ERROR             = "intervention_error"  # the mutation itself failed to run
 AUDIT_SEALED                   = "audit_sealed"        # fail-closed: audit chain broken, refuse
 
+# ── capability boundaries (Phase 11 — the declared operational lane) ─────────
+OUT_OF_BOUNDARY = "out_of_boundary"  # plan targets outside the manifest's declared
+                                     # boundary — refused BEFORE consent, audited,
+                                     # owner never prompted
+
 # ── remote keyed owner approval (Phase 10A — owner signs a plan over the wire) ─
 OWNER_APPROVAL_REQUIRED = "owner_approval_required"  # non-terminal: sign the returned plan_hash
 OWNER_UNREGISTERED      = "owner_unregistered"       # keyed approval sent but no owner key pinned
@@ -113,6 +118,7 @@ ALL_CODES = frozenset({
     EVENT_CAP_EXCEEDED, DEVICE_EVENT_CAPACITY,
     NOT_AN_INTERVENTION_CAPABILITY, INVALID_PLAN, INTERVENTION_PREFLIGHT_REFUSED,
     INTERVENTION_VERIFY_FAILED, INTERVENTION_ERROR, AUDIT_SEALED,
+    OUT_OF_BOUNDARY,
     OWNER_APPROVAL_REQUIRED, OWNER_UNREGISTERED, OWNER_KEY_MISMATCH,
     OWNER_SIG_INVALID, OWNER_APPROVAL_STALE,
     NOT_DELEGATOR, DELEGATION_SCOPE_EXCEEDED, DELEGATION_NOT_FOUND, DELEGATION_REVOKED,
