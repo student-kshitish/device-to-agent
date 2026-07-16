@@ -76,6 +76,8 @@ class RemoteAgent:
         self._leases: dict[str, dict] = {}
         self._leases_lock = threading.Lock()
         self.on_lease_lost = None   # optional callback(binding_id, reason)
+        self.on_regrant    = None   # optional callback(binding) — v1.12: a queued
+                                    # (or preempted-and-requeued) bind came through
 
     def start(self) -> None:
         self.swarm.start()
@@ -145,7 +147,40 @@ class RemoteAgent:
             # a silent vanish (lease_expired / renew timeout) = backoff rediscovery.
             self._on_binding_death(message.get("binding_id", ""),
                                    message.get("code", errors.DEVICE_SHUTDOWN))
+        elif mtype == "preempted":
+            # Arbitration eviction (v1.12) — GRACEFUL: the device tells us why
+            # (a policy-sanctioned higher claim) and that we were re-queued, before
+            # the winner starts using the resource. Same local teardown; the loss
+            # code lets a harness branch: preempted+requeued = expect a
+            # waitqueue_granted push (or re-bind later), not a dead device.
+            self._on_binding_death(message.get("binding_id", ""),
+                                   message.get("code", errors.PREEMPTED_BY_ARBITRATION))
+        elif mtype == "waitqueue_granted":
+            self._on_waitqueue_granted(message)
         return None  # no TCP reply needed for inbound pushes
+
+    def _on_waitqueue_granted(self, message: dict) -> None:
+        """
+        A freed slot's minted binding, pushed by the device (v1.12): our waitqueue
+        turn came up after we queued (or were gracefully preempted and re-queued).
+        TRUST: this hands out a binding, so it must be SIGNED by the device key we
+        pinned — verified exactly like a bind_response; a forged/unsigned push is
+        dropped. On success the lease is adopted (auto-renew as usual) and the
+        optional `on_regrant` callback fires with the binding dict.
+        """
+        node_id = message.get("node_id", "")
+        if signing.verify_message(message, node_id, self.pins) is not None:
+            return                                     # forged / unsigned → drop
+        binding = dict(message)
+        binding["provider_node_id"] = node_id
+        binding["verified"] = True
+        self._start_lease(binding)
+        cb = getattr(self, "on_regrant", None)
+        if cb:
+            try:
+                cb(binding)
+            except Exception:
+                pass
 
     def _on_binding_death(self, bid: str, code: str) -> None:
         """Shared teardown for a device-pushed binding-death notice (lease_expired
@@ -255,10 +290,18 @@ class RemoteAgent:
             return sorted({name for (nid, name) in self.swarm.records
                            if nid == node_id and name})
 
-    def bind_remote_to(self, target_node_id: str, capability_name: str, priority: int = 5) -> dict:
+    def bind_remote_to(self, target_node_id: str, capability_name: str,
+                       priority: int = 5, claim: dict | None = None) -> dict:
         """
         Bind a specific named capability on a specific provider node.
         Use when you already know the target_node_id from discovery.
+
+        `claim` (v1.12, optional): a contention claim
+        {"priority": "routine"|"elevated"|"urgent"|"safety", "intent": str,
+         "max_wait": seconds} — a DECLARATION, not a grant: whether the level may
+        preempt a current holder is decided by the device owner's arbitration
+        policy. The legacy `priority` int is clamped to the routine band by the
+        device for remote binds (it can lower, never raise, effective priority).
         """
         with self.swarm._lock:
             provider_record = next(
@@ -281,15 +324,20 @@ class RemoteAgent:
             signing.verify_record(provider_record, self.pins)
 
         # bind_request is a trust op — sign it (v + ts inside the signed payload;
-        # agent_address now rides inside, tamper-evident).
-        request = signing.sign_message({
+        # agent_address now rides inside, tamper-evident). The optional claim
+        # rides INSIDE the signed payload too, so a stated priority is always
+        # attributable to this agent's key (the arbitration honesty anchor).
+        payload = {
             "type":            "bind_request",
             "from_node":       self.agent_id,
             "capability_name": capability_name,
             "needs":           self.needs,
             "priority":        priority,
             "agent_address":   agent_address,
-        }, self.private_key, self.public_key)
+        }
+        if claim is not None:
+            payload["claim"] = claim
+        request = signing.sign_message(payload, self.private_key, self.public_key)
 
         response = self.swarm.send_and_recv(target_node_id, request, timeout=5.0)
         if not response:
@@ -448,7 +496,8 @@ class RemoteAgent:
         if lease:
             lease["stop"].set()
 
-    def bind_remote(self, capability_name: str, priority: int = 5) -> dict:
+    def bind_remote(self, capability_name: str, priority: int = 5,
+                    claim: dict | None = None) -> dict:
         """
         Discover providers of `capability_name`, pick the first, and bind.
         Use bind_remote_to() when you want to target a specific provider.
@@ -469,7 +518,8 @@ class RemoteAgent:
             return {"status": "error", "code": errors.NO_PROVIDER,
                     "detail": f"No provider for '{capability_name}' found on network"}
 
-        return self.bind_remote_to(providers[0]["node_id"], capability_name, priority)
+        return self.bind_remote_to(providers[0]["node_id"], capability_name, priority,
+                                   claim=claim)
 
     # ── data delivery: DEFAULT (on-demand pull) ────────────────────────────────
 

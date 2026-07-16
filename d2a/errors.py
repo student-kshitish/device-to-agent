@@ -85,6 +85,13 @@ OUT_OF_BOUNDARY = "out_of_boundary"  # plan targets outside the manifest's decla
                                      # boundary — refused BEFORE consent, audited,
                                      # owner never prompted
 
+# ── multi-agent arbitration (Phase 12 — contention over a singular resource) ─
+PREEMPTED_BY_ARBITRATION = "preempted_by_arbitration"  # notice: your binding was taken
+                                                       # for a policy-sanctioned claim
+INVALID_CLAIM            = "invalid_claim"             # claim violates the fixed vocabulary
+CLAIM_RATE_LIMITED       = "claim_rate_limited"        # above-routine claims over budget
+                                                       # — refused (not downgraded), audited
+
 # ── remote keyed owner approval (Phase 10A — owner signs a plan over the wire) ─
 OWNER_APPROVAL_REQUIRED = "owner_approval_required"  # non-terminal: sign the returned plan_hash
 OWNER_UNREGISTERED      = "owner_unregistered"       # keyed approval sent but no owner key pinned
@@ -119,6 +126,7 @@ ALL_CODES = frozenset({
     NOT_AN_INTERVENTION_CAPABILITY, INVALID_PLAN, INTERVENTION_PREFLIGHT_REFUSED,
     INTERVENTION_VERIFY_FAILED, INTERVENTION_ERROR, AUDIT_SEALED,
     OUT_OF_BOUNDARY,
+    PREEMPTED_BY_ARBITRATION, INVALID_CLAIM, CLAIM_RATE_LIMITED,
     OWNER_APPROVAL_REQUIRED, OWNER_UNREGISTERED, OWNER_KEY_MISMATCH,
     OWNER_SIG_INVALID, OWNER_APPROVAL_STALE,
     NOT_DELEGATOR, DELEGATION_SCOPE_EXCEEDED, DELEGATION_NOT_FOUND, DELEGATION_REVOKED,

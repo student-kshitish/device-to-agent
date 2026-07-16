@@ -66,7 +66,19 @@ import logging
 # still requires the full owner approval (boundary is a pre-filter, not consent).
 # A manifest without a boundary behaves exactly as v1.10; same-major peers ignore
 # the new key/code.
-PROTOCOL_VERSION = "1.11"
+# v1.12 (additive): MULTI-AGENT ARBITRATION — a bind_request may carry an optional
+# `claim` {priority: routine|elevated|urgent|safety, intent, max_wait} (a D2A-
+# original concept: physical devices are singular, so contention needs stated
+# intent). Claiming grants nothing — the OWNER's ArbitrationPolicy decides which
+# levels may preempt (default: none; claims only order the waitqueue). Adds two
+# push types (`preempted` — graceful eviction notice with reason + re-queue
+# position; `waitqueue_granted` — a freed slot's minted binding, device-SIGNED)
+# and three codes (preempted_by_arbitration / invalid_claim / claim_rate_limited).
+# Sanctioned tightening: a remote bind's raw `priority` int is clamped to the
+# routine band — priority:1 no longer silently evicts a holder (pre-v1.12 hole).
+# A bind without a claim otherwise behaves as v1.11; same-major peers ignore the
+# new field/types/codes.
+PROTOCOL_VERSION = "1.12"
 VERSION_FIELD = "v"
 
 logger = logging.getLogger("d2a.protocol")

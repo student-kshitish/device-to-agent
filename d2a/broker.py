@@ -43,7 +43,9 @@ class CapabilityBroker:
         self.runtime = runtime
         self.active_binds: dict[str, list[ActiveBind]] = {}
         self.quotas: dict[str, int] = {}
-        # waitqueue entries: (priority, agent_id, needs)
+        # waitqueue entries: (priority, agent_id, needs, meta) — meta (v1.12) is a
+        # dict that may carry {"claim": {...}, "deadline": <ts>} for arbitration;
+        # {} for every legacy path. Indices 0-2 and the sort key are unchanged.
         self.waitqueue: dict[str, list] = {}
         self.bindings: dict[str, Binding] = {}
         self.bind_history: list = []
@@ -97,24 +99,43 @@ class CapabilityBroker:
         self._log(reason, agent_id=bind.agent_id, capability=capability_name)
 
     def _grant_from_waitqueue(self, capability_name: str) -> dict | None:
-        """Shared: pop the next queued agent (if any) and grant it the freed slot."""
+        """Shared: pop the next queued agent (if any) and grant it the freed slot.
+        Entries whose arbitration deadline (claim max_wait) has passed are dropped
+        on the way — a claimant that said "I'll wait 30s" is not granted at 60s."""
         wq = self.waitqueue.get(capability_name, [])
-        if not wq:
-            return None
-        active = self.active_binds.setdefault(capability_name, [])
-        next_priority, next_agent_id, next_needs = wq.pop(0)
-        new_bind = self._issue_token(next_agent_id, capability_name, next_needs, next_priority)
-        active.append(new_bind)
-        self._log("auto_granted", agent_id=next_agent_id, capability=capability_name)
-        return {
-            "next_agent_id": next_agent_id,
-            "token": self._token_of(new_bind.binding_id),
-            "binding_id": new_bind.binding_id,
-        }
+        now = time.time()
+        while wq:
+            next_priority, next_agent_id, next_needs, meta = wq.pop(0)
+            deadline = (meta or {}).get("deadline")
+            if deadline is not None and now > deadline:
+                self._log("queue_wait_expired", agent_id=next_agent_id,
+                          capability=capability_name)
+                continue
+            active = self.active_binds.setdefault(capability_name, [])
+            new_bind = self._issue_token(next_agent_id, capability_name, next_needs, next_priority)
+            active.append(new_bind)
+            self._log("auto_granted", agent_id=next_agent_id, capability=capability_name)
+            return {
+                "next_agent_id": next_agent_id,
+                "token": self._token_of(new_bind.binding_id),
+                "binding_id": new_bind.binding_id,
+            }
+        return None
 
     # ── request / release ──────────────────────────────────────────────────────
 
-    def request_bind(self, agent_id: str, capability_name: str, needs: list[str], priority: int = 5) -> dict:
+    def request_bind(self, agent_id: str, capability_name: str, needs: list[str],
+                     priority: int = 5, may_preempt: bool = True,
+                     claim_meta: dict | None = None) -> dict:
+        """
+        `may_preempt` (v1.12 arbitration): eviction now requires numeric priority
+        superiority AND this flag. Default True preserves every local/direct
+        caller unchanged (local = inside the trust boundary); the WIRE bind path
+        passes the owner's ArbitrationPolicy verdict — an agent-claimed priority
+        alone can order the queue but never evict a holder without owner opt-in.
+        `claim_meta` rides the waitqueue entry ({"claim": ..., "deadline": ...})
+        so a queued claim keeps its declared max_wait.
+        """
         with self._lock:
             if self.runtime.get_capability(capability_name) is None:
                 return {"status": "error", "code": errors.CAPABILITY_NOT_FOUND,
@@ -137,12 +158,15 @@ class CapabilityBroker:
 
             # slot full — check for preemption candidate (higher number = lower priority)
             worst = max(active, key=lambda b: b.priority)
-            if worst.priority > priority:
+            if may_preempt and worst.priority > priority:
                 # Preemption goes through the SAME teardown path as release/expiry,
                 # then re-queues the victim (rather than granting the waitqueue).
+                victim_binding_id = worst.binding_id
                 self._remove_active_bind(worst, capability_name, "preempted")
-                wq.append((worst.priority, worst.agent_id, worst.needs))
+                wq.append((worst.priority, worst.agent_id, worst.needs, {}))
                 wq.sort(key=lambda x: x[0])
+                victim_position = next(i + 1 for i, e in enumerate(wq)
+                                       if e[1] == worst.agent_id)
 
                 bind = self._issue_token(agent_id, capability_name, needs, priority)
                 active.append(bind)
@@ -153,10 +177,12 @@ class CapabilityBroker:
                     "binding_id": bind.binding_id,
                     "message": f"Preempted {worst.agent_id}",
                     "preempted_agent_id": worst.agent_id,
+                    "preempted_binding_id": victim_binding_id,
+                    "victim_queue_position": victim_position,
                 }
 
             # queue
-            wq.append((priority, agent_id, needs))
+            wq.append((priority, agent_id, needs, dict(claim_meta or {})))
             wq.sort(key=lambda x: x[0])
             queue_position = next(i + 1 for i, e in enumerate(wq) if e[1] == agent_id)
             self._log("queued", agent_id=agent_id, capability=capability_name, priority=priority, position=queue_position)
@@ -271,6 +297,28 @@ class CapabilityBroker:
             before = len(wq)
             self.waitqueue[capability_name] = [e for e in wq if e[1] != agent_id]
             return len(wq) > before
+
+    def prune_waitqueues(self, now: float | None = None) -> list[dict]:
+        """
+        Drop every waitqueue entry whose arbitration deadline (claim max_wait) has
+        passed — device-side hygiene run by the lease sweeper. The agent enforces
+        its own deadline on its own clock (it declared max_wait); no push is sent.
+        Returns one info dict per pruned entry.
+        """
+        now = now if now is not None else time.time()
+        with self._lock:
+            out = []
+            for cap, wq in self.waitqueue.items():
+                keep = []
+                for entry in wq:
+                    deadline = (entry[3] or {}).get("deadline") if len(entry) > 3 else None
+                    if deadline is not None and now > deadline:
+                        out.append({"agent_id": entry[1], "capability_name": cap})
+                        self._log("queue_wait_expired", agent_id=entry[1], capability=cap)
+                    else:
+                        keep.append(entry)
+                self.waitqueue[cap] = keep
+            return out
 
     # ── lease delegation (Phase 10B) ───────────────────────────────────────────
 

@@ -18,6 +18,7 @@ from d2a import (
     crypto,
 )
 from d2a import signing
+from d2a import arbitration as _arbitration
 from d2a import boundary as _boundary
 from d2a import manifest as _manifest
 from d2a.protocol import PROTOCOL_VERSION
@@ -122,6 +123,12 @@ class DeviceRuntime:
         # ── broker ────────────────────────────────────────────────────────────
         self.broker = CapabilityBroker(self)
         self.broker.quotas = {n: 1 for n in self.capabilities}
+
+        # ── arbitration policy (Phase 12, owner-governed) ─────────────────────
+        # Contention claims on bind_request are weighed by THIS policy, never by
+        # the claiming agent. Default: NO claim level may preempt — claims order
+        # the waitqueue only. Owner opts in: self.arbitration.allow_preemption().
+        self.arbitration = _arbitration.ArbitrationPolicy()
 
         self.swarm: SwarmTransport = transport if transport is not None else LANSwarm(node_id=self.node_id)
 
@@ -580,6 +587,14 @@ class DeviceRuntime:
             print(f"[{self.name}] lease expired binding={binding_id[:8]} "
                   f"cap={info['capability_name']} → slot freed"
                   + (f", auto-granted to {info['next_agent_id'][:8]}" if info.get("next_agent_id") else ""))
+            # v1.12: push the expiry-triggered waitqueue grant to the queued agent
+            # (was minted silently — a remote agent never learned of its turn).
+            if info.get("grant"):
+                self._notify_waitqueue_grant(info["grant"], info["capability_name"])
+
+        # v1.12: drop waitqueue entries whose claim max_wait deadline passed —
+        # device-side hygiene (the claimant enforces its own deadline itself).
+        self.broker.prune_waitqueues()
 
         # Sweep delegated children whose OWN (capped) lease lapsed before their
         # parent's teardown — so a child never over-serves past its cap even if the
@@ -1055,7 +1070,37 @@ class DeviceRuntime:
                                        "code": errors.APPROVAL_REQUIRED,
                                        "detail": "owner approval required for sensitive resource"})
 
-            result = self.broker_request(agent_id, cap_name, needs, priority)
+            # ── contention claim (Phase 12 arbitration) ───────────────────────
+            # An optional, validated claim {priority, intent, max_wait}. Claiming
+            # grants NOTHING: the level maps to a queue-ordering number; whether
+            # it may EVICT a holder is the owner's ArbitrationPolicy verdict.
+            # Legacy raw ints are clamped to the routine band — a remote agent
+            # can no longer self-elevate with priority:1 (pre-v1.12 hole closed).
+            claim = None
+            claim_raw = message.get("claim")
+            if claim_raw is not None:
+                try:
+                    claim = _arbitration.validate_claim(claim_raw)
+                except _arbitration.ClaimError as e:
+                    return self._sign({"type": "bind_response", "status": "denied",
+                                       "code": errors.INVALID_CLAIM, "detail": str(e)})
+                if not self.arbitration.note_claim(agent_id, claim["priority"]):
+                    # Refused, not silently downgraded — and AUDITED: a claim
+                    # spammer is a probe worth recording.
+                    self._audit_arbitration(
+                        result="claim_rate_limited", capability=cap_name,
+                        claimant_agent_id=agent_id, claim=claim)
+                    print(f"[{self.name}] bind_request from {agent_id[:8]} for '{cap_name}' "
+                          f"→ denied (claim rate limited)")
+                    return self._sign({"type": "bind_response", "status": "denied",
+                                       "code": errors.CLAIM_RATE_LIMITED,
+                                       "detail": "above-routine claim budget exceeded"})
+            eff_priority = _arbitration.effective_priority(claim, priority)
+            may_preempt  = (claim is not None
+                            and self.arbitration.may_preempt(claim["priority"], cap_name))
+
+            result = self.broker_request(agent_id, cap_name, needs, eff_priority,
+                                         may_preempt=may_preempt, claim=claim)
             print(f"[{self.name}] bind_request from {agent_id[:8]} for '{cap_name}' "
                   f"→ {result['status']}")
             if result.get("status") in ("granted", "granted_by_preemption"):
@@ -1082,6 +1127,8 @@ class DeviceRuntime:
                       "detail": result.get("detail") or result.get("message", "")}
             if result.get("code"):
                 denial["code"] = result["code"]
+            if result.get("queue_position") is not None:     # v1.12: queued binds
+                denial["queue_position"] = result["queue_position"]
             return self._sign(denial)
 
         # ── lease renewal (wire-level) ────────────────────────────────────────
@@ -1718,15 +1765,52 @@ class DeviceRuntime:
         return verify_bind_token(token, self.public_key)
 
     def broker_request(self, agent_id: str, capability_name: str,
-                       needs: list[str], priority: int = 5) -> dict:
+                       needs: list[str], priority: int = 5,
+                       may_preempt: bool = True, claim: dict | None = None) -> dict:
+        """
+        `may_preempt` / `claim` (v1.12 arbitration): the wire bind path passes the
+        owner's ArbitrationPolicy verdict; local/direct callers keep the default
+        (True, no claim) — unchanged pre-v1.12 behavior, local = trusted. On a
+        claim-driven preemption the victim gets a graceful `preempted` push and
+        the decision is appended to the signed audit — BEFORE the winner's
+        bind_response leaves this handler, so A is never silently cut.
+        """
+        # FAIL-CLOSED (arbitration only): an eviction we cannot record must not
+        # happen. A broken audit chain downgrades a claim's preemption right to
+        # queueing — the bind still serves, degraded not dead.
+        if may_preempt and claim is not None:
+            chain_ok, _ = self._audit_log().verify_chain()
+            if not chain_ok:
+                may_preempt = False
         # Detect preemption before calling broker so we can clean up preempted streams.
         active = self.broker.active_binds.get(capability_name, [])
         quota  = self.broker.quotas.get(capability_name, 1)
-        if len(active) >= quota:
+        if may_preempt and len(active) >= quota:
             worst = max(active, key=lambda b: b.priority)
             if worst.priority > priority:
                 self._cleanup_binding_stream(worst.binding_id)
-        return self.broker.request_bind(agent_id, capability_name, needs, priority)
+        claim_meta = None
+        if claim is not None:
+            claim_meta = {"claim": claim}
+            if "max_wait" in claim:
+                claim_meta["deadline"] = time.time() + claim["max_wait"]
+        result = self.broker.request_bind(agent_id, capability_name, needs, priority,
+                                          may_preempt=may_preempt, claim_meta=claim_meta)
+        if result.get("status") == "granted_by_preemption":
+            # Graceful notice to the victim (best-effort, like lease_expired) —
+            # pushed before the winner's response is returned.
+            self._notify_preempted(result, capability_name, claim)
+            if claim is not None:
+                self._audit_arbitration(
+                    result="preempted", capability=capability_name,
+                    claimant_agent_id=agent_id, claim=claim,
+                    victim_agent_id=result.get("preempted_agent_id", ""),
+                    victim_binding_id=result.get("preempted_binding_id", ""),
+                    queue_position=result.get("victim_queue_position"))
+                print(f"[{self.name}] arbitration PREEMPTED "
+                      f"{result.get('preempted_agent_id', '')[:8]} on '{capability_name}' "
+                      f"for {agent_id[:8]} (claim={claim['priority']})")
+        return result
 
     def broker_release(self, agent_id: str, capability_name: str) -> dict:
         # Clean up streaming before releasing binding.
@@ -1734,7 +1818,94 @@ class DeviceRuntime:
         bind   = next((b for b in active if b.agent_id == agent_id), None)
         if bind:
             self._cleanup_binding_stream(bind.binding_id)
-        return self.broker.release_bind(agent_id, capability_name)
+        result = self.broker.release_bind(agent_id, capability_name)
+        # v1.12: a freed slot's waitqueue grant is PUSHED to the queued agent
+        # (was minted silently — a remote agent never learned of its turn).
+        if result.get("next_agent_id"):
+            self._notify_waitqueue_grant(result, capability_name)
+        return result
+
+    def _notify_preempted(self, result: dict, capability_name: str,
+                          claim: dict | None) -> None:
+        """Best-effort graceful-preemption push to the victim (same delivery class
+        as lease_expired: reachable iff the agent gave agent_address). Carries the
+        reason, the WINNING claim level (not the winner's identity — the audit has
+        who-for-whom), and the victim's re-queue position."""
+        try:
+            self.swarm.send(result.get("preempted_agent_id", ""), {
+                "type":             "preempted",
+                "code":             errors.PREEMPTED_BY_ARBITRATION,
+                "binding_id":       result.get("preempted_binding_id", ""),
+                "capability_name":  capability_name,
+                "node_id":          self.node_id,
+                "winning_priority": (claim or {}).get("priority", ""),
+                "requeued":         True,
+                "queue_position":   result.get("victim_queue_position"),
+                "ts":               time.time(),
+            })
+        except Exception:
+            pass
+
+    def _notify_waitqueue_grant(self, grant: dict, capability_name: str) -> None:
+        """
+        Push a freed slot's minted binding to the queued agent (v1.12). SIGNED —
+        unlike data-path pushes this is a trust artifact (it hands out a binding),
+        so the agent verifies it exactly like a bind_response before adopting it.
+        Best-effort: if undeliverable, the minted lease simply TTL-expires and the
+        slot re-frees — self-healing, no new state machine.
+        """
+        token = grant.get("token")
+        agent_id = grant.get("next_agent_id")
+        if token is None or not agent_id:
+            return
+        try:
+            self.swarm.send(agent_id, self._sign({
+                "type":                 "waitqueue_granted",
+                "status":               "granted",
+                "binding_id":           grant.get("binding_id"),
+                "capability_name":      capability_name,
+                "agent_id":             token.agent_id,
+                "node_id":              self.node_id,
+                "scope":                token.scope,
+                "expires_at":           token.expires_at,
+                "lease_ttl":            self.lease_ttl,
+                "lease_expires_at":     token.expires_at,
+                "token_sig":            token.signature,
+                "device_class":         self.device_class,
+                "verified_by_provider": True,
+            }))
+            print(f"[{self.name}] waitqueue grant pushed to {agent_id[:8]} "
+                  f"cap={capability_name}")
+        except Exception:
+            pass
+
+    def _audit_arbitration(self, *, result: str, capability: str,
+                           claimant_agent_id: str, claim: dict | None,
+                           victim_agent_id: str = "", victim_binding_id: str = "",
+                           queue_position=None) -> dict | None:
+        """Append ONE signed audit entry for an arbitration decision — a physical
+        resource taken from one agent for another (result="preempted"), or a
+        refused claim-spammer (result="claim_rate_limited"). Records the claimant's
+        STATED claim (level + advisory intent) and the policy it ran under, so the
+        log shows who was preempted for whom, under which owner rule, on whose
+        asserted priority. Returns the entry, or None if the log refused."""
+        try:
+            return self._audit_log().append({
+                "kind":              "arbitration",
+                "result":            result,
+                "capability":        capability,
+                "device_node_id":    self.node_id,
+                "claimant_agent_id": claimant_agent_id,
+                "claim":             dict(claim or {}),
+                "victim_agent_id":   victim_agent_id,
+                "victim_binding_id": victim_binding_id,
+                "policy_allowed":    self.arbitration.preempt_levels(capability),
+                "requeued":          bool(victim_agent_id),
+                "queue_position":    queue_position,
+                "ts":                time.time(),
+            })
+        except AuditError:
+            return None
 
     def broker_status(self) -> dict:
         return self.broker.status()

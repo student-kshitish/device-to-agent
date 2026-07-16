@@ -270,6 +270,11 @@ Multiple agents compete for a finite number of hardware slots. The broker handle
 | **Audit log** | Full event history: granted · queued · preempted · released · auto\_granted |
 | **Cancel-queue** | Atomic Binder cancels queue entries on rollback — prevents ghost bindings |
 
+Since v1.12 the raw numeric preemption above applies to **local (in-process) callers
+only** — a *remote* bind's priority is governed by the owner's arbitration policy
+and a stated contention claim; see
+*[Multi-Agent Arbitration](#multi-agent-arbitration-phase-12-v112-additive)*.
+
 ---
 
 ## Security model (Ed25519, v1.1)
@@ -502,6 +507,8 @@ exactly one name):
 | Intervention (Phase 8, mutating) | `not_an_intervention_capability`, `invalid_plan`, `intervention_preflight_refused`, `intervention_verify_failed`, `intervention_error`, `audit_sealed` |
 | Remote keyed owner approval (Phase 10A) | `owner_approval_required` (non-terminal — sign the returned `plan_hash`), `owner_unregistered`, `owner_key_mismatch`, `owner_sig_invalid`, `owner_approval_stale` |
 | Lease delegation (Phase 10B) | `not_delegator`, `delegation_scope_exceeded`, `delegation_not_found`, `delegation_revoked` (child-right-ended notice) |
+| Capability boundaries (Phase 11) | `out_of_boundary` (plan outside the manifest's declared lane — refused before consent, audited) |
+| Multi-agent arbitration (Phase 12) | `preempted_by_arbitration` (graceful eviction notice), `invalid_claim`, `claim_rate_limited` (refused + audited) |
 | Agent-side | `no_response`, `binding_id_mismatch`, `no_provider` |
 
 **Boundary — what is NOT in the registry.** Codes that appear **inside**
@@ -890,6 +897,83 @@ into the agent**. Devices report signed *state*; agents do all reasoning.
 Recorded here so the gap is a decision, not an omission.
 
 Tests: `tests/test_boundary.py`.
+
+## Multi-Agent Arbitration (Phase 12; v1.12 additive)
+
+A **D2A-original concept** — neither MCP nor A2A has it, because they never need
+it: a software tool is copyable (two clients can call the same MCP tool
+concurrently), while a **physical device is singular** — one camera, one GPU
+slot, one actuator. Before v1.12, `quota=1` + leases serialized access
+first-come-first-served, a contending agent had no way to express intent or
+urgency, and (worse) the wire had an open hole: `bind_request.priority` was a
+raw int fed straight to the broker's numeric preemption rule, so **any remote
+agent could send `priority: 1` and silently evict any holder** — no owner gate,
+no notice. v1.12 closes that hole and replaces it with governed arbitration.
+
+**The contention claim** (optional field on `bind_request`, rides *inside* the
+Ed25519-signed payload so every stated priority is attributable to a key):
+
+```python
+binding = agent.bind_remote_to(node_id, "compute",
+    claim={"priority": "safety",                  # routine|elevated|urgent|safety — FIXED set
+           "intent":   "thermal shutdown imminent",   # advisory text, never parsed
+           "max_wait": 30})                       # how long I'll queue (device prunes after)
+```
+
+**Claiming grants nothing — the owner's policy is the gate.** Agents can only
+*declare* a claim; the device weighs it against an owner-set `ArbitrationPolicy`
+that agents have no verb to touch:
+
+```python
+device.arbitration.allow_preemption("safety")               # global opt-in
+device.arbitration.allow_preemption("urgent", "camera")     # or per capability
+device.arbitration.set_claim_rate(max_claims=5, window=60)  # anti-gaming knob
+```
+
+**Default: NO level may preempt** — claims order the waitqueue by level, holders
+are never evicted. A safety-preempts-by-default rule was considered and
+rejected: "safety" is agent-asserted and unverifiable, so defaulting it to an
+eviction right would hand every remote agent the same free eviction button this
+phase exists to close.
+
+**Graceful preemption, never a silent cut.** When the owner's policy sanctions
+an eviction, it runs through the broker's ONE existing preemption/teardown path
+(a `may_preempt` flag on `request_bind` — local in-process callers keep the old
+behavior unchanged, trusted by definition), and *before the winner's
+bind_response leaves the handler* the victim gets a `preempted` push: the
+distinct `preempted_by_arbitration` code, the **winning claim level**, and its
+**re-queue position**. The victim's re-queued turn (and any queued bind's turn)
+now actually arrives: when the slot frees, the device pushes a **signed**
+`waitqueue_granted` message carrying the minted binding — the agent verifies it
+exactly like a `bind_response`, adopts the lease, and fires `on_regrant`. (This
+also fixes a pre-v1.12 gap where a remote agent's waitqueue grant was minted
+silently and expired unused.) If the push is undeliverable, the minted lease
+TTL-expires and the slot re-frees — self-healing.
+
+**Anti-gaming, layered:** a fixed 4-level enum (no int arms race); claiming
+grants nothing by default; a per-agent sliding-window rate limit on
+above-routine claims that **refuses** (`claim_rate_limited`) rather than
+silently downgrades — and the refusal is **audited**, because a claim-spammer is
+a probe worth recording.
+
+**Audit.** Every owner-sanctioned preemption appends one signed, hash-chained
+entry (`kind: "arbitration"`): who was preempted for whom, under which policy
+(`policy_allowed`), on whose *stated* claim (level + advisory intent), re-queue
+outcome. Fail-closed, consistent with the intervention layer: a broken audit
+chain downgrades preemption to queueing (an eviction the device cannot record
+must not happen) — the bind still serves, degraded not dead.
+
+**The honest limit (read this).** The device **cannot verify that a claim is
+true** — a "safety" claim is an assertion, and the device has no way to check
+that the claimant's need is real or greater than the holder's. Arbitration is
+therefore only as honest as the claiming agents, *unless* the owner's policy
+gates which levels have teeth — which is exactly why the policy is
+owner-governed and defaults to no-preemption. What the system does guarantee:
+a claim is **attributable** (signed), **bounded** (rate-limited), and
+**recorded** (audited) — a lying claimant is identifiable and evictable by the
+owner after the fact, never undetectable.
+
+Tests: `tests/test_arbitration.py`.
 
 ## Node Catalog (v1.8; additive)
 
@@ -1289,7 +1373,7 @@ Still out of scope, each by design: chains deeper than `MAX_DERIVATION_DEPTH` (a
 
 ## Versioning & Compatibility
 
-**The wire format is `v1.11`** as of the capability-boundaries arc — `d2a.PROTOCOL_VERSION = "1.11"` (defined in `d2a/protocol.py`; `major_of("1.11") == 1`, so it is same-major with every `1.x`). **v1.11 is *additive*** — it adds one optional manifest key, `boundary` (intervention tier only: the declared operational lane of targets/params, per the `d2a/boundary.py` vocabulary `in` / `match` / `range`), one error code (`out_of_boundary`), and one `intervention_result` status / audit `result_status` value (`out_of_boundary`). The device enforces a declared boundary in `propose_intervention` *before* preflight and *before* both consent gates; a manifest without one behaves exactly as v1.10 and same-major peers ignore the new key/code. See *[Capability boundaries](#capability-boundaries-phase-11-v111-additive)* above. **v1.10 is *additive*** — it adds the `delegate_binding` / `revoke_delegation` verbs (agent A hands a binding to agent B: a device-issued, re-gated, lease-capped, optionally scope-narrowed **child** binding), additive `Binding` fields (`parent_binding_id` / `delegated_by` / `scope_restrict`), and four `delegation`/`delegator` [error codes](#error-model-v14). Same-major peers ignore the new verbs; a device that never receives one behaves exactly as v1.9. See *[Lease delegation](#lease-delegation-phase-10b-v110-additive)* above. **v1.9 is *additive*** — it adds an optional `owner_approval` field on `propose_intervention` (an owner Ed25519 signature over the `plan_hash`, an alternative to the local console callback), a non-terminal `pending_owner_approval` result (round 1 returns the exact `plan_hash` for the owner to sign), and five `owner_*` [error codes](#error-model-v14); the audit entry gains the owner pubkey + signature and the descriptor's `owner_pubkey` is now populated. A device with no owner key registered behaves exactly as v1.8; same-major peers ignore the new field. See *[Remote keyed owner approval](#remote-keyed-owner-approval-phase-10a-v19-additive)* above. **v1.8 is *additive*** — it adds the `describe_node` / `describe_node_response` verbs (the node-level `list_tools` / agent-card; host-key-signed catalog + node self-descriptor) and enriches the existing `node:<id>` DHT record into a signed node descriptor carrying the disclosed capability **names** (address retained, so old address-resolution consumers are unaffected). No field renames, no error codes; same-major peers ignore the new verbs and the extra descriptor fields. See *[Node Catalog](#node-catalog-v18-additive)* above. **v1.7 is *additive*** — it adds the `propose_intervention` verb (mutating fix loop; its `intervention_result` reply and the six `intervention_*` / `invalid_plan` / `audit_sealed` [error codes](#error-model-v14)) and one optional manifest key, `cannot_fix` (the mutating sibling of `cannot_observe`, valid on any manifest, listing a fixer's honest blind spots), carried by Phase 8 intervention capabilities; same-major peers ignore both and records without them stay valid. **v1.6 was *additive*** — the manifest vocabulary gained one optional honesty key, `cannot_observe` (valid on any manifest, distinct from the derived-only `cannot_detect`), carried by the Phase 7 read-only diagnostic capabilities; same-major peers ignore it and records without it stay valid. v1.1 added the `sig` / `sig_key` / `ts` fields (Ed25519 trust); v1.2 **additively** added an optional `manifest` field to capability records; v1.3 **additively** added the `subscribe_event` / `unsubscribe_event` / `event` / `task_status` verbs, an optional per-action `long_running` manifest key, and a small set of eventable live-frame reading fields to the built-in manifests (see *Event Layer* above). **v1.4 is the one *non-additive* bump so far** — it unifies every error/denial onto a single shape with a stable `code` from the [error registry](#error-model-v14). This is a **sanctioned pre-adoption break**: it renames wire fields (`reason` / `error` → `code`), so it is not additive, and it is done now precisely because there are no external consumers yet. **v1.5 is *additive*** — the manifest vocabulary gains four optional derived-provenance keys (`derived` / `recipe` / `fidelity` / `cannot_detect`) and an optional per-field `hz` cadence, so a locally derived capability publishes, discovers, and binds like any other (closing derivation protocol gaps 1 and 3, dated 2026-07-12). It adds a `derived_input_failed` code to the [error registry](#error-model-v14) for a published derivation whose required input died. No field renames, no verb changes; same-major peers ignore the new keys. See the *Error model* section for the migration and the full code registry. Records/messages without any of these remain valid. Records without a manifest remain valid. Every outbound message and every published capability record carries a top-level `"v"` field, injected at the serialization chokepoints (TCP `_tcp_send` / `_handle_tcp`, LAN UDP `_broadcast` / `_handle_udp`, Kademlia `_send` / `_handle`, and both `publish()` sites). It is a plain field, **not** an envelope, so handlers that read `msg["type"]` are unaffected.
+**The wire format is `v1.12`** as of the multi-agent-arbitration arc — `d2a.PROTOCOL_VERSION = "1.12"` (defined in `d2a/protocol.py`; `major_of("1.12") == 1`, so it is same-major with every `1.x`). **v1.12 is *additive*** — it adds an optional `claim` field on `bind_request` ({priority: routine|elevated|urgent|safety, intent, max_wait} — weighed by the OWNER's arbitration policy, never self-granting), two push types (`preempted` — graceful eviction notice with reason + re-queue position; `waitqueue_granted` — a freed slot's minted binding, device-signed and verified like a `bind_response`), a `queue_position` field on queued bind_responses, and three [error codes](#error-model-v14) (`preempted_by_arbitration` / `invalid_claim` / `claim_rate_limited`). One **sanctioned tightening** rides along: a remote bind's raw `priority` int is clamped to the routine band, so `priority: 1` no longer silently evicts a holder (closing a pre-v1.12 hole; no field renames, nothing in-tree relied on it — local/in-process broker callers are unchanged). A bind without a claim otherwise behaves exactly as v1.11; same-major peers ignore the new field/types/codes. See *[Multi-Agent Arbitration](#multi-agent-arbitration-phase-12-v112-additive)* above. **v1.11 is *additive*** — it adds one optional manifest key, `boundary` (intervention tier only: the declared operational lane of targets/params, per the `d2a/boundary.py` vocabulary `in` / `match` / `range`), one error code (`out_of_boundary`), and one `intervention_result` status / audit `result_status` value (`out_of_boundary`). The device enforces a declared boundary in `propose_intervention` *before* preflight and *before* both consent gates; a manifest without one behaves exactly as v1.10 and same-major peers ignore the new key/code. See *[Capability boundaries](#capability-boundaries-phase-11-v111-additive)* above. **v1.10 is *additive*** — it adds the `delegate_binding` / `revoke_delegation` verbs (agent A hands a binding to agent B: a device-issued, re-gated, lease-capped, optionally scope-narrowed **child** binding), additive `Binding` fields (`parent_binding_id` / `delegated_by` / `scope_restrict`), and four `delegation`/`delegator` [error codes](#error-model-v14). Same-major peers ignore the new verbs; a device that never receives one behaves exactly as v1.9. See *[Lease delegation](#lease-delegation-phase-10b-v110-additive)* above. **v1.9 is *additive*** — it adds an optional `owner_approval` field on `propose_intervention` (an owner Ed25519 signature over the `plan_hash`, an alternative to the local console callback), a non-terminal `pending_owner_approval` result (round 1 returns the exact `plan_hash` for the owner to sign), and five `owner_*` [error codes](#error-model-v14); the audit entry gains the owner pubkey + signature and the descriptor's `owner_pubkey` is now populated. A device with no owner key registered behaves exactly as v1.8; same-major peers ignore the new field. See *[Remote keyed owner approval](#remote-keyed-owner-approval-phase-10a-v19-additive)* above. **v1.8 is *additive*** — it adds the `describe_node` / `describe_node_response` verbs (the node-level `list_tools` / agent-card; host-key-signed catalog + node self-descriptor) and enriches the existing `node:<id>` DHT record into a signed node descriptor carrying the disclosed capability **names** (address retained, so old address-resolution consumers are unaffected). No field renames, no error codes; same-major peers ignore the new verbs and the extra descriptor fields. See *[Node Catalog](#node-catalog-v18-additive)* above. **v1.7 is *additive*** — it adds the `propose_intervention` verb (mutating fix loop; its `intervention_result` reply and the six `intervention_*` / `invalid_plan` / `audit_sealed` [error codes](#error-model-v14)) and one optional manifest key, `cannot_fix` (the mutating sibling of `cannot_observe`, valid on any manifest, listing a fixer's honest blind spots), carried by Phase 8 intervention capabilities; same-major peers ignore both and records without them stay valid. **v1.6 was *additive*** — the manifest vocabulary gained one optional honesty key, `cannot_observe` (valid on any manifest, distinct from the derived-only `cannot_detect`), carried by the Phase 7 read-only diagnostic capabilities; same-major peers ignore it and records without it stay valid. v1.1 added the `sig` / `sig_key` / `ts` fields (Ed25519 trust); v1.2 **additively** added an optional `manifest` field to capability records; v1.3 **additively** added the `subscribe_event` / `unsubscribe_event` / `event` / `task_status` verbs, an optional per-action `long_running` manifest key, and a small set of eventable live-frame reading fields to the built-in manifests (see *Event Layer* above). **v1.4 is the one *non-additive* bump so far** — it unifies every error/denial onto a single shape with a stable `code` from the [error registry](#error-model-v14). This is a **sanctioned pre-adoption break**: it renames wire fields (`reason` / `error` → `code`), so it is not additive, and it is done now precisely because there are no external consumers yet. **v1.5 is *additive*** — the manifest vocabulary gains four optional derived-provenance keys (`derived` / `recipe` / `fidelity` / `cannot_detect`) and an optional per-field `hz` cadence, so a locally derived capability publishes, discovers, and binds like any other (closing derivation protocol gaps 1 and 3, dated 2026-07-12). It adds a `derived_input_failed` code to the [error registry](#error-model-v14) for a published derivation whose required input died. No field renames, no verb changes; same-major peers ignore the new keys. See the *Error model* section for the migration and the full code registry. Records/messages without any of these remain valid. Records without a manifest remain valid. Every outbound message and every published capability record carries a top-level `"v"` field, injected at the serialization chokepoints (TCP `_tcp_send` / `_handle_tcp`, LAN UDP `_broadcast` / `_handle_udp`, Kademlia `_send` / `_handle`, and both `publish()` sites). It is a plain field, **not** an envelope, so handlers that read `msg["type"]` are unaffected.
 
 The compatibility contract:
 
@@ -1339,6 +1423,7 @@ Each device probes itself at startup using `/proc/meminfo`, `/proc/loadavg`, `/s
 - **Multi-hop derivation chaining (Phase 4, application layer — no protocol change): a recipe's `requires` may be met by a derived capability, so derivations stack (`compute → presence → activity_summary`) both fully-local (planner instantiates the inner recipe) and across-the-wire (consume another agent's published derived cap) on LAN + DHT; strict preference (real > single-hop > two-hop), `MAX_DERIVATION_DEPTH = 2` safety rail, cycle + depth guards (distinct refusal codes), nested provenance with chain-max tier + `cannot_detect` union + concatenated fidelity, and inner-failure propagation through the existing healer/lifecycle state machine** — `python3 examples/chain_demo.py`.
 - **Recipe distribution as community infrastructure (Phase 5, application layer — no protocol change, stdlib only): fetch a signed package from a local directory (a git repo you cloned — no shelling out) or a raw http(s) URL; a mechanical review-then-trust `install` (verify sig → print author fingerprint + requires/provides + effective tier + `fidelity`/`cannot_detect` + the full `transform.py` → typed confirmation, stronger `author-trust` for a new author) that lands the package + trust entry, refuses bad-sig / duplicate-version, and re-reviews a bumped version as new code; a `sign` self-check gate that refuses missing honesty fields or a failing dry-run; `new` scaffolding with the honesty fields present-but-empty; a `conformance` runner emitting a machine-readable `{dry_run, live, environment, passed}` report (dry-run twice across reloads + bounded live run); `registry list`/`show` hygiene** — see [Phase 5](#phase-5--the-registry-as-community-infrastructure).
 - **Observed-cost ranking & quarantine (Phase 6, application layer — no protocol change, stdlib only): the deferred cost optimizer made real from the data the system already generates. A bounded, persistent per-recipe metrics store (`derive_metrics.json`: runs, uptime, heal/failed counts, mean staleness, last conformance — one disk write per run, no per-frame IO) feeds a deterministic within-tier ranking `(observed_score → cost_rank_hint → num_inputs)` where `observed_score = (failure_rate, heal_rate, mean_staleness)`; the strict invariant holds structurally (real > single-hop > two-hop is never overridden — fidelity honesty outranks measured reliability); cold-start recipes rank by hint alone; `python -m d2a_derive.explain <cap>` prints WHY the planner picks what it picks (naming the deciding factor, off the planner's own ranking key); a quarantine quality-gate (failure-rate threshold or a failed conformance run) that `registry list`/`show` surface and the planner refuses to plan without `include_quarantined`, cleared only by a passing conformance run** — see [Phase 6](#phase-6--observed-cost-ranking--quarantine).
+- **Multi-agent arbitration (v1.12, a D2A-original concept beyond MCP/A2A): a bind_request may carry a signed contention `claim` (fixed set routine/elevated/urgent/safety + advisory intent + max_wait) weighed by an OWNER-set `ArbitrationPolicy` — claiming grants NOTHING (default: no level preempts; claims only order the waitqueue); owner opt-in (`allow_preemption`, global or per-cap) sanctions eviction through the broker's ONE existing preemption path (`may_preempt` flag — local callers and prior preemption tests untouched); the victim gets a graceful `preempted` push (distinct code + winning level + re-queue position, never a silent cut) and freed-slot grants are now PUSHED as signed `waitqueue_granted` and adopted agent-side (`on_regrant`); remote raw-int priority clamped (the pre-v1.12 silent-eviction hole closed); per-agent claim-rate limit refuses (`claim_rate_limited`) and is audited; every sanctioned preemption appended to the signed hash-chained audit (claimant, victim, stated claim, policy it ran under), fail-closed (broken chain → queue, never evict); both transports** — honest limit: a stated priority is agent-asserted and unverifiable; the owner policy is the real gate. See [Multi-Agent Arbitration](#multi-agent-arbitration-phase-12-v112-additive).
 - **Capability boundaries (v1.11): an intervention manifest may declare a `boundary` — the operational lane of targets/params it may EVER act on (`d2a/boundary.py` fixed vocabulary: exact set `in`, glob `match`, numeric `range`, on the reserved `target` key or any action param) — validated at publish time (boundary-on-nonexistent-param rejected; rejected outside the intervention tier; an attach whose own fixed target is out-of-lane refused) and enforced by the device in `propose_intervention` BEFORE preflight and BEFORE both consent gates: an out-of-boundary plan is refused structurally with the distinct `out_of_boundary` code, the owner is NEVER prompted (asserted in tests), nothing mutates, and the attempt is audited; a constrained param is effectively required (no dodging a `signal` allow-list by omitting it); in-boundary still faces the full double gate (both must hold); absent boundary → v1.10 behavior unchanged (compat); the lane rides the signed manifest into the record + `describe_node` catalog; both transports** — see [Capability boundaries](#capability-boundaries-phase-11-v111-additive).
 - **Lease delegation (v1.10): agent A hands a binding to agent B via `delegate_binding` / `revoke_delegation` — a device-issued CHILD binding, capped to A's remaining lease (longer `sub_ttl` clamped) and non-renewable, RE-GATED for B so consent is never laundered (open passes; sensitive re-checks B through the same policy gate; intervention requires a keyed owner approval NAMING B — audited); optional action-level scope narrowing (never wider than the capability, enforced on B's every action/propose); cascade teardown when A's lease ends by any path (release / expiry / preemption / shutdown) or A revokes, through the one unified path; re-delegation forbidden; both transports** — the lease-cascade guarantee holds (B's derived right can never outlive A's). See [Lease delegation](#lease-delegation-phase-10b-v110-additive).
 - **Remote keyed owner approval (v1.9): an owner keypair (distinct from the host key) is TOFU-registered on the device (`set_owner_pubkey`, persisted, populates the node-descriptor `owner_pubkey`); an intervention plan is approved by an owner Ed25519 signature over the device-computed `plan_hash` (two-round `pending_owner_approval` → sign → execute), bound to the plan + this device + a nonce/ts (replay-guarded); the audit records the owner pubkey + signature (approver = owner fingerprint) and survives restart with the chain intact; a bad/foreign/stale/replayed/cross-device signature is rejected with a distinct `owner_*` code; a device with no owner key falls back to the local callback unchanged — one gate, no second policy surface; both transports** — honest limit: proves *which key* signed, not *who held it* (key custody out of scope). See [Remote keyed owner approval](#remote-keyed-owner-approval-phase-10a-v19-additive).
@@ -1373,8 +1458,9 @@ d2a/
 ├── manifest.py            Capability manifest vocabulary + validator + built-ins (v1.2)
 ├── conditions.py          Event condition vocabulary: validate-against-manifest + edge/re-arm (v1.3)
 ├── boundary.py            Capability boundary vocabulary (in/match/range) + pre-consent check (v1.11)
+├── arbitration.py         Contention claims (fixed levels) + owner ArbitrationPolicy (v1.12)
 ├── identity.py            Node ID (binding handles) + Ed25519 token signing
-├── protocol.py            Wire version (PROTOCOL_VERSION="1.11") + negotiation helpers
+├── protocol.py            Wire version (PROTOCOL_VERSION="1.12") + negotiation helpers
 ├── verbs.py               bind / rebind / renew / unbind operations
 ├── broker.py              Contention broker: priority · quota · preemption · waitqueue
 ├── probes.py              OS probes: CPU, memory, GPU, thermal, battery, disk, net
